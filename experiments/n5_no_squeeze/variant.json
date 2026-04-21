@@ -1,0 +1,12 @@
+{
+  "name": "n5_no_squeeze",
+  "hypothesis": "Ablation of squeeze pillar. Tests whether squeeze is additive, neutral, or dilutive.",
+  "tweak_type": "code_patch",
+  "patches": [
+    {
+      "file": "daemon_base_v1.py",
+      "find": "    enh = EnhancedStrategy(max_risk=max_risk)",
+      "replace": "    enh = EnhancedStrategy(enable_squeeze=False, max_risk=max_risk)"
+    }
+  ]
+}
