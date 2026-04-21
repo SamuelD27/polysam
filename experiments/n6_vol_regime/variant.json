@@ -1,0 +1,15 @@
+{
+  "name": "n6_vol_regime",
+  "hypothesis": "Edge model is only trustworthy in elevated vol regimes; low-vol markets are noise.",
+  "tweak_type": "code_patch",
+  "env": {
+    "SIGMA_MIN": "0.60"
+  },
+  "patches": [
+    {
+      "file": "active_bots/enhanced_strategy.py",
+      "find": "        # \u2500\u2500 Entry check: iterate time zones \u2500\u2500\n        if not self.has_position:\n            for offset_min, offset_max, zone_edge_min, label in TIME_ZONES:",
+      "replace": "        # \u2500\u2500 Entry check: iterate time zones \u2500\u2500\n        # n6: vol-regime gate \u2014 skip entries below annualized-sigma floor\n        if sigma < float(os.environ.get(\"SIGMA_MIN\", \"0.0\")):\n            return None\n        if not self.has_position:\n            for offset_min, offset_max, zone_edge_min, label in TIME_ZONES:"
+    }
+  ]
+}
