@@ -1,0 +1,20 @@
+{
+  "name": "n2_late_gamma",
+  "hypothesis": "Peak model accuracy is at T+260-285; a large-edge-only strategy in that window with aggressive sizing dominates.",
+  "tweak_type": "code_patch",
+  "env": {
+    "MAX_BET_PCT": "0.40"
+  },
+  "patches": [
+    {
+      "file": "active_bots/enhanced_strategy.py",
+      "find": "TIME_ZONES: list[tuple[int, int, float, str]] = [\n    (60, 120, 0.20, \"early\"),\n    (120, 210, 0.12, \"mid\"),\n    (210, 260, 0.08, \"sweet_spot\"),\n    (260, 285, 0.15, \"late_gamma\"),\n]",
+      "replace": "TIME_ZONES: list[tuple[int, int, float, str]] = [\n    (260, 285, 0.20, \"late_gamma_only\"),\n]"
+    },
+    {
+      "file": "daemon_base_v1.py",
+      "find": "    enh = EnhancedStrategy(max_risk=max_risk)",
+      "replace": "    enh = EnhancedStrategy(enable_squeeze=False, max_risk=max_risk)"
+    }
+  ]
+}
