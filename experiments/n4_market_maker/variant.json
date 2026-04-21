@@ -1,0 +1,12 @@
+{
+  "name": "n4_market_maker",
+  "hypothesis": "FAK market orders overpay the spread; passive posting at fair +/- 0.03 captures the spread when the market overreacts.",
+  "tweak_type": "code_patch",
+  "patches": [
+    {
+      "file": "active_bots/enhanced_strategy.py",
+      "find": "                    if edge >= zone_edge_min and MIN_ENTRY_PRICE <= entry_price <= MAX_ENTRY_PRICE:",
+      "replace": "                    # n4 market-maker: replace entry_price with a passive target; skip until market crosses it.\n                    _mm_offset = 0.03\n                    if side == \"Up\":\n                        _mm_target_up = max(fair - _mm_offset, 0.01)\n                        if market_price_up > _mm_target_up:\n                            break\n                        entry_price = _mm_target_up\n                    else:\n                        _mm_target_up = min(fair + _mm_offset, 0.99)\n                        if market_price_up < _mm_target_up:\n                            break\n                        entry_price = 1.0 - _mm_target_up\n                    if edge >= zone_edge_min and MIN_ENTRY_PRICE <= entry_price <= MAX_ENTRY_PRICE:"
+    }
+  ]
+}
