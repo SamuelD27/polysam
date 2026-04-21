@@ -1,0 +1,6 @@
+{
+  "name": "_baseline",
+  "hypothesis": "Reference run of unmodified daemon (BASE + ENHANCED) for cross-variant comparison.",
+  "tweak_type": "env_only",
+  "env": {}
+}
