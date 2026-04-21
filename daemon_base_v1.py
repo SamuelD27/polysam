@@ -88,19 +88,58 @@ def _env_float(name: str, default: float | None = None) -> float | None:
         return default
 
 
-def compute_effective_max_risk() -> tuple[float, str]:
+def fetch_portfolio_size_usdc(client) -> float | None:
+    """Query the CLOB for the funder's free USDC collateral.
+
+    Returns float USD balance, or None if the query fails, the import is
+    missing, or the balance is zero/negative (treat as 'can't use this as
+    portfolio size'). Never raises.
+    """
+    try:
+        from py_clob_client.clob_types import (  # type: ignore
+            AssetType,
+            BalanceAllowanceParams,
+        )
+    except ImportError as exc:  # pragma: no cover — manual-exercise path
+        logger.warning("fetch_portfolio_size_usdc: py_clob_client unavailable: %s", exc)
+        return None
+
+    try:
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        balance = client.get_balance_allowance(params)
+        raw_bal = float(balance.get("balance") or 0)
+    except Exception as exc:  # noqa: BLE001 — defensive: any failure → None
+        logger.warning("fetch_portfolio_size_usdc: query failed: %s", exc)
+        return None
+
+    usdc = raw_bal / 1e6
+    if usdc <= 0:
+        return None
+    return usdc
+
+
+def compute_effective_max_risk(
+    *, portfolio_override: float | None = None,
+) -> tuple[float, str]:
     """Resolve per-trade max bet from env. Returns (value, source).
 
     Order:
-      1. PORTFOLIO_SIZE_USDC * MAX_BET_PCT (default 0.20)
-      2. MAX_TRADE_SIZE_USDC absolute ceiling (wins if smaller)
-      3. Fallback to MAX_RISK (100.0)
+      1. PORTFOLIO_SIZE_USDC env * MAX_BET_PCT (source "env")
+      2. portfolio_override arg (if >0) * MAX_BET_PCT (source "autodetect")
+      3. MAX_TRADE_SIZE_USDC absolute ceiling (wins via min() against 1/2,
+         or standalone as source "absolute")
+      4. Fallback to MAX_RISK (100.0), source "default"
 
     Defensive parsing: invalid (non-float, non-positive) env values are
     treated as unset and logged. MAX_BET_PCT > 1.0 is also rejected as
-    nonsense. When MAX_BET_PCT is invalid but PORTFOLIO_SIZE_USDC is valid,
+    nonsense. When MAX_BET_PCT is invalid but a portfolio size is valid,
     we fall back to the default pct (DEFAULT_MAX_BET_PCT = 0.20) so a bad
     pct does not disable portfolio sizing entirely.
+
+    The absolute cap (MAX_TRADE_SIZE_USDC) applies regardless of portfolio
+    source: env-set or autodetected portfolios both get min()'d against it.
+    When the abs cap wins over an autodetected portfolio, the source label
+    flips to "absolute" (matches existing env-portfolio behavior).
     """
     portfolio = _env_float("PORTFOLIO_SIZE_USDC")
     if portfolio is not None and portfolio <= 0:
@@ -113,6 +152,15 @@ def compute_effective_max_risk() -> tuple[float, str]:
     source = "default"
 
     if portfolio is not None:
+        portfolio_value = portfolio
+        source = "env"
+    elif portfolio_override is not None and portfolio_override > 0:
+        portfolio_value = portfolio_override
+        source = "autodetect"
+    else:
+        portfolio_value = None
+
+    if portfolio_value is not None:
         pct = _env_float("MAX_BET_PCT", DEFAULT_MAX_BET_PCT)
         if pct is None or pct <= 0 or pct > 1.0:
             if pct is not None:
@@ -121,8 +169,7 @@ def compute_effective_max_risk() -> tuple[float, str]:
                     pct, DEFAULT_MAX_BET_PCT,
                 )
             pct = DEFAULT_MAX_BET_PCT
-        candidate = portfolio * pct
-        source = "portfolio"
+        candidate = portfolio_value * pct
 
     abs_cap = _env_float("MAX_TRADE_SIZE_USDC")
     if abs_cap is not None and abs_cap <= 0:
@@ -144,14 +191,54 @@ def compute_effective_max_risk() -> tuple[float, str]:
 def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
     """Assemble the executor stack from env vars.
 
-    POLYMARKET_MODE=paper  -> PaperExecutor (no network)
+    POLYMARKET_MODE=paper  -> PaperExecutor (no network, no client build)
     POLYMARKET_MODE=live   -> LiveExecutor (real CLOB orders)
     POLYMARKET_DRY_RUN=1   -> PaperExecutor (overrides mode)
+
+    In live mode (regardless of dry_run) we try to build the CLOB client
+    so we can auto-detect the funder's USDC balance and use it as the
+    portfolio size. Client build failures (no creds, no py-clob-client,
+    SG geo-block reaching clob.polymarket.com without the polybot VPN
+    netns) are non-fatal: we fall back to env/default sizing and, if the
+    mode was `live`, route to paper for safety.
     """
     mode = os.environ.get("POLYMARKET_MODE", "paper").lower()
     dry_run = os.environ.get("POLYMARKET_DRY_RUN", "0") == "1"
 
-    effective_max, source = compute_effective_max_risk()
+    # Attempt client build + autodetect only if mode is live. Paper users
+    # have no funder to query, and we don't want to drag in the VPN/client
+    # dependency for strategy-only comparison runs.
+    client = None
+    client_build_error: str | None = None
+    autodetected_portfolio: float | None = None
+    if mode == "live":
+        try:
+            from active_bots.execution.clob_client_factory import (
+                ClobFactoryError,
+                build_client,
+            )
+            client = build_client()
+        except ClobFactoryError as e:
+            client_build_error = str(e)
+            logger.warning(
+                "autodetect: could not build CLOB client (%s); "
+                "falling back to env/default portfolio size",
+                e,
+            )
+        except Exception as e:  # noqa: BLE001 — defensive: any import/init failure
+            client_build_error = f"unexpected error: {e}"
+            logger.warning(
+                "autodetect: unexpected error building CLOB client (%s); "
+                "falling back to env/default portfolio size",
+                e,
+            )
+
+        if client is not None:
+            autodetected_portfolio = fetch_portfolio_size_usdc(client)
+
+    effective_max, source = compute_effective_max_risk(
+        portfolio_override=autodetected_portfolio,
+    )
 
     max_daily_loss = _env_float("MAX_DAILY_LOSS_USDC", 300.0)
     if max_daily_loss is None or max_daily_loss <= 0:
@@ -165,46 +252,54 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
         ),
     )
     risk = RiskManager(risk_cfg)
-    logger.info(
-        "max_trade_size=%.2f source=%s (portfolio=%s pct=%s abs=%s)",
-        effective_max, source,
-        os.environ.get("PORTFOLIO_SIZE_USDC", "<unset>"),
-        os.environ.get("MAX_BET_PCT", f"{DEFAULT_MAX_BET_PCT:.2f}"),
-        os.environ.get("MAX_TRADE_SIZE_USDC", "<unset>"),
+
+    portfolio_str = (
+        f"${autodetected_portfolio:.2f}" if autodetected_portfolio is not None
+        else "<none>"
     )
 
+    # Paper path: POLYMARKET_MODE=paper, dry_run set, or live-mode client
+    # build failed. In all three cases return PaperExecutor and log why.
     if dry_run:
+        reason = f"dry-run; POLYMARKET_MODE={mode} ignored"
         logger.info(
-            "executor=paper (dry-run; POLYMARKET_MODE=%s ignored)",
-            mode,
+            "executor=paper (%s) portfolio=%s max_trade_size=$%.2f (%s)",
+            reason, portfolio_str, effective_max, source,
         )
         return PaperExecutor(), None, risk
 
     if mode != "live":
-        logger.info("executor=paper (MAX_TRADE_SIZE=%.0f)", risk_cfg.max_trade_size_usdc)
+        logger.info(
+            "executor=paper (POLYMARKET_MODE=%s) portfolio=%s max_trade_size=$%.2f (%s)",
+            mode, portfolio_str, effective_max, source,
+        )
         return PaperExecutor(), None, risk
 
-    from active_bots.execution.clob_client_factory import (
-        ClobFactoryError, build_client,
-    )
+    # mode == "live", not dry_run. If client build failed, fall back to paper.
+    if client is None:
+        logger.error(
+            "LIVE MODE REQUESTED BUT FAILED TO INIT CLIENT: %s",
+            client_build_error,
+        )
+        logger.error("Falling back to paper mode for safety")
+        logger.info(
+            "executor=paper (live-fallback) portfolio=%s max_trade_size=$%.2f (%s)",
+            portfolio_str, effective_max, source,
+        )
+        return PaperExecutor(), None, risk
+
     from active_bots.execution.live_executor import LiveExecutor
     from active_bots.execution.reconciler import Reconciler
     from active_bots.execution.token_resolver import TokenResolver
-
-    try:
-        client = build_client()
-    except ClobFactoryError as e:
-        logger.error("LIVE MODE REQUESTED BUT FAILED TO INIT CLIENT: %s", e)
-        logger.error("Falling back to paper mode for safety")
-        return PaperExecutor(), None, risk
 
     funder = os.environ.get("POLYMARKET_FUNDER", "").strip()
     resolver = TokenResolver()
     reconciler = Reconciler(funder_address=funder) if funder else None
 
     logger.info(
-        "executor=live funder=%s MAX_TRADE_SIZE=%.0f DAILY_LOSS=%.0f",
-        funder, risk_cfg.max_trade_size_usdc, risk_cfg.max_daily_loss_usdc,
+        "executor=live funder=%s portfolio=%s max_trade_size=$%.2f (%s) daily_loss=$%.0f",
+        funder, portfolio_str, effective_max, source,
+        risk_cfg.max_daily_loss_usdc,
     )
     return (
         LiveExecutor(client, resolver, risk, reconciler=reconciler, dry_run=False),
