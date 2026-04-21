@@ -67,6 +67,45 @@ class EffectiveMaxRiskTests(unittest.TestCase):
         self.assertEqual(val, 25.0)
         self.assertEqual(src, "absolute")
 
+    # ── Defensive parsing ────────────────────────────────────────────
+
+    def test_portfolio_non_numeric_treated_as_unset(self):
+        os.environ["PORTFOLIO_SIZE_USDC"] = "notanumber"
+        val, src = compute_effective_max_risk()
+        self.assertEqual(val, 100.0)
+        self.assertEqual(src, "default")
+
+    def test_portfolio_negative_treated_as_unset(self):
+        os.environ["PORTFOLIO_SIZE_USDC"] = "-1000"
+        val, src = compute_effective_max_risk()
+        self.assertEqual(val, 100.0)
+        self.assertEqual(src, "default")
+
+    def test_pct_over_one_falls_back_to_default(self):
+        # MAX_BET_PCT=2.0 is nonsensical (>100%); fall back to 0.20 default
+        # but keep the portfolio branch active.
+        os.environ["PORTFOLIO_SIZE_USDC"] = "1000"
+        os.environ["MAX_BET_PCT"] = "2.0"
+        val, src = compute_effective_max_risk()
+        self.assertAlmostEqual(val, 200.0)  # 1000 * 0.20 default
+        self.assertEqual(src, "portfolio")
+
+    def test_pct_zero_falls_back_to_default(self):
+        os.environ["PORTFOLIO_SIZE_USDC"] = "1000"
+        os.environ["MAX_BET_PCT"] = "0"
+        val, src = compute_effective_max_risk()
+        self.assertAlmostEqual(val, 200.0)  # 1000 * 0.20 default
+        self.assertEqual(src, "portfolio")
+
+    def test_portfolio_derived_beats_larger_abs_cap(self):
+        # 1000 * 0.20 = 200; abs cap 500; min(200, 500) = 200 → portfolio wins.
+        os.environ["PORTFOLIO_SIZE_USDC"] = "1000"
+        os.environ["MAX_BET_PCT"] = "0.20"
+        os.environ["MAX_TRADE_SIZE_USDC"] = "500"
+        val, src = compute_effective_max_risk()
+        self.assertAlmostEqual(val, 200.0)
+        self.assertEqual(src, "portfolio")
+
 
 if __name__ == "__main__":
     unittest.main()

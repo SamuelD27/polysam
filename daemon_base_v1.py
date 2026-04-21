@@ -44,6 +44,7 @@ except ImportError:
 EDGE_MIN = 0.10
 EDGE_MAX = 0.25
 MAX_RISK = 100.0
+DEFAULT_MAX_BET_PCT = 0.20
 SPREAD_COST = 0.01
 ENTRY_OFFSET = 120
 ENTRY_CUTOFF = 150
@@ -69,6 +70,23 @@ EVENTS_FILE = STATE_DIR / "events.jsonl"
 logger = logging.getLogger("daemon_base_v1")
 
 
+def _env_float(name: str, default: float | None = None) -> float | None:
+    """Parse a float env var, returning ``default`` on missing/invalid input.
+
+    Logs a warning on invalid non-empty values instead of raising, so the
+    long-running daemon can tolerate typos like ``PORTFOLIO_SIZE_USDC=1k``
+    without crashing at startup.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r (expected float); ignoring", name, raw)
+        return default
+
+
 def compute_effective_max_risk() -> tuple[float, str]:
     """Resolve per-trade max bet from env. Returns (value, source).
 
@@ -76,22 +94,45 @@ def compute_effective_max_risk() -> tuple[float, str]:
       1. PORTFOLIO_SIZE_USDC * MAX_BET_PCT (default 0.20)
       2. MAX_TRADE_SIZE_USDC absolute ceiling (wins if smaller)
       3. Fallback to MAX_RISK (100.0)
+
+    Defensive parsing: invalid (non-float, non-positive) env values are
+    treated as unset and logged. MAX_BET_PCT > 1.0 is also rejected as
+    nonsense. When MAX_BET_PCT is invalid but PORTFOLIO_SIZE_USDC is valid,
+    we fall back to the default pct (DEFAULT_MAX_BET_PCT = 0.20) so a bad
+    pct does not disable portfolio sizing entirely.
     """
-    portfolio = os.environ.get("PORTFOLIO_SIZE_USDC")
-    abs_cap = os.environ.get("MAX_TRADE_SIZE_USDC")
-    pct = float(os.environ.get("MAX_BET_PCT", "0.20"))
+    portfolio = _env_float("PORTFOLIO_SIZE_USDC")
+    if portfolio is not None and portfolio <= 0:
+        logger.warning(
+            "PORTFOLIO_SIZE_USDC=%s is non-positive; ignoring", portfolio,
+        )
+        portfolio = None
 
     candidate: float | None = None
     source = "default"
 
-    if portfolio is not None and portfolio.strip() != "":
-        candidate = float(portfolio) * pct
+    if portfolio is not None:
+        pct = _env_float("MAX_BET_PCT", DEFAULT_MAX_BET_PCT)
+        if pct is None or pct <= 0 or pct > 1.0:
+            if pct is not None:
+                logger.warning(
+                    "MAX_BET_PCT=%s out of range (0, 1]; using default %.2f",
+                    pct, DEFAULT_MAX_BET_PCT,
+                )
+            pct = DEFAULT_MAX_BET_PCT
+        candidate = portfolio * pct
         source = "portfolio"
 
-    if abs_cap is not None and abs_cap.strip() != "":
-        abs_val = float(abs_cap)
-        if candidate is None or abs_val < candidate:
-            candidate = abs_val
+    abs_cap = _env_float("MAX_TRADE_SIZE_USDC")
+    if abs_cap is not None and abs_cap <= 0:
+        logger.warning(
+            "MAX_TRADE_SIZE_USDC=%s is non-positive; ignoring", abs_cap,
+        )
+        abs_cap = None
+
+    if abs_cap is not None:
+        if candidate is None or abs_cap < candidate:
+            candidate = abs_cap
             source = "absolute"
 
     if candidate is None:
@@ -111,8 +152,12 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
 
     effective_max, source = compute_effective_max_risk()
 
+    max_daily_loss = _env_float("MAX_DAILY_LOSS_USDC", 300.0)
+    if max_daily_loss is None or max_daily_loss <= 0:
+        max_daily_loss = 300.0
+
     risk_cfg = RiskConfig(
-        max_daily_loss_usdc=float(os.environ.get("MAX_DAILY_LOSS_USDC", "300")),
+        max_daily_loss_usdc=max_daily_loss,
         max_trade_size_usdc=effective_max,
         kill_switch_file=Path(
             os.environ.get("KILL_SWITCH_FILE", "daemon_state/KILL")
@@ -123,7 +168,7 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
         "max_trade_size=%.2f source=%s (portfolio=%s pct=%s abs=%s)",
         effective_max, source,
         os.environ.get("PORTFOLIO_SIZE_USDC", "<unset>"),
-        os.environ.get("MAX_BET_PCT", "0.20"),
+        os.environ.get("MAX_BET_PCT", f"{DEFAULT_MAX_BET_PCT:.2f}"),
         os.environ.get("MAX_TRADE_SIZE_USDC", "<unset>"),
     )
 
@@ -889,12 +934,12 @@ async def run():
     state = DaemonState()
     ewma = EWMA()
     state.detect_market()
-    executor, resolver, _risk = build_executor()
+    executor, resolver, risk = build_executor()
     events = EventLogger(EVENTS_FILE)
     events.log(
         "startup", mode=executor.mode,
-        max_trade_size=_risk.config.max_trade_size_usdc,
-        max_daily_loss=_risk.config.max_daily_loss_usdc,
+        max_trade_size=risk.config.max_trade_size_usdc,
+        max_daily_loss=risk.config.max_daily_loss_usdc,
         dry_run=os.environ.get("POLYMARKET_DRY_RUN", "0") == "1",
     )
 
@@ -902,7 +947,7 @@ async def run():
     logger.info("  BASE: edge_min=%.2f edge_max=%.2f entry=%d-%ds", EDGE_MIN, EDGE_MAX, ENTRY_OFFSET, ENTRY_CUTOFF)
     logger.info("  ENHANCED: time-zones + profit-grabber + squeeze-detector")
 
-    effective_max = _risk.config.max_trade_size_usdc
+    effective_max = risk.config.max_trade_size_usdc
     tasks = [
         asyncio.create_task(binance_feed(state, ewma)),
         asyncio.create_task(rtds_feed(state)),
