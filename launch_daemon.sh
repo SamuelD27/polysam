@@ -154,6 +154,55 @@ fi
 
 echo "[launch] daemon pid=$DAEMON_PID"
 
+# ── Streamlit web GUI (host netns, reads state files only) ───────────────
+start_streamlit() {
+    if [[ ! -f "$PROJECT_DIR/scripts/dashboard_streamlit.py" ]]; then
+        return
+    fi
+    if ! command -v streamlit >/dev/null 2>&1; then
+        echo "[launch] streamlit not installed; skipping web GUI (run: uv pip install -r requirements.txt)"
+        return
+    fi
+    local spid
+    streamlit run "$PROJECT_DIR/scripts/dashboard_streamlit.py" \
+        --server.port 3006 \
+        --server.address 0.0.0.0 \
+        --server.headless true \
+        --server.fileWatcherType none \
+        --browser.gatherUsageStats false \
+        > "$STATE_DIR/streamlit.log" 2>&1 &
+    spid=$!
+    echo "[launch] streamlit GUI pid=$spid http://localhost:3006"
+    echo "$spid" > "$STATE_DIR/streamlit.pid"
+}
+
+start_streamlit
+
+stop_streamlit() {
+    local spid=""
+    if [[ -f "$STATE_DIR/streamlit.pid" ]]; then
+        spid=$(cat "$STATE_DIR/streamlit.pid" 2>/dev/null || true)
+    fi
+    if [[ -n "$spid" ]] && kill -0 "$spid" 2>/dev/null; then
+        echo "[launch] stopping streamlit pid=$spid"
+        kill "$spid" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6; do
+            if ! kill -0 "$spid" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        if kill -0 "$spid" 2>/dev/null; then
+            echo "[launch] streamlit did not exit in 6s; SIGKILL"
+            kill -9 "$spid" 2>/dev/null || true
+        fi
+        wait "$spid" 2>/dev/null || true
+    fi
+    # Safety net: any stray streamlit process bound to this dashboard.
+    pkill -f "streamlit run.*dashboard_streamlit" 2>/dev/null || true
+    rm -f "$STATE_DIR/streamlit.pid"
+}
+
 stop_daemon() {
     # Bounded escalation: SIGTERM the known PID + cmdline match,
     # wait up to 6s, then SIGKILL anything still alive. The outer
@@ -184,13 +233,14 @@ stop_daemon() {
     fi
 }
 
-trap 'stop_daemon; exit 0' INT TERM
+trap 'stop_streamlit; stop_daemon; exit 0' INT TERM
 
 # ── Rich TUI dashboard in foreground ─────────────────────────────────────
 echo "[launch] starting TUI dashboard (Ctrl-C stops dashboard + daemon)"
 sleep 2
 python3 "$PROJECT_DIR/scripts/dashboard.py" || true
 
-# Dashboard exited (Ctrl-C). Stop the daemon too.
+# Dashboard exited (Ctrl-C). Stop streamlit + daemon too.
+stop_streamlit
 stop_daemon
 echo "[launch] daemon stopped"
