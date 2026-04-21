@@ -50,6 +50,7 @@ ENTRY_OFFSET = 120
 ENTRY_CUTOFF = 150
 MARKET_DURATION = 300
 SECONDS_PER_YEAR = 31557600.0
+SHUTDOWN_TIMEOUT_S = 5.0
 
 MAX_CLOSED_TRADES = 200
 
@@ -471,48 +472,53 @@ async def rtds_feed(state: DaemonState):
                         await asyncio.sleep(5)
 
                 ping_task = asyncio.create_task(ping())
+                try:
+                    async for raw in ws:
+                        if isinstance(raw, str):
+                            try:
+                                msg = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                        else:
+                            continue
 
-                async for raw in ws:
-                    if isinstance(raw, str):
+                        payload = msg.get("payload")
+                        if not payload:
+                            continue
+
+                        slug = payload.get("slug", "") or payload.get("eventSlug", "")
+                        if not slug.startswith(SLUG_PREFIX):
+                            continue
+
+                        # Parse trade slug to check it matches current market
                         try:
-                            msg = json.loads(raw)
-                        except json.JSONDecodeError:
+                            trade_slug_tz = int(slug.split("-")[-1])
+                            if trade_slug_tz != state.t_zero:
+                                continue
+                        except (ValueError, TypeError):
                             continue
-                    else:
-                        continue
 
-                    payload = msg.get("payload")
-                    if not payload:
-                        continue
+                        outcome = payload.get("outcome", "")
+                        price = payload.get("price")
+                        if price is None:
+                            continue
+                        price = float(price)
 
-                    slug = payload.get("slug", "") or payload.get("eventSlug", "")
-                    if not slug.startswith(SLUG_PREFIX):
-                        continue
+                        if outcome in ("Up", "Yes"):
+                            state.market_price_up = price
+                        elif outcome in ("Down", "No"):
+                            state.market_price_up = 1.0 - price
+                        else:
+                            continue
 
-                    # Parse trade slug to check it matches current market
+                        state.market_price_ts = time.time()
+                finally:
+                    ping_task.cancel()
+                    # Best-effort: let it observe cancel. Don't await indefinitely.
                     try:
-                        trade_slug_tz = int(slug.split("-")[-1])
-                        if trade_slug_tz != state.t_zero:
-                            continue
-                    except (ValueError, TypeError):
-                        continue
-
-                    outcome = payload.get("outcome", "")
-                    price = payload.get("price")
-                    if price is None:
-                        continue
-                    price = float(price)
-
-                    if outcome in ("Up", "Yes"):
-                        state.market_price_up = price
-                    elif outcome in ("Down", "No"):
-                        state.market_price_up = 1.0 - price
-                    else:
-                        continue
-
-                    state.market_price_ts = time.time()
-
-                ping_task.cancel()
+                        await asyncio.wait_for(ping_task, timeout=1.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                        pass
 
         except (websockets.ConnectionClosed, OSError) as e:
             state.connections["rtds"] = False
@@ -972,12 +978,23 @@ async def run():
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:
-        pass
+        # handle_signal cancelled the tasks; wait briefly for them to unwind.
+        _, pending = await asyncio.wait(tasks, timeout=SHUTDOWN_TIMEOUT_S)
+        if pending:
+            logger.warning(
+                "Shutdown: %d task(s) did not exit in %.0fs; forcing",
+                len(pending), SHUTDOWN_TIMEOUT_S,
+            )
     finally:
         events.log("shutdown")
         events.close()
         logger.info("daemon_base_v1 stopped")
         PID_FILE.unlink(missing_ok=True)
+        if any(not t.done() for t in tasks):
+            # asyncio cleanup won't complete; force process exit so the next
+            # launch_daemon.sh run isn't blocked by the startup guard.
+            logger.error("Tasks still hung after timeout; calling os._exit")
+            os._exit(1)
 
 
 def _another_daemon_running() -> int | None:
