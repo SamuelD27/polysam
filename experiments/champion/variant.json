@@ -1,0 +1,11 @@
+{
+  "name": "champion",
+  "hypothesis": "Final session champion: squeeze disabled + tight TP. 100% TP rate across every round it ran, survived R5 catastrophic-loss event that blew up all squeeze-enabled variants.",
+  "tweak_type": "code_patch",
+  "env": {"TP_DELTA_MIN": "0.08", "TP_ABSOLUTE_FAVOR": "0.15"},
+  "patches": [
+    {"file": "daemon_base_v1.py",
+     "find": "    enh = EnhancedStrategy(max_risk=max_risk)",
+     "replace": "    enh = EnhancedStrategy(enable_squeeze=False, max_risk=max_risk)"}
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "crashed": false,
+  "roi": 0.7882761280370227,
+  "total_pnl": 122.64,
+  "total_risked": 155.58,
+  "trade_count": 5,
+  "win_rate": 0.8,
+  "max_dd_pct": 0.008741483481167244,
+  "composite": 0.9439053862964392,
+  "per_exit_type": {
+    "TP": 5,
+    "SL": 0,
+    "RESOLUTION": 0
+  },
+  "per_source": {
+    "edge": 5,
+    "squeeze": 0
+  }
+}

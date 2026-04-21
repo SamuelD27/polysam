@@ -1,7 +1,41 @@
 {
-  "variant": null,
-  "round": 0,
-  "metrics": null,
-  "created_at": null,
-  "note": "No champion yet — will be set after Round 1."
+  "variant": "r5_confirm_tp_tight_no_squeeze",
+  "round": 5,
+  "metrics": {
+    "crashed": false,
+    "roi": 0.3548877624909486,
+    "total_pnl": 49.01,
+    "total_risked": 138.1,
+    "trade_count": 4,
+    "win_rate": 1.0,
+    "max_dd_pct": 0.0,
+    "composite": 0.5548877624909486,
+    "per_exit_type": {
+      "TP": 4,
+      "SL": 0,
+      "RESOLUTION": 0
+    },
+    "per_source": {
+      "edge": 4,
+      "squeeze": 0
+    }
+  },
+  "config": {
+    "tweak_type": "code_patch",
+    "env": {
+      "TP_DELTA_MIN": "0.08",
+      "TP_ABSOLUTE_FAVOR": "0.15"
+    },
+    "patches": [
+      {
+        "file": "daemon_base_v1.py",
+        "find": "    enh = EnhancedStrategy(max_risk=max_risk)",
+        "replace": "    enh = EnhancedStrategy(enable_squeeze=False, max_risk=max_risk)"
+      }
+    ]
+  },
+  "created_at": "2026-04-21T19:43:58.289137+00:00",
+  "note": "Session champion. R5: 4/4 TPs, ROI +35.5%, composite +0.555. Crucially: survived the R5 market event that blew up all squeeze-enabled variants (-67% each). The squeeze-off pillar is the robust contributor.",
+  "session_status": "CONVERGED (5 rounds)",
+  "flat_round_count": 2
 }

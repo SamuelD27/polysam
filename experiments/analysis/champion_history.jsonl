@@ -1,0 +1,5 @@
+{"round": 1, "variant": null, "reason": "no qualifying variant", "ts": "2026-04-21T17:28:23.643796+00:00"}
+{"round": 2, "variant": "r2_sl_wide", "roi": 0.37346182357301705, "delta_vs_baseline_rel": 0.19903691813804172, "ts": "2026-04-21T18:01:41.779825+00:00"}
+{"round": 3, "variant": "r3_sl_wide_no_squeeze", "roi": 0.7882761280370227, "roi_vs_baseline_rel": 0.06919945725915881, "previous": "r2_sl_wide", "ts": "2026-04-21T18:35:08.045179+00:00"}
+{"round": 4, "variant": "r3_sl_wide_no_squeeze (kept, confirmation failed)", "round4_highest_qualifying_roi": 0.678, "round4_baseline_roi": 0.772, "flat_round_count": 1, "ts": "2026-04-21T19:08:06.821626+00:00"}
+{"round": 5, "variant": "r5_confirm_tp_tight_no_squeeze", "roi": 0.3548877624909486, "roi_vs_baseline_abs_delta": 1.0338877624909486, "converged": true, "ts": "2026-04-21T19:43:58.289137+00:00"}
