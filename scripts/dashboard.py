@@ -16,9 +16,9 @@ Ctrl-C to exit.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 from rich.align import Align
@@ -40,9 +40,20 @@ MARKET_DURATION = 300
 REFRESH_HZ = 2
 
 SPARK_CHARS = " ▁▂▃▄▅▆▇█"
-SPARK_WIDTH = 60
+SPARK_MIN_WIDTH = 20
+SPARK_MAX_WIDTH = 120
 PRICE_HISTORY_CAP = 80
 ACTION_CAP = 50
+LOG_TAIL_LINES = 10
+RECENT_TRADES_CAP = 5
+
+
+@dataclass(frozen=True)
+class TailerSnapshot:
+    base_actions: tuple[dict, ...]
+    enh_actions: tuple[dict, ...]
+    unified_actions: tuple[dict, ...]
+    events: tuple[dict, ...]
 
 
 def read_json(path: Path) -> dict | None:
@@ -246,7 +257,7 @@ def _render_action_line(a: dict, *, prefix: Text | None = None) -> Text:
     return line
 
 
-def build_orders_panel(actions: deque[dict]) -> Panel:
+def build_orders_panel(actions: tuple[dict, ...] | deque[dict]) -> Panel:
     if not actions:
         body: Text | Group = Text("no orders yet", style="dim")
     else:
@@ -255,11 +266,12 @@ def build_orders_panel(actions: deque[dict]) -> Panel:
     return Panel(body, title="orders", border_style="grey37", title_align="left")
 
 
-def build_strategy_panel(name: str, blob: dict, actions: deque[dict],
+def build_strategy_panel(name: str, blob: dict,
+                         actions: tuple[dict, ...] | deque[dict],
                          open_pos_key: str = "open_position") -> Panel:
     stats = blob.get("stats", {})
     pos = blob.get(open_pos_key)
-    trades = blob.get("closed_trades", [])[-5:]
+    trades = blob.get("closed_trades", [])[-RECENT_TRADES_CAP:]
 
     total_pnl = stats.get("total_pnl", 0.0)
     total = stats.get("total_trades", 0) or 0
@@ -320,7 +332,7 @@ def build_strategy_panel(name: str, blob: dict, actions: deque[dict],
         pos_panel = Panel(Align.center(Text("no position", style="dim")), title="position",
                           border_style="grey37", title_align="left")
 
-    # Recent trades (capped at 5)
+    # Recent trades (capped at RECENT_TRADES_CAP)
     trade_tbl = Table(box=None, show_header=True, expand=True, padding=(0, 1))
     trade_tbl.add_column("t", style="dim", width=6)
     trade_tbl.add_column("side", width=5)
@@ -393,7 +405,8 @@ def build_extras_panel(d: dict) -> Panel:
 
 def build_log_panel(lines: list[str]) -> Panel:
     body = Text("\n".join(lines), style="grey70", overflow="ellipsis")
-    return Panel(body, title="daemon.log (last 10)", border_style="grey37", title_align="left")
+    return Panel(body, title=f"daemon.log (last {LOG_TAIL_LINES})",
+                 border_style="grey37", title_align="left")
 
 
 def _render_prices_line(market_up: float | None) -> Text:
@@ -414,7 +427,7 @@ def _render_prices_line(market_up: float | None) -> Text:
     return line
 
 
-def _render_sparkline(prices: deque[float], width: int = SPARK_WIDTH) -> Text:
+def _render_sparkline(prices: deque[float], width: int) -> Text:
     line = Text()
     if not prices:
         line.append("no price history", style="dim")
@@ -448,10 +461,19 @@ def _render_stream_line(a: dict) -> Text:
     return _render_action_line(a, prefix=prefix)
 
 
-def build_live_panel(d: dict, prices: deque[float], unified: deque[dict]) -> Panel:
+def build_live_panel(d: dict, prices: deque[float],
+                     unified: tuple[dict, ...] | deque[dict],
+                     *, console_width: int) -> Panel:
     market_up = d.get("market_price_up") if d else None
     prices_line = Align.center(_render_prices_line(market_up))
-    spark_line = Align.center(_render_sparkline(prices))
+
+    # Live panel occupies ~2/3 of total console width; subtract ~14 chars for
+    # panel padding/borders and the "$lo  " / "  $hi" labels on the sparkline.
+    spark_width = max(
+        SPARK_MIN_WIDTH,
+        min(SPARK_MAX_WIDTH, console_width * 2 // 3 - 6 - 14),
+    )
+    spark_line = Align.center(_render_sparkline(prices, width=spark_width))
 
     stream = list(unified)[-5:]
     if stream:
@@ -465,8 +487,8 @@ def build_live_panel(d: dict, prices: deque[float], unified: deque[dict]) -> Pan
     return Panel(body, title="live", border_style="bright_blue", title_align="left")
 
 
-def render(d: dict, log_lines: list[str], tailer: "EventsTailer",
-           prices: deque[float]) -> Layout:
+def render(d: dict, log_lines: list[str], snap: TailerSnapshot,
+           prices: deque[float], *, console_width: int) -> Layout:
     if d is None:
         return Layout(Panel(Align.center(Text("waiting for daemon_state/state.json…",
                                                style="dim")), border_style="red"))
@@ -480,13 +502,14 @@ def render(d: dict, log_lines: list[str], tailer: "EventsTailer",
     )
     layout["body"].split_row(
         Layout(build_strategy_panel("BASE", d.get("base", {}),
-                                    tailer.base_actions), name="base"),
+                                    snap.base_actions), name="base"),
         Layout(build_strategy_panel("ENHANCED", d.get("enhanced", {}),
-                                    tailer.enh_actions), name="enh"),
+                                    snap.enh_actions), name="enh"),
     )
     layout["footer"].split_row(
         Layout(build_log_panel(log_lines), name="log", ratio=1),
-        Layout(build_live_panel(d, prices, tailer.unified_actions),
+        Layout(build_live_panel(d, prices, snap.unified_actions,
+                                console_width=console_width),
                name="live", ratio=2),
     )
     return layout
@@ -536,6 +559,14 @@ class EventsTailer:
         except OSError:
             return
 
+    def snapshot(self) -> TailerSnapshot:
+        return TailerSnapshot(
+            base_actions=tuple(self.base_actions),
+            enh_actions=tuple(self.enh_actions),
+            unified_actions=tuple(self.unified_actions),
+            events=tuple(self.events),
+        )
+
 
 def main() -> int:
     console = Console()
@@ -548,13 +579,15 @@ def main() -> int:
     with Live(console=console, refresh_per_second=REFRESH_HZ, screen=True) as live:
         while True:
             d = read_json(STATE_FILE)
-            log_lines = tail_lines(LOG_FILE, 10)
+            log_lines = tail_lines(LOG_FILE, LOG_TAIL_LINES)
             tailer.update()
+            snap = tailer.snapshot()
             if d:
                 btc = d.get("btc_price")
                 if isinstance(btc, (int, float)) and btc > 0:
                     prices.append(float(btc))
-            live.update(render(d, log_lines, tailer, prices))
+            live.update(render(d, log_lines, snap, prices,
+                               console_width=console.size.width))
             time.sleep(1.0 / REFRESH_HZ)
 
 
