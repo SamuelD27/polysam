@@ -410,20 +410,17 @@ def build_log_panel(lines: list[str]) -> Panel:
 
 
 def _render_prices_line(market_up: float | None) -> Text:
-    line = Text(justify="center")
+    line = Text(no_wrap=True, overflow="crop")
     if market_up is None:
-        line.append("UP  ", style="dim")
-        line.append("—", style="dim")
-        line.append("      DOWN  ", style="dim")
-        line.append("—", style="dim")
+        line.append("UP   —  ", style="dim")
+        line.append(" " * 7)
+        line.append("DOWN   —", style="dim")
         return line
     up = max(0.0, min(1.0, float(market_up)))
     down = 1.0 - up
-    line.append("UP  ", style="bold bright_green")
-    line.append(f"${up:.2f}", style="bold bright_green")
-    line.append("       ")
-    line.append("DOWN  ", style="bold bright_red")
-    line.append(f"${down:.2f}", style="bold bright_red")
+    line.append(f"UP  ${up:.2f}", style="bold bright_green")
+    line.append(" " * 7)
+    line.append(f"DOWN  ${down:.2f}", style="bold bright_red")
     return line
 
 
