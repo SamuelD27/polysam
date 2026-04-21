@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific runtime artifacts
+daemon_state/
+data/
+active_bots/plots/
+active_bots/backtest_*.csv
+daemon_state/KILL
+experiments/
