@@ -117,6 +117,54 @@ def test_conditioned_sampler_routing():
     sampler = ConditionedSampler(profiles, key_fn=lambda _ctx: "fresh")
     rng = random.Random(11)
     draws = [sampler.sample(object(), rng) for _ in range(500)]
-    assert max(draws) <= SG_WG_PRIOR.p999_ms * 1.00000001
+    # New 3-tuple shape: (latency_ms, bucket_key_used, profile_used).
+    assert all(b == "fresh" for _, b, _ in draws)
+    latencies = [d for d, _, _ in draws]
+    assert max(latencies) <= SG_WG_PRIOR.p999_ms * 1.00000001
     # sanity: at least some draws exceed DUBLIN p999, proving it routed to SG
-    assert any(d > DUBLIN_PRIOR.p999_ms for d in draws)
+    assert any(d > DUBLIN_PRIOR.p999_ms for d in latencies)
+
+
+def test_conditioned_sampler_fallback_on_missing_bucket():
+    sampler = ConditionedSampler(
+        profiles={"fresh": DUBLIN_PRIOR},
+        key_fn=lambda _ctx: "stale_high_vol",
+        fallback=SG_WG_PRIOR,
+    )
+    rng = random.Random(17)
+    latency, bucket, profile = sampler.sample({}, rng)
+    assert bucket == "fallback:stale_high_vol"
+    assert profile is SG_WG_PRIOR
+    assert 0.0 < latency <= SG_WG_PRIOR.p999_ms * 1.00000001
+
+
+def test_conditioned_sampler_fallback_when_key_fn_raises():
+    def bad_key(_ctx):
+        raise RuntimeError("no context")
+
+    sampler = ConditionedSampler(
+        profiles={"fresh": DUBLIN_PRIOR},
+        key_fn=bad_key,
+        fallback=SG_WG_PRIOR,
+    )
+    rng = random.Random(19)
+    latency, bucket, profile = sampler.sample({}, rng)
+    assert bucket == "fallback:unknown"
+    assert profile is SG_WG_PRIOR
+    assert 0.0 < latency <= SG_WG_PRIOR.p999_ms * 1.00000001
+
+
+def test_conditioned_sampler_accepts_empty_profiles_dict_with_fallback():
+    # Zero-measured-data case: profiles={} must degrade to the prior rather
+    # than raise. Per brief: "degrade gracefully to the prior when no
+    # measured distribution is available."
+    sampler = ConditionedSampler(
+        profiles={},
+        key_fn=lambda _ctx: "fresh",
+        fallback=SG_WG_PRIOR,
+    )
+    rng = random.Random(23)
+    latency, bucket, profile = sampler.sample({}, rng)
+    assert bucket == "fallback:fresh"
+    assert profile is SG_WG_PRIOR
+    assert 0.0 < latency <= SG_WG_PRIOR.p999_ms * 1.00000001

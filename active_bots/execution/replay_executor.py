@@ -42,7 +42,12 @@ from typing import Callable, Literal, Optional, Protocol
 
 from .book import Book, FillResult, freeze_last_book, walk_book
 from .fees import FeeCategory, fee_usdc as _default_fee
-from .latency import LatencyProfile, SG_WG_PRIOR, sample as _sample_latency
+from .latency import (
+    ConditionedSampler,
+    LatencyProfile,
+    SG_WG_PRIOR,
+    sample as _sample_latency,
+)
 
 NAN = float("nan")
 _ONE = Decimal("1")
@@ -89,6 +94,11 @@ class OrderRequest:
     t_zero_ns: Optional[int] = None
     t_end_ns: Optional[int] = None
     edge_at_signal: float = NAN
+    # Latency-sampling context (spec §3.1 / §3.3): harness populates these
+    # when it has signal; absent, default "unk" lets a ConditionedSampler
+    # fall through to its configured fallback profile.
+    tunnel_age_bucket: str = "unk"
+    vol_regime: str = "unk"
 
 
 @dataclass(frozen=True)
@@ -252,6 +262,7 @@ class ReplayExecutor:
         books: BookStore,
         fees_fn: Callable[[Decimal, Decimal, FeeCategory], Decimal] = _default_fee,
         latency_profile: LatencyProfile = SG_WG_PRIOR,
+        latency_sampler: Optional[ConditionedSampler] = None,
         mode: Literal["freeze_depleted", "snap_back"] = "freeze_depleted",
         staleness_hard_ms: int = 500,
         staleness_soft_ms: int = 200,
@@ -261,6 +272,10 @@ class ReplayExecutor:
         self._books = books
         self._fees_fn = fees_fn
         self._profile = latency_profile
+        # When ``latency_sampler`` is supplied, per-order latency is drawn
+        # from it using (tunnel_age_bucket, vol_regime) context from the
+        # OrderRequest. Otherwise a single LatencyProfile is used (back-compat).
+        self._sampler = latency_sampler
         self._mode = mode
         self._staleness_hard_ms = int(staleness_hard_ms)
         self._staleness_soft_ms = int(staleness_soft_ms)
@@ -275,7 +290,19 @@ class ReplayExecutor:
         sign = _ONE if order.side == "BUY" else -_ONE
         snaps = self._books.snapshots_for(order.token_id)
 
-        latency_ms = _sample_latency(self._profile, self._rng)
+        if self._sampler is not None:
+            # Context is a dict so ConditionedSampler's key_fn can pick the
+            # field(s) relevant to its bucketing strategy.
+            ctx = {
+                "tunnel_age_bucket": order.tunnel_age_bucket,
+                "vol_regime": order.vol_regime,
+            }
+            latency_ms, bucket_used, profile_used = self._sampler.sample(ctx, self._rng)
+            latency_source = profile_used.source
+        else:
+            latency_ms = _sample_latency(self._profile, self._rng)
+            bucket_used = self._p_bucket_used
+            latency_source = self._profile.source
         t_ack_ns = decision_ts_ns + int(latency_ms * 1e6)
 
         book_dec, stale_dec_ms = _freeze_or_snap(snaps, decision_ts_ns, "freeze_depleted")
@@ -286,8 +313,8 @@ class ReplayExecutor:
             decision_ts_ns=decision_ts_ns,
             t_ack_ns=t_ack_ns,
             latency_ms=latency_ms,
-            latency_source=self._profile.source,
-            p_bucket_used=self._p_bucket_used,
+            latency_source=latency_source,
+            p_bucket_used=bucket_used,
             mode=self._mode,
         )
 
@@ -470,8 +497,8 @@ def _empty_record(
         diff_paper_minus_realised=NAN,
         thin_book_flag=False,
         price_extreme_flag=False,
-        vol_regime="unk",
-        tunnel_age_bucket="unk",
+        vol_regime=order.vol_regime,
+        tunnel_age_bucket=order.tunnel_age_bucket,
         time_in_market_bucket="unk",
         mode=mode,
     )

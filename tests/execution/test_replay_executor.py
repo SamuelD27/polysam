@@ -13,7 +13,12 @@ import pytest
 
 from active_bots.execution.book import Book, Level
 from active_bots.execution.fees import CRYPTO
-from active_bots.execution.latency import LatencyProfile, SG_WG_PRIOR
+from active_bots.execution.latency import (
+    ConditionedSampler,
+    DUBLIN_PRIOR,
+    LatencyProfile,
+    SG_WG_PRIOR,
+)
 from active_bots.execution.replay_executor import (
     DictBookStore,
     ExecutionRecord,
@@ -231,3 +236,81 @@ def test_time_in_market_bucket_last_30s():
     rec = ex.post_fak(order, decision_ts_ns=290_000_000_000)
     assert rec.classification == "full"
     assert rec.time_in_market_bucket == "last_30s"
+
+
+# ----- ConditionedSampler wiring -----
+
+
+def _order_with_context(
+    *, tunnel_age: str = "unk", vol: str = "unk"
+) -> OrderRequest:
+    return OrderRequest(
+        token_id="t1",
+        side="BUY",
+        requested_shares=Decimal("1"),
+        worst_price_limit=Decimal("0.99"),
+        decision_mid=Decimal("0.50"),
+        category=CRYPTO,
+        tick_size=TICK,
+        tunnel_age_bucket=tunnel_age,
+        vol_regime=vol,
+    )
+
+
+def test_executor_uses_conditioned_sampler_when_given() -> None:
+    book = _book(ts_ns=0, bids=[("0.49", "100")], asks=[("0.51", "100")])
+    store = _store([book])
+    sampler = ConditionedSampler(
+        profiles={"fresh_low": DUBLIN_PRIOR},
+        key_fn=lambda ctx: f"{ctx['tunnel_age_bucket']}_{ctx['vol_regime']}",
+        fallback=SG_WG_PRIOR,
+    )
+    ex = ReplayExecutor(
+        books=store,
+        latency_sampler=sampler,
+        staleness_hard_ms=10_000,
+        rng=random.Random(1),
+    )
+    rec = ex.post_fak(
+        _order_with_context(tunnel_age="fresh", vol="low"),
+        decision_ts_ns=0,
+    )
+    # Matched bucket → p_bucket_used is the key verbatim.
+    assert rec.p_bucket_used == "fresh_low"
+    # Record should also echo back the context tags for downstream groupby.
+    assert rec.tunnel_age_bucket == "fresh"
+    assert rec.vol_regime == "low"
+
+
+def test_executor_sampler_falls_back_when_bucket_missing() -> None:
+    book = _book(ts_ns=0, bids=[("0.49", "100")], asks=[("0.51", "100")])
+    store = _store([book])
+    sampler = ConditionedSampler(
+        profiles={"fresh_low": DUBLIN_PRIOR},  # bucket "stale_high" absent
+        key_fn=lambda ctx: f"{ctx['tunnel_age_bucket']}_{ctx['vol_regime']}",
+        fallback=SG_WG_PRIOR,
+    )
+    ex = ReplayExecutor(
+        books=store,
+        latency_sampler=sampler,
+        staleness_hard_ms=10_000,
+        rng=random.Random(2),
+    )
+    rec = ex.post_fak(
+        _order_with_context(tunnel_age="stale", vol="high"),
+        decision_ts_ns=0,
+    )
+    assert rec.p_bucket_used == "fallback:stale_high"
+
+
+def test_executor_without_sampler_still_uses_single_profile() -> None:
+    book = _book(ts_ns=0, bids=[("0.49", "100")], asks=[("0.51", "100")])
+    store = _store([book])
+    ex = ReplayExecutor(
+        books=store,
+        latency_profile=_fast_profile(),
+        staleness_hard_ms=10_000,
+        rng=random.Random(3),
+    )
+    rec = ex.post_fak(_order_with_context(), decision_ts_ns=0)
+    assert rec.p_bucket_used == "base"

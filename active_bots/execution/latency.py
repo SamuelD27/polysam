@@ -165,23 +165,44 @@ def fit_from_events_jsonl(
 
 
 class ConditionedSampler:
-    """Two-bucket sampler: {'fresh': profile_a, 'stale': profile_b}. key_fn
-    takes an arbitrary context object and returns a bucket key. Not used by the
-    MVP harness; ships for forward compatibility with tunnel-age conditioning.
+    """Multi-bucket latency sampler with graceful fallback.
+
+    Intended use: bucket by (tunnel_age_bucket, vol_regime) — e.g.
+    {"fresh_low": profile_a, "fresh_high": profile_b, "stale_low": ...}.
+    ``key_fn`` takes a context object (typically a dict) and returns a bucket
+    key. If the key is not present in ``profiles``, ``fallback`` is used; the
+    returned bucket label on ``sample`` is ``"fallback:{key}"`` so downstream
+    audit can distinguish measured-per-bucket data from a prior-backed draw.
+
+    Default ``fallback = SG_WG_PRIOR`` per spec §3.1, so a fresh session
+    (no empirical fit yet) that still wants bucket-aware plumbing degrades
+    cleanly to the documented Singapore+WireGuard prior.
     """
 
     def __init__(
         self,
         profiles: dict[str, LatencyProfile],
         key_fn: Callable[[object], str],
+        fallback: LatencyProfile = SG_WG_PRIOR,
     ):
-        if not profiles:
-            raise ValueError("profiles must be non-empty")
-        self._profiles: dict[str, LatencyProfile] = dict(profiles)
+        self._profiles: dict[str, LatencyProfile] = dict(profiles)  # allowed to be empty
         self._key_fn = key_fn
+        self._fallback = fallback
 
-    def sample(self, context: object, rng: random.Random) -> float:
-        key = self._key_fn(context)
-        if key not in self._profiles:
-            raise KeyError(f"no profile for bucket key {key!r}")
-        return sample(self._profiles[key], rng)
+    def sample(self, context: object, rng: random.Random) -> tuple[float, str, LatencyProfile]:
+        """Return ``(latency_ms, bucket_key_used, profile_used)``.
+
+        ``bucket_key_used`` is:
+          - the caller's key verbatim when ``profiles[key]`` is present;
+          - ``"fallback:{key}"`` when the key is not configured and the
+            fallback profile was used;
+          - ``"fallback:unknown"`` if ``key_fn`` raised.
+        """
+        try:
+            key = self._key_fn(context)
+        except Exception:
+            return sample(self._fallback, rng), "fallback:unknown", self._fallback
+        profile = self._profiles.get(key)
+        if profile is None:
+            return sample(self._fallback, rng), f"fallback:{key}", self._fallback
+        return sample(profile, rng), key, profile
