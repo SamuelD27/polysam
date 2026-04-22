@@ -28,6 +28,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from active_bots.enhanced_strategy import EnhancedStrategy
+from active_bots.refined_strategy import RefinedStrategy
 from active_bots.execution import Executor, MarketCtx
 from active_bots.execution.event_logger import EventLogger
 from active_bots.execution.paper_executor import PaperExecutor
@@ -244,9 +245,20 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
     if max_daily_loss is None or max_daily_loss <= 0:
         max_daily_loss = 300.0
 
+    # 0 disables. Default 30 matches the operator's preferred session cap.
+    max_session_loss = _env_float("MAX_SESSION_LOSS_USDC", 30.0)
+    if max_session_loss is None or max_session_loss < 0:
+        max_session_loss = 30.0
+
+    min_trade_size = _env_float("MIN_TRADE_SIZE_USDC", 10.0)
+    if min_trade_size is None or min_trade_size < 0:
+        min_trade_size = 10.0
+
     risk_cfg = RiskConfig(
         max_daily_loss_usdc=max_daily_loss,
+        max_session_loss_usdc=max_session_loss,
         max_trade_size_usdc=effective_max,
+        min_trade_size_usdc=min_trade_size,
         kill_switch_file=Path(
             os.environ.get("KILL_SWITCH_FILE", "daemon_state/KILL")
         ),
@@ -297,9 +309,10 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
     reconciler = Reconciler(funder_address=funder) if funder else None
 
     logger.info(
-        "executor=live funder=%s portfolio=%s max_trade_size=$%.2f (%s) daily_loss=$%.0f",
+        "executor=live funder=%s portfolio=%s max_trade_size=$%.2f (%s) "
+        "daily_loss=$%.0f session_loss=$%.0f",
         funder, portfolio_str, effective_max, source,
-        risk_cfg.max_daily_loss_usdc,
+        risk_cfg.max_daily_loss_usdc, risk_cfg.max_session_loss_usdc,
     )
     return (
         LiveExecutor(client, resolver, risk, reconciler=reconciler, dry_run=False),
@@ -313,8 +326,17 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
 def setup_logging():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(str(LOG_FILE), maxBytes=5242880, backupCount=3)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(handler)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s", "%Y-%m-%d %H:%M:%S",
+    ))
+    # Attach to the root logger so child loggers (execution.live, execution.risk,
+    # execution.events, execution.reconciler, etc.) all write to daemon.log.
+    # Previously the handler was only on the "daemon_base_v1" logger, so live
+    # executor warnings/errors went to stderr (lost under the TUI) and never
+    # reached the log — making live-mode rejections look mysterious.
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
     logger.setLevel(logging.INFO)
 
 
@@ -449,6 +471,33 @@ class DaemonState:
             "squeeze_trades": 0,
         }
 
+        # Refined strategy state (session champion — live-capable)
+        self.refined_fair_price = None
+        self.refined_position = None
+        self.refined_trades = []
+        self.refined_stats = {
+            "total_pnl": 0.0,
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "max_drawdown": 0.0,
+            "current_drawdown": 0.0,
+            "high_water_mark": 0.0,
+            "current_streak": 0,
+            "streak_type": None,
+            "start_time": time.time(),
+            "total_risked": 0.0,
+        }
+        self.refined_extra = {
+            "last_exit_type": None,
+            "last_time_zone": None,
+            "last_source": None,
+            "tp_count": 0,
+            "sl_count": 0,
+            "resolution_count": 0,
+            "edge_trades": 0,
+        }
+
         self.connections = {"binance": False, "rtds": False}
 
     def current_offset(self) -> float:
@@ -475,6 +524,7 @@ class DaemonState:
             self.market_price_ts = 0.0
             self.base_fair_price = None
             self.enh_fair_price = None
+            self.refined_fair_price = None
             return old_t_zero is not None
         return False
 
@@ -485,6 +535,7 @@ class DaemonState:
         fair = fair_price_up(self.btc_price, self.strike, self.sigma, tr)
         self.base_fair_price = fair
         self.enh_fair_price = fair
+        self.refined_fair_price = fair
 
     def to_dict(self) -> dict:
         return {
@@ -509,6 +560,13 @@ class DaemonState:
                 "closed_trades": self.enh_trades,
                 "stats": self.enh_stats,
                 "extra": self.enh_extra,
+            },
+            "refined": {
+                "fair_price": self.refined_fair_price,
+                "open_position": self.refined_position,
+                "closed_trades": self.refined_trades,
+                "stats": self.refined_stats,
+                "extra": self.refined_extra,
             },
             "last_update": time.time(),
         }
@@ -669,24 +727,27 @@ def update_stats(stats: dict, trade: dict):
 # ── Strategy loop ─────────────────────────────────────────────────────────
 
 async def strategy_loop(
-    state: DaemonState, executor: Executor, resolver, events: EventLogger,
-    max_risk: float = MAX_RISK,
+    state: DaemonState, executor: Executor, resolver, risk: RiskManager,
+    events: EventLogger, max_risk: float = MAX_RISK,
 ):
-    # BASE is a paper benchmark only — never trades live. Keeps the comparison
-    # honest when the live daemon is running.
+    # BASE and ENHANCED are paper benchmarks — never trade live. REFINED is
+    # the session champion (squeeze off + tighter TP) and uses the main
+    # executor, which may be live or paper depending on env.
     base_executor: Executor = PaperExecutor()
+    enh_executor: Executor = PaperExecutor()
     """Main strategy loop. Runs at 1 Hz.
 
     - Detects market rollover
-    - Enters positions at ENTRY_OFFSET..ENTRY_CUTOFF (base) or via EnhancedStrategy
+    - Enters positions at ENTRY_OFFSET..ENTRY_CUTOFF (base) or via strategies
     - Resolves at market expiry (T+300)
-    - Delegates order placement / fill bookkeeping to `executor`
+    - Delegates order placement / fill bookkeeping to the right executor
     """
     logger.info(
-        "Strategy loop started — enhanced=%s, base=paper (benchmark only), max_risk=%.2f",
+        "Strategy loop started — refined=%s, enhanced=paper, base=paper (benchmarks), max_risk=%.2f",
         executor.mode, max_risk,
     )
     enh = EnhancedStrategy(max_risk=max_risk)
+    refined = RefinedStrategy(max_risk=max_risk)
     market_ctx: MarketCtx | None = None
 
     def refresh_market_ctx() -> MarketCtx | None:
@@ -744,7 +805,7 @@ async def strategy_loop(
 
                 if state.enh_position is not None:
                     if state.btc_price > 0 and prev_ctx is not None:
-                        result = executor.resolve(
+                        result = enh_executor.resolve(
                             state.enh_position, prev_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -769,8 +830,37 @@ async def strategy_loop(
                         )
                     state.enh_position = None
 
-                # Reset enhanced strategy for new market
+                if state.refined_position is not None:
+                    if state.btc_price > 0 and prev_ctx is not None:
+                        result = executor.resolve(
+                            state.refined_position, prev_ctx, now,
+                            btc_price=state.btc_price,
+                        )
+                        if result is not None:
+                            trade = result.to_trade_dict()
+                            update_stats(state.refined_stats, trade)
+                            risk.record_trade(trade["pnl"], trade.get("resolved_time"))
+                            state.refined_trades.append(trade)
+                            if len(state.refined_trades) > MAX_CLOSED_TRADES:
+                                state.refined_trades = state.refined_trades[-MAX_CLOSED_TRADES:]
+                            state.refined_extra["resolution_count"] += 1
+                            state.refined_extra["last_exit_type"] = "RESOLUTION"
+                            outcome = "WIN" if trade["won"] else "LOSS"
+                            events.log("resolve", strategy="refined", trade=trade, trigger="rollover")
+                            logger.info(
+                                "REFINED RESOLVED [%s] %s %s PnL=%+.2f",
+                                outcome, trade["side"], trade["slug"], trade["pnl"],
+                            )
+                    else:
+                        logger.warning(
+                            "Cannot resolve refined position %s -- no BTC price or ctx",
+                            state.refined_position.get("slug"),
+                        )
+                    state.refined_position = None
+
+                # Reset strategies for new market
                 enh.reset(t_zero=state.t_zero, strike=state.strike)
+                refined.reset(t_zero=state.t_zero, strike=state.strike)
                 market_ctx = refresh_market_ctx()
                 events.log(
                     "market_rollover",
@@ -815,7 +905,7 @@ async def strategy_loop(
                                 time_zone=tz, spike_score=enh_action.get("spike_score"),
                                 offset=offset, slug=state.slug,
                             )
-                            result = executor.enter(
+                            result = enh_executor.enter(
                                 enh_action, market_ctx, now, source=src,
                             )
                             if result is not None:
@@ -857,7 +947,7 @@ async def strategy_loop(
                     action_type = enh_action.get("action")
 
                     if action_type in ("EXIT_TP", "EXIT_SL"):
-                        result = executor.exit(
+                        result = enh_executor.exit(
                             state.enh_position, enh_action, market_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -887,7 +977,7 @@ async def strategy_loop(
                             )
 
                     elif action_type == "RESOLVE":
-                        result = executor.resolve(
+                        result = enh_executor.resolve(
                             state.enh_position, market_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -911,6 +1001,122 @@ async def strategy_loop(
             if enh.squeeze is not None:
                 state.enh_extra["squeeze_active"] = enh.squeeze.is_squeeze_candidate
                 state.enh_extra["spike_score"] = round(enh.squeeze.spike_score, 2)
+
+            # ── Refined strategy tick ──
+            if (
+                state.sigma and state.btc_price > 0
+                and state.refined_position is None
+                and market_ctx is not None
+            ):
+                market_up = state.market_price_up
+                if market_up is not None:
+                    ref_action = refined.on_tick(
+                        state.btc_price, market_up, state.sigma, state.t_zero,
+                        market_price_ts=state.market_price_ts,
+                    )
+                    if ref_action is not None:
+                        action_type = ref_action.get("action")
+
+                        if action_type == "ENTER":
+                            tz = ref_action.get("time_zone")
+                            events.log(
+                                "entry_signal",
+                                strategy="refined", source="edge", side=ref_action.get("side"),
+                                entry_price=ref_action.get("entry_price"),
+                                edge=ref_action.get("edge"),
+                                size_usdc=ref_action.get("size_usdc"),
+                                time_zone=tz, offset=offset, slug=state.slug,
+                            )
+                            result = executor.enter(
+                                ref_action, market_ctx, now, source="edge",
+                            )
+                            if result is not None:
+                                state.refined_position = result.to_position_dict()
+                                state.refined_extra["edge_trades"] += 1
+                                state.refined_extra["last_source"] = "edge"
+                                state.refined_extra["last_time_zone"] = tz
+                                events.log(
+                                    "entry_filled",
+                                    strategy="refined", source="edge",
+                                    position=result.to_position_dict(),
+                                    order_id=result.order_id, token_id=result.token_id,
+                                )
+                                logger.info(
+                                    "REFINED ENTRY %s %s @%.3f edge=%.3f $%.2f tz=%s",
+                                    result.side, result.slug, result.entry_price,
+                                    result.edge, result.size_usdc, tz,
+                                )
+                            else:
+                                events.log(
+                                    "entry_rejected",
+                                    strategy="refined", source="edge", side=ref_action.get("side"),
+                                    slug=state.slug,
+                                )
+
+            # ── Refined: check profit grabber / resolution ──
+            if (
+                state.refined_position is not None and state.sigma
+                and state.btc_price > 0 and market_ctx is not None
+            ):
+                ref_action = refined.on_tick(
+                    state.btc_price, state.market_price_up or 0.5, state.sigma,
+                    state.t_zero, market_price_ts=state.market_price_ts,
+                )
+                if ref_action is not None:
+                    action_type = ref_action.get("action")
+
+                    if action_type in ("EXIT_TP", "EXIT_SL"):
+                        result = executor.exit(
+                            state.refined_position, ref_action, market_ctx, now,
+                            btc_price=state.btc_price,
+                        )
+                        if result is not None:
+                            trade = result.to_trade_dict()
+                            update_stats(state.refined_stats, trade)
+                            risk.record_trade(trade["pnl"], trade.get("resolved_time"))
+                            state.refined_trades.append(trade)
+                            if len(state.refined_trades) > MAX_CLOSED_TRADES:
+                                state.refined_trades = state.refined_trades[-MAX_CLOSED_TRADES:]
+                            if result.exit_type == "TP":
+                                state.refined_extra["tp_count"] += 1
+                            else:
+                                state.refined_extra["sl_count"] += 1
+                            state.refined_extra["last_exit_type"] = result.exit_type
+                            state.refined_position = None
+                            events.log("exit_filled", strategy="refined", trade=trade)
+                            logger.info(
+                                "REFINED %s %s %s PnL=%+.2f hold=%.0fs",
+                                result.exit_type, result.side, result.slug,
+                                result.pnl, result.hold_time_s or 0,
+                            )
+                        else:
+                            events.log(
+                                "exit_rejected",
+                                strategy="refined", action=action_type,
+                                position=state.refined_position,
+                            )
+
+                    elif action_type == "RESOLVE":
+                        result = executor.resolve(
+                            state.refined_position, market_ctx, now,
+                            btc_price=state.btc_price,
+                        )
+                        if result is not None:
+                            trade = result.to_trade_dict()
+                            update_stats(state.refined_stats, trade)
+                            risk.record_trade(trade["pnl"], trade.get("resolved_time"))
+                            state.refined_trades.append(trade)
+                            if len(state.refined_trades) > MAX_CLOSED_TRADES:
+                                state.refined_trades = state.refined_trades[-MAX_CLOSED_TRADES:]
+                            state.refined_extra["resolution_count"] += 1
+                            state.refined_extra["last_exit_type"] = "RESOLUTION"
+                            outcome = "WIN" if trade["won"] else "LOSS"
+                            events.log("resolve", strategy="refined", trade=trade)
+                            logger.info(
+                                "REFINED RESOLVED [%s] %s %s PnL=%+.2f",
+                                outcome, trade["side"], trade["slug"], trade["pnl"],
+                            )
+                        state.refined_position = None
 
             # ── Base strategy: simple edge entry at T+120..T+150 ──
             if ENTRY_OFFSET <= offset <= ENTRY_CUTOFF and state.base_position is None:
@@ -1053,7 +1259,7 @@ async def run():
         asyncio.create_task(binance_feed(state, ewma)),
         asyncio.create_task(rtds_feed(state)),
         asyncio.create_task(
-            strategy_loop(state, executor, resolver, events, max_risk=effective_max)
+            strategy_loop(state, executor, resolver, risk, events, max_risk=effective_max)
         ),
         asyncio.create_task(state_persister(state)),
     ]

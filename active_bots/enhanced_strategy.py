@@ -9,6 +9,7 @@ Three composable enhancements over the base fair-price edge strategy:
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -154,31 +155,75 @@ class TimeBasedStrategy:
 
 # ── Enhancement 2: Profit Grabber ──────────────────────────────────────────
 
-# Floor / cap for the confidence-adaptive TP threshold. Lower edge =
-# less conviction, take profits quickly; higher edge = ride the move further.
-TP_DELTA_MIN = 0.05
-TP_DELTA_MAX = 0.30
-# SL is symmetric: tight stop when conviction is low, wider when we have edge
-# (we expect noise around our model price — don't get shaken out).
-SL_DELTA_MIN = 0.05
-SL_DELTA_MAX = 0.20
+# TP floor only — the ceiling used to be a fixed cap but that fought the
+# time-decay we need as resolution approaches. The TP threshold now starts
+# at the entry edge and ramps DOWN as time runs out, so a profitable
+# position cashes in before the bell.
+TP_DELTA_MIN = float(os.environ.get("TP_DELTA_MIN", 0.05))
+# SL is symmetric but still capped: a wide SL protects high-conviction
+# trades from getting shaken out by noise around the model price.
+SL_DELTA_MIN = float(os.environ.get("SL_DELTA_MIN", 0.05))
+SL_DELTA_MAX = float(os.environ.get("SL_DELTA_MAX", 0.20))
+# Force-exit within this many seconds of resolution regardless of P&L.
+# Enhanced strategy is built to actively manage exits — never hold to
+# resolution. Set to 0 to disable (and let the market take you to T+300).
+FORCE_EXIT_BEFORE_S = float(os.environ.get("FORCE_EXIT_BEFORE_S", 30.0))
+# If delta_favor (realizable - entry) >= this, TP fires immediately
+# regardless of edge-scaled threshold or time remaining. Gives a simple
+# "take any X¢ profit, always" floor on top of the time-decay logic.
+# Set to 0 to disable.
+TP_ABSOLUTE_FAVOR = float(os.environ.get("TP_ABSOLUTE_FAVOR", 0.10))
 
 
-def adaptive_tp(edge: float) -> float:
-    """Map entry edge to TP threshold. Edge 0.10 → 0.10, 0.20 → 0.20, capped."""
-    return max(TP_DELTA_MIN, min(TP_DELTA_MAX, edge))
+def adaptive_tp(edge: float, time_remaining: float, tp_delta_min: float | None = None) -> float:
+    """Time-decayed TP threshold.
+
+    At entry (full cycle remaining): returns the entry edge — a big move
+    has to materialize before we give up a high-conviction hold.
+    As the clock runs down the threshold linearly shrinks toward
+    ``tp_delta_min`` so the last third of the cycle cashes out on
+    whatever profit exists.
+    """
+    floor = TP_DELTA_MIN if tp_delta_min is None else tp_delta_min
+    target = max(edge, floor)
+    if time_remaining <= 0:
+        return floor
+    frac = max(0.0, min(1.0, time_remaining / MARKET_DURATION))
+    return max(floor, floor + (target - floor) * frac)
 
 
-def adaptive_sl(edge: float) -> float:
+def adaptive_sl(
+    edge: float,
+    sl_delta_min: float | None = None,
+    sl_delta_max: float | None = None,
+) -> float:
     """SL grows with conviction so noise doesn't shake us out of high-edge trades."""
-    return max(SL_DELTA_MIN, min(SL_DELTA_MAX, 0.5 * edge + 0.05))
+    lo = SL_DELTA_MIN if sl_delta_min is None else sl_delta_min
+    hi = SL_DELTA_MAX if sl_delta_max is None else sl_delta_max
+    return max(lo, min(hi, 0.5 * edge + 0.05))
 
 
 class ProfitGrabber:
-    """Monitors open positions and triggers TP/SL exits before resolution."""
+    """Monitors open positions and triggers TP/SL exits before resolution.
 
-    def __init__(self):
-        pass
+    Per-instance TP/SL parameters (pass overrides to __init__) let multiple
+    strategies with different exit tunings coexist in one process. Defaults
+    fall back to the module-level env-driven globals.
+    """
+
+    def __init__(
+        self,
+        tp_delta_min: float | None = None,
+        sl_delta_min: float | None = None,
+        sl_delta_max: float | None = None,
+        tp_absolute_favor: float | None = None,
+        force_exit_before_s: float | None = None,
+    ):
+        self.tp_delta_min = TP_DELTA_MIN if tp_delta_min is None else tp_delta_min
+        self.sl_delta_min = SL_DELTA_MIN if sl_delta_min is None else sl_delta_min
+        self.sl_delta_max = SL_DELTA_MAX if sl_delta_max is None else sl_delta_max
+        self.tp_absolute_favor = TP_ABSOLUTE_FAVOR if tp_absolute_favor is None else tp_absolute_favor
+        self.force_exit_before_s = FORCE_EXIT_BEFORE_S if force_exit_before_s is None else force_exit_before_s
 
     def check_exit(
         self,
@@ -214,25 +259,34 @@ class ProfitGrabber:
         fair_up = compute_fair_price(btc_price, strike, sigma, time_remaining)
         current_fair = fair_up if side == "Up" else 1.0 - fair_up
 
-        # Without a fresh market quote we cannot honestly TP/SL — hold to
-        # resolution rather than booking phantom fills against the model.
         market_fresh = (
             market_price_up is not None
             and market_price_ts > 0.0
             and (now - market_price_ts) < 10.0
         )
-        if not market_fresh:
+        # Force-exit window: close to resolution, never hold — take whatever
+        # the last known price gives us. Outside the window we still require
+        # a fresh market quote to avoid booking phantom fills.
+        in_force_window = (
+            self.force_exit_before_s > 0 and time_remaining <= self.force_exit_before_s
+        )
+        if not market_fresh and not in_force_window:
+            return None
+        if market_price_up is None:
             return None
 
         realizable = market_price_up if side == "Up" else 1.0 - market_price_up
-
         delta_favor = realizable - entry_price
         delta_against = entry_price - realizable
 
-        tp_delta = adaptive_tp(entry_edge)
-        sl_delta = adaptive_sl(entry_edge)
+        tp_delta = adaptive_tp(entry_edge, time_remaining, tp_delta_min=self.tp_delta_min)
+        sl_delta = adaptive_sl(entry_edge, sl_delta_min=self.sl_delta_min, sl_delta_max=self.sl_delta_max)
 
-        if delta_favor >= tp_delta:
+        if in_force_window:
+            action = "EXIT_TP" if delta_favor >= 0 else "EXIT_SL"
+        elif self.tp_absolute_favor > 0 and delta_favor >= self.tp_absolute_favor:
+            action = "EXIT_TP"
+        elif delta_favor >= tp_delta:
             action = "EXIT_TP"
         elif delta_against >= sl_delta:
             action = "EXIT_SL"
@@ -253,6 +307,7 @@ class ProfitGrabber:
             "side": side,
             "tp_delta": tp_delta,
             "sl_delta": sl_delta,
+            "forced": in_force_window,
         }
 
 
@@ -436,6 +491,11 @@ class EnhancedStrategy:
         enable_profit_grabber: bool = True,
         enable_squeeze: bool = True,
         max_risk: float = MAX_RISK,
+        tp_delta_min: float | None = None,
+        sl_delta_min: float | None = None,
+        sl_delta_max: float | None = None,
+        tp_absolute_favor: float | None = None,
+        force_exit_before_s: float | None = None,
     ):
         if enable_time_based:
             self.time_strategy = TimeBasedStrategy(max_risk=max_risk)
@@ -443,7 +503,13 @@ class EnhancedStrategy:
             self.time_strategy = BaseStrategy(max_risk=max_risk)
 
         if enable_profit_grabber:
-            self.profit_grabber = ProfitGrabber()
+            self.profit_grabber = ProfitGrabber(
+                tp_delta_min=tp_delta_min,
+                sl_delta_min=sl_delta_min,
+                sl_delta_max=sl_delta_max,
+                tp_absolute_favor=tp_absolute_favor,
+                force_exit_before_s=force_exit_before_s,
+            )
         else:
             self.profit_grabber = None
 

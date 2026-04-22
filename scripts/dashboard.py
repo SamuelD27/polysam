@@ -52,6 +52,7 @@ RECENT_TRADES_CAP = 5
 class TailerSnapshot:
     base_actions: tuple[dict, ...]
     enh_actions: tuple[dict, ...]
+    refined_actions: tuple[dict, ...]
     unified_actions: tuple[dict, ...]
     events: tuple[dict, ...]
 
@@ -266,141 +267,290 @@ def build_orders_panel(actions: tuple[dict, ...] | deque[dict]) -> Panel:
     return Panel(body, title="orders", border_style="grey37", title_align="left")
 
 
-def build_strategy_panel(name: str, blob: dict,
-                         actions: tuple[dict, ...] | deque[dict],
-                         open_pos_key: str = "open_position") -> Panel:
-    stats = blob.get("stats", {})
-    pos = blob.get(open_pos_key)
-    trades = blob.get("closed_trades", [])[-RECENT_TRADES_CAP:]
-
-    total_pnl = stats.get("total_pnl", 0.0)
+def _compute_stats(stats: dict) -> dict:
+    """Derive display-friendly numbers from a stats blob."""
     total = stats.get("total_trades", 0) or 0
     wins = stats.get("wins", 0) or 0
     losses = stats.get("losses", 0) or 0
-    wr = 100.0 * wins / total if total else 0.0
+    total_pnl = stats.get("total_pnl", 0.0) or 0.0
     total_risked = stats.get("total_risked", 0.0) or 0.0
+    wr = 100.0 * wins / total if total else 0.0
     roi = (total_pnl / total_risked * 100) if total_risked else 0.0
+    return {
+        "total": total, "wins": wins, "losses": losses,
+        "total_pnl": total_pnl, "total_risked": total_risked,
+        "wr": wr, "roi": roi,
+        "max_drawdown": stats.get("max_drawdown", 0) or 0,
+        "streak": stats.get("current_streak", 0) or 0,
+        "streak_type": stats.get("streak_type") or "",
+    }
 
-    summary = Table.grid(expand=True, padding=(0, 1))
-    summary.add_column(justify="left")
-    summary.add_column(justify="right")
-    summary.add_row(
-        Text("PnL", style="dim"),
-        Text(f"{total_pnl:+.2f}", style=pnl_color(total_pnl)),
-    )
-    summary.add_row(
-        Text("trades", style="dim"),
-        Text(f"{total}  W={wins} L={losses}  {wr:.0f}%", style=""),
-    )
-    summary.add_row(
-        Text("risked", style="dim"),
-        Text(f"${total_risked:.0f}  ROI={roi:+.1f}%", style=pnl_color(roi)),
-    )
-    summary.add_row(
-        Text("drawdown", style="dim"),
-        Text(f"{stats.get('max_drawdown', 0):.2f}", style="red"),
-    )
-    streak_type = stats.get("streak_type") or ""
-    streak = stats.get("current_streak", 0) or 0
-    s_style = "green" if streak_type == "W" else "red" if streak_type == "L" else "dim"
-    summary.add_row(
-        Text("streak", style="dim"),
-        Text(f"{streak} {streak_type}" if streak_type else "–", style=s_style),
-    )
 
+def build_comparison_banner(d: dict) -> Panel:
+    """Compact 2-line banner showing BASE + ENHANCED paper-benchmark stats."""
+    base = _compute_stats((d.get("base") or {}).get("stats", {}) or {})
+    enh = _compute_stats((d.get("enhanced") or {}).get("stats", {}) or {})
+    enh_extra = (d.get("enhanced") or {}).get("extra", {}) or {}
+
+    t = Table.grid(expand=True, padding=(0, 1))
+    t.add_column(justify="left",  width=12)
+    t.add_column(justify="left",  width=14)  # PnL
+    t.add_column(justify="left",  width=22)  # trades
+    t.add_column(justify="left",  width=14)  # ROI
+    t.add_column(justify="left",  width=14)  # DD
+    t.add_column(justify="left")              # extras
+
+    for label, s, extra in (
+        ("BASE",     base, None),
+        ("ENHANCED", enh,  enh_extra),
+    ):
+        name_cell = Text(f"{label}", style="bold")
+        name_cell.append("  paper", style="dim")
+        pnl_cell = Text(f"PnL {s['total_pnl']:+.2f}", style=pnl_color(s["total_pnl"]))
+        trades_cell = Text(
+            f"{s['total']}tr W={s['wins']} L={s['losses']} {s['wr']:.0f}%",
+            style="dim white" if s["total"] else "dim",
+        )
+        roi_cell = Text(f"ROI {s['roi']:+.1f}%", style=pnl_color(s["roi"]))
+        dd_cell = Text(f"DD ${s['max_drawdown']:.1f}", style="red dim")
+
+        extras_cell = Text("")
+        if extra is not None:
+            extras_cell.append("TP/SL/Res ", style="dim")
+            extras_cell.append(
+                f"{extra.get('tp_count',0)}/{extra.get('sl_count',0)}/{extra.get('resolution_count',0)}",
+                style="white",
+            )
+            extras_cell.append("  sq ", style="dim")
+            sq_active = extra.get("squeeze_active")
+            extras_cell.append(
+                "●" if sq_active else "○",
+                style="magenta" if sq_active else "dim",
+            )
+            extras_cell.append(f" {extra.get('spike_score', 0):.1f}", style="dim")
+        t.add_row(name_cell, pnl_cell, trades_cell, roi_cell, dd_cell, extras_cell)
+
+    return Panel(t, title="[bold]benchmarks[/] [dim]— paper, for comparison[/]",
+                 border_style="grey50", title_align="left")
+
+
+def build_refined_panel(blob: dict, d: dict,
+                        actions: tuple[dict, ...] | deque[dict]) -> Panel:
+    """The main strategy panel. Bigger and more detailed than the benchmarks."""
+    stats = blob.get("stats", {}) or {}
+    extra = blob.get("extra", {}) or {}
+    pos = blob.get("open_position")
+    trades = blob.get("closed_trades", [])[-RECENT_TRADES_CAP:]
+    s = _compute_stats(stats)
     fair = blob.get("fair_price")
-    summary.add_row(
-        Text("fair", style="dim"),
-        Text(f"{fair:.3f}" if fair is not None else "–", style="cyan"),
-    )
+    market_up = d.get("market_price_up")
 
-    # Open position
+    # Headline stats row — single wide line
+    headline = Table.grid(expand=True, padding=(0, 2))
+    headline.add_column(justify="left")
+    headline.add_column(justify="left")
+    headline.add_column(justify="left")
+    headline.add_column(justify="left")
+    headline.add_column(justify="left")
+    headline.add_column(justify="left")
+
+    pnl_t = Text()
+    pnl_t.append("PnL ", style="dim")
+    pnl_t.append(f"{s['total_pnl']:+.2f}", style=f"bold {pnl_color(s['total_pnl'])}")
+
+    roi_t = Text()
+    roi_t.append("ROI ", style="dim")
+    roi_t.append(f"{s['roi']:+.1f}%", style=f"bold {pnl_color(s['roi'])}")
+
+    trades_t = Text()
+    trades_t.append("trades ", style="dim")
+    trades_t.append(f"{s['total']}", style="bold")
+    trades_t.append(f"  W={s['wins']} L={s['losses']} ", style="dim")
+    trades_t.append(f"{s['wr']:.0f}%", style="bold cyan" if s["total"] else "dim")
+
+    risked_t = Text()
+    risked_t.append("risked ", style="dim")
+    risked_t.append(f"${s['total_risked']:.0f}", style="white")
+
+    dd_t = Text()
+    dd_t.append("max DD ", style="dim")
+    dd_t.append(f"${s['max_drawdown']:.2f}", style="red")
+
+    streak_t = Text()
+    streak_t.append("streak ", style="dim")
+    s_style = "green" if s["streak_type"] == "W" else "red" if s["streak_type"] == "L" else "dim"
+    streak_t.append(
+        f"{s['streak']} {s['streak_type']}" if s["streak_type"] else "–", style=s_style,
+    )
+    headline.add_row(pnl_t, roi_t, trades_t, risked_t, dd_t, streak_t)
+
+    # Secondary row — fair vs market, exit counts
+    second = Table.grid(expand=True, padding=(0, 2))
+    second.add_column(justify="left")
+    second.add_column(justify="left")
+    second.add_column(justify="left")
+    second.add_column(justify="left")
+
+    fair_t = Text()
+    fair_t.append("fair(Up) ", style="dim")
+    fair_t.append(f"{fair:.3f}" if fair is not None else "–", style="cyan")
+
+    market_t = Text()
+    market_t.append("market(Up) ", style="dim")
+    market_t.append(f"{market_up:.3f}" if market_up is not None else "–", style="yellow")
+
+    edge_t = Text()
+    if fair is not None and market_up is not None:
+        delta = fair - market_up
+        edge_t.append("edge ", style="dim")
+        edge_t.append(
+            f"{abs(delta):+.3f}",
+            style="green" if abs(delta) >= 0.10 else "dim",
+        )
+        edge_t.append("  side ", style="dim")
+        edge_t.append(
+            "Up" if delta > 0 else ("Down" if delta < 0 else "–"),
+            style="green" if delta > 0 else ("red" if delta < 0 else "dim"),
+        )
+    else:
+        edge_t.append("edge –", style="dim")
+
+    exits_t = Text()
+    exits_t.append("TP/SL/Res ", style="dim")
+    exits_t.append(
+        f"{extra.get('tp_count',0)}/{extra.get('sl_count',0)}/{extra.get('resolution_count',0)}",
+        style="white",
+    )
+    last_xt = extra.get("last_exit_type") or "–"
+    exits_t.append("  last ", style="dim")
+    exits_t.append(str(last_xt), style="dim")
+
+    second.add_row(fair_t, market_t, edge_t, exits_t)
+
+    # Open position block
     if pos:
-        pos_tbl = Table.grid(expand=True, padding=(0, 1))
+        pos_tbl = Table.grid(expand=True, padding=(0, 2))
         pos_tbl.add_column(justify="left")
-        pos_tbl.add_column(justify="right")
+        pos_tbl.add_column(justify="left")
+        pos_tbl.add_column(justify="left")
+        pos_tbl.add_column(justify="left")
+        pos_tbl.add_column(justify="left")
+
         side = pos.get("side", "?")
         side_style = "bold green" if side == "Up" else "bold red"
-        pos_tbl.add_row("OPEN", Text(side, style=side_style))
-        pos_tbl.add_row("entry px", f"{pos.get('entry_price', 0):.3f}")
-        pos_tbl.add_row("size", f"${pos.get('size_usdc', 0):.2f}  ({pos.get('size_shares', 0):.1f} sh)")
-        pos_tbl.add_row("edge", f"{pos.get('edge', 0):.3f}")
-        if pos.get("source"):
-            pos_tbl.add_row("source", f"{pos.get('source')}/{pos.get('time_zone') or '–'}")
-        pos_panel = Panel(pos_tbl, title="position", border_style="yellow", title_align="left")
-    else:
-        pos_panel = Panel(Align.center(Text("no position", style="dim")), title="position",
-                          border_style="grey37", title_align="left")
+        entry_px = pos.get("entry_price", 0)
 
-    # Recent trades (capped at RECENT_TRADES_CAP)
+        open_t = Text("OPEN ", style="bold yellow")
+        open_t.append(side, style=side_style)
+
+        entry_t = Text()
+        entry_t.append("entry ", style="dim")
+        entry_t.append(f"{entry_px:.3f}", style="white")
+
+        size_t = Text()
+        size_t.append("size ", style="dim")
+        size_t.append(f"${pos.get('size_usdc', 0):.2f}", style="white")
+        size_t.append(f" ({pos.get('size_shares', 0):.1f} sh)", style="dim")
+
+        edge_t2 = Text()
+        edge_t2.append("edge ", style="dim")
+        edge_t2.append(f"{pos.get('edge', 0):.3f}", style="cyan")
+
+        # Unrealized
+        realizable = None
+        if market_up is not None:
+            realizable = market_up if side == "Up" else 1.0 - market_up
+        unreal_t = Text()
+        if realizable is not None:
+            favor = realizable - entry_px
+            unreal_t.append("realizable ", style="dim")
+            unreal_t.append(f"{realizable:.3f}", style="yellow")
+            unreal_t.append("  favor ", style="dim")
+            unreal_t.append(
+                f"{favor:+.3f}",
+                style=pnl_color(favor),
+            )
+        else:
+            unreal_t.append("realizable –", style="dim")
+
+        pos_tbl.add_row(open_t, entry_t, size_t, edge_t2, unreal_t)
+        pos_panel = Panel(pos_tbl, title="[bold]position[/]",
+                          border_style="yellow", title_align="left", padding=(0, 1))
+    else:
+        pos_panel = Panel(Align.center(Text("no position", style="dim")),
+                          title="[bold]position[/]", border_style="grey37",
+                          title_align="left", padding=(0, 1))
+
+    # Recent trades — wider table
     trade_tbl = Table(box=None, show_header=True, expand=True, padding=(0, 1))
     trade_tbl.add_column("t", style="dim", width=6)
     trade_tbl.add_column("side", width=5)
     trade_tbl.add_column("px in→out", width=14)
-    trade_tbl.add_column("pnl", justify="right", width=8)
+    trade_tbl.add_column("size", justify="right", width=8)
+    trade_tbl.add_column("pnl", justify="right", width=10)
+    trade_tbl.add_column("ROI", justify="right", width=8)
     trade_tbl.add_column("why", width=6)
+    trade_tbl.add_column("hold", justify="right", width=6)
     for t in reversed(trades):
         ts = t.get("resolved_time", 0)
         tm = time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
         side = t.get("side", "?")
         side_style = "green" if side == "Up" else "red"
         pnl = t.get("pnl", 0)
+        size_usdc = t.get("size_usdc", 0) or 0
+        t_roi = (pnl / size_usdc * 100) if size_usdc else 0
+        hold = t.get("hold_time_s")
+        hold_str = f"{int(hold)}s" if hold else "–"
         trade_tbl.add_row(
             tm,
             Text(side, style=side_style),
             f"{t.get('entry_price', 0):.3f}→{t.get('exit_price', 0):.3f}",
+            f"${size_usdc:.0f}",
             Text(f"{pnl:+.2f}", style=pnl_color(pnl)),
+            Text(f"{t_roi:+.1f}%", style=pnl_color(t_roi)),
             t.get("exit_type", ""),
+            hold_str,
         )
     if not trades:
-        trade_tbl.add_row("–", "–", "–", "–", "–")
+        trade_tbl.add_row("–", "–", "–", "–", "–", "–", "–", "–")
 
     orders_panel = build_orders_panel(actions)
 
     body = Group(
-        summary,
+        headline,
+        second,
         pos_panel,
-        Panel(trade_tbl, title="recent trades", border_style="grey37", title_align="left"),
+        Panel(trade_tbl, title="[bold]recent trades[/]",
+              border_style="grey37", title_align="left"),
         orders_panel,
     )
-    if name == "ENHANCED":
-        title = "[bold cyan]ENHANCED[/] [yellow](live-capable)[/]"
-        border = "cyan"
-    else:
-        title = "[bold white]BASE[/] [dim](paper benchmark)[/]"
-        border = "white"
-    return Panel(body, title=title, border_style=border, title_align="left")
+    title = "[bold bright_cyan]REFINED[/] [yellow](main strategy — live-capable)[/]"
+    return Panel(body, title=title, border_style="bright_cyan",
+                 title_align="left", padding=(0, 1))
 
 
 def build_extras_panel(d: dict) -> Panel:
-    extra = d.get("enhanced", {}).get("extra", {}) or {}
-    market_up = d.get("market_price_up")
-    tbl = Table.grid(padding=(0, 2))
+    """Refined-strategy detailed extras (squeeze removed — always off)."""
+    extra = d.get("refined", {}).get("extra", {}) or {}
+    tbl = Table.grid(expand=True, padding=(0, 2))
     tbl.add_column(justify="left")
     tbl.add_column(justify="left")
     tbl.add_column(justify="left")
     tbl.add_column(justify="left")
     tbl.add_row(
-        Text("market Up", style="dim"),
-        Text(f"{market_up:.3f}" if market_up is not None else "–",
-             style="yellow"),
-        Text("squeeze", style="dim"),
-        Text("active" if extra.get("squeeze_active") else "—",
-             style="magenta" if extra.get("squeeze_active") else "dim"),
-    )
-    tbl.add_row(
-        Text("spike", style="dim"),
-        f"{extra.get('spike_score', 0):.2f}",
         Text("last exit", style="dim"),
         str(extra.get("last_exit_type") or "–"),
+        Text("last zone", style="dim"),
+        str(extra.get("last_time_zone") or "–"),
     )
     tbl.add_row(
-        Text("tp/sl/res", style="dim"),
-        f"{extra.get('tp_count', 0)}/{extra.get('sl_count', 0)}/{extra.get('resolution_count', 0)}",
-        Text("edge/sq", style="dim"),
-        f"{extra.get('edge_trades', 0)}/{extra.get('squeeze_trades', 0)}",
+        Text("edge trades", style="dim"),
+        str(extra.get("edge_trades", 0)),
+        Text("config", style="dim"),
+        "TP_MIN=0.08  TP_ABS=0.15  squeeze=off",
     )
-    return Panel(tbl, title="enhanced extras", border_style="magenta", title_align="left")
+    return Panel(tbl, title="[bold]refined extras[/]",
+                 border_style="bright_cyan", title_align="left")
 
 
 def build_log_panel(lines: list[str]) -> Panel:
@@ -449,7 +599,9 @@ def _render_sparkline(prices: deque[float], width: int) -> Text:
 
 def _render_stream_line(a: dict) -> Text:
     strat = a.get("strategy") or ""
-    if strat == "enhanced":
+    if strat == "refined":
+        prefix = Text("[R]", style="bright_cyan")
+    elif strat == "enhanced":
         prefix = Text("[E]", style="cyan")
     elif strat == "base":
         prefix = Text("[B]", style="white")
@@ -493,15 +645,11 @@ def render(d: dict, log_lines: list[str], snap: TailerSnapshot,
     layout = Layout(name="root")
     layout.split(
         Layout(build_header(d), size=3, name="header"),
-        Layout(name="body"),
-        Layout(build_extras_panel(d), size=5, name="extras"),
+        Layout(build_comparison_banner(d), size=4, name="banner"),
+        Layout(build_refined_panel(d.get("refined", {}) or {}, d,
+                                   snap.refined_actions), name="main"),
+        Layout(build_extras_panel(d), size=4, name="extras"),
         Layout(name="footer", size=14),
-    )
-    layout["body"].split_row(
-        Layout(build_strategy_panel("BASE", d.get("base", {}),
-                                    snap.base_actions), name="base"),
-        Layout(build_strategy_panel("ENHANCED", d.get("enhanced", {}),
-                                    snap.enh_actions), name="enh"),
     )
     layout["footer"].split_row(
         Layout(build_log_panel(log_lines), name="log", ratio=1),
@@ -518,6 +666,7 @@ class EventsTailer:
         self.events: deque[dict] = deque(maxlen=cap)
         self.base_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.enh_actions: deque[dict] = deque(maxlen=ACTION_CAP)
+        self.refined_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.unified_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self._pos = 0
 
@@ -530,6 +679,8 @@ class EventsTailer:
             self.base_actions.append(action)
         elif strat == "enhanced":
             self.enh_actions.append(action)
+        elif strat == "refined":
+            self.refined_actions.append(action)
         self.unified_actions.append(action)
 
     def update(self) -> None:
@@ -560,6 +711,7 @@ class EventsTailer:
         return TailerSnapshot(
             base_actions=tuple(self.base_actions),
             enh_actions=tuple(self.enh_actions),
+            refined_actions=tuple(self.refined_actions),
             unified_actions=tuple(self.unified_actions),
             events=tuple(self.events),
         )
