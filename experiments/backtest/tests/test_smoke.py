@@ -371,6 +371,10 @@ def test_smoke_real_overlap_if_present(tmp_path: Path) -> None:
     iso_lo, iso_hi = _REAL_OVERLAP
     out_path = tmp_path / "real.parquet"
 
+    # The real scraper runs at 30 s interval per spec §8.1.2 deferred,
+    # so staleness below 500 ms is impossible. Raise the threshold
+    # generously to let the test actually exercise the walk when real
+    # overlap exists.
     harness_run(
         events=REAL_EVENTS,
         scrapes=REAL_DB,
@@ -381,6 +385,7 @@ def test_smoke_real_overlap_if_present(tmp_path: Path) -> None:
         fee_category="crypto",
         mode="freeze_depleted",
         seed=7,
+        staleness_hard_ms=10 * 60 * 1000,  # 10 min -- loose diagnostic mode
     )
     assert out_path.exists()
 

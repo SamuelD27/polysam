@@ -280,6 +280,8 @@ def run(
     mode: str = "freeze_depleted",
     seed: int = 0,
     asset_prefix: str = "btc",
+    staleness_hard_ms: int = 500,
+    staleness_soft_ms: int = 200,
 ) -> Path:
     t0_ns, t1_ns = parse_window(window)
     if latency_profile not in LATENCY_PROFILES:
@@ -330,6 +332,8 @@ def run(
         books=store,
         latency_profile=profile,
         mode=mode,  # type: ignore[arg-type]
+        staleness_hard_ms=staleness_hard_ms,
+        staleness_soft_ms=staleness_soft_ms,
         rng=rng,
     )
 
@@ -532,29 +536,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--mode", default="freeze_depleted", choices=["freeze_depleted", "snap_back", "both"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--asset-prefix", default="btc")
+    p.add_argument("--staleness-hard-ms", type=int, default=500,
+                   help="Reject fills where the walked book is older than this (ms). "
+                        "Spec default 500; raise for coarse-cadence diagnostic runs.")
+    p.add_argument("--staleness-soft-ms", type=int, default=200)
     args = p.parse_args(argv)
+    common = dict(
+        events=args.events, scrapes=args.scrapes, window=args.window,
+        tick_size=Decimal(args.tick_size), latency_profile=args.latency_profile,
+        fee_category=args.fee_category, seed=args.seed,
+        asset_prefix=args.asset_prefix,
+        staleness_hard_ms=args.staleness_hard_ms,
+        staleness_soft_ms=args.staleness_soft_ms,
+    )
     if args.mode == "both":
         out_fd = args.out.with_suffix(".freeze_depleted.parquet")
         out_sb = args.out.with_suffix(".snap_back.parquet")
-        run(
-            events=args.events, scrapes=args.scrapes, out=out_fd, window=args.window,
-            tick_size=Decimal(args.tick_size), latency_profile=args.latency_profile,
-            fee_category=args.fee_category, mode="freeze_depleted", seed=args.seed,
-            asset_prefix=args.asset_prefix,
-        )
-        run(
-            events=args.events, scrapes=args.scrapes, out=out_sb, window=args.window,
-            tick_size=Decimal(args.tick_size), latency_profile=args.latency_profile,
-            fee_category=args.fee_category, mode="snap_back", seed=args.seed,
-            asset_prefix=args.asset_prefix,
-        )
+        run(out=out_fd, mode="freeze_depleted", **common)
+        run(out=out_sb, mode="snap_back", **common)
     else:
-        run(
-            events=args.events, scrapes=args.scrapes, out=args.out, window=args.window,
-            tick_size=Decimal(args.tick_size), latency_profile=args.latency_profile,
-            fee_category=args.fee_category, mode=args.mode, seed=args.seed,
-            asset_prefix=args.asset_prefix,
-        )
+        run(out=args.out, mode=args.mode, **common)
     return 0
 
 
