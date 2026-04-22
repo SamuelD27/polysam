@@ -19,9 +19,10 @@ import from ``replay_executor`` or ``harness`` and has no side effects.
 from __future__ import annotations
 
 import bisect
+import dataclasses
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal
-from typing import Literal
+from typing import Iterable, Literal
 
 # Spec section 2.2: tick_size (string key) -> price decimal places.
 ROUNDING_CONFIG: dict[str, int] = {
@@ -49,9 +50,23 @@ class Book:
     token_id: str
     side_bids: tuple["Level", ...]
     side_asks: tuple["Level", ...]
-    tick_size: Decimal
+    tick_size: Decimal                       # symmetric default (also back-compat)
     ts_ns: int
     source_seq: int | None = None
+    # Per-side overrides (spec §2.2 / §8.2 nautilus_trader #2980): when the YES
+    # token runs a finer tick than the NO token on the same market, or during
+    # a mid-stream tick_size_change on only one side. Leave None to inherit
+    # tick_size.
+    tick_size_bids: Decimal | None = None
+    tick_size_asks: Decimal | None = None
+
+    @property
+    def bids_tick(self) -> Decimal:
+        return self.tick_size_bids if self.tick_size_bids is not None else self.tick_size
+
+    @property
+    def asks_tick(self) -> Decimal:
+        return self.tick_size_asks if self.tick_size_asks is not None else self.tick_size
 
 
 @dataclass(frozen=True)
@@ -132,19 +147,25 @@ def freeze_last_book(
 
 
 def _validate_book_prices(book: Book) -> None:
-    tick = book.tick_size
-    _tick_key(tick)  # raises ValueError if unknown
-    lo = tick
-    hi = Decimal(1) - tick
+    bids_tick = book.bids_tick
+    asks_tick = book.asks_tick
+    _tick_key(bids_tick)
+    _tick_key(asks_tick)
+    bid_lo = bids_tick
+    bid_hi = Decimal(1) - bids_tick
+    ask_lo = asks_tick
+    ask_hi = Decimal(1) - asks_tick
     for lvl in book.side_bids:
-        if lvl.price < lo or lvl.price > hi:
+        if lvl.price < bid_lo or lvl.price > bid_hi:
             raise ValueError(
-                f"bid price {lvl.price} outside [{lo}, {hi}]"
+                f"bid price {lvl.price} outside [{bid_lo}, {bid_hi}] "
+                f"(bids_tick={bids_tick}; see py-clob-client #218)"
             )
     for lvl in book.side_asks:
-        if lvl.price < lo or lvl.price > hi:
+        if lvl.price < ask_lo or lvl.price > ask_hi:
             raise ValueError(
-                f"ask price {lvl.price} outside [{lo}, {hi}]"
+                f"ask price {lvl.price} outside [{ask_lo}, {ask_hi}] "
+                f"(asks_tick={asks_tick}; see py-clob-client #218)"
             )
 
 
@@ -173,22 +194,26 @@ def walk_book(
         worst_price_limit = Decimal(str(worst_price_limit))
 
     _validate_book_prices(book)
-    tick = book.tick_size
-    lo = tick
-    hi = Decimal(1) - tick
-    if worst_price_limit < lo or worst_price_limit > hi:
-        raise ValueError(
-            f"worst_price_limit {worst_price_limit} outside [{lo}, {hi}]"
-        )
-
+    # worst_price_limit is validated against the side that will actually be
+    # consumed (BUY consumes asks; SELL consumes bids). Prevents placing a
+    # limit outside the py-clob-client #218 validator bounds on that side.
     if side == "BUY":
+        tick = book.asks_tick
         side_levels = book.side_asks
         price_ok = lambda p: p <= worst_price_limit  # noqa: E731
     elif side == "SELL":
+        tick = book.bids_tick
         side_levels = book.side_bids
         price_ok = lambda p: p >= worst_price_limit  # noqa: E731
     else:
         raise ValueError(f"invalid side {side!r}")
+    lo = tick
+    hi = Decimal(1) - tick
+    if worst_price_limit < lo or worst_price_limit > hi:
+        raise ValueError(
+            f"worst_price_limit {worst_price_limit} outside [{lo}, {hi}] "
+            f"for side={side} (tick={tick}; see py-clob-client #218)"
+        )
 
     remaining = requested_shares
     fills: list[FillLevel] = []
@@ -232,4 +257,62 @@ def walk_book(
         levels=tuple(fills),
         vwap=vwap,
         levels_consumed=levels_consumed,
+    )
+
+
+def apply_deltas(
+    base: Book,
+    deltas: Iterable[dict],
+    *,
+    new_ts_ns: int | None = None,
+    new_source_seq: int | None = None,
+) -> Book:
+    """Rebuild a Book by applying price-change deltas to a base snapshot.
+
+    Each delta is a dict matching the shape emitted by scrape_book.py's
+    price_change records:
+
+        {"side": "BUY" | "SELL", "price": "0.51", "size": "100"}
+
+    A ``size`` of ``"0"`` removes the level. Deltas are applied in
+    iteration order. The returned Book shares ``token_id`` and tick-size
+    state with ``base``; ``ts_ns`` and ``source_seq`` can be overridden
+    via kwargs (otherwise they are preserved from ``base``).
+
+    This is a pure function. It does not mutate ``base``. Caller must
+    ensure all deltas belong to the same token as ``base`` — no cross-
+    token checking is done here.
+    """
+    bids: dict[Decimal, Decimal] = {lvl.price: lvl.size for lvl in base.side_bids}
+    asks: dict[Decimal, Decimal] = {lvl.price: lvl.size for lvl in base.side_asks}
+
+    for d in deltas:
+        side = str(d.get("side", "")).upper()
+        price_raw = d.get("price")
+        size_raw = d.get("size", "0")
+        if price_raw is None:
+            continue
+        _reject_float(price_raw, size_raw)
+        price = price_raw if isinstance(price_raw, Decimal) else Decimal(str(price_raw))
+        size = size_raw if isinstance(size_raw, Decimal) else Decimal(str(size_raw))
+        book_side = bids if side == "BUY" else asks if side == "SELL" else None
+        if book_side is None:
+            continue
+        if size == Decimal(0):
+            book_side.pop(price, None)
+        else:
+            book_side[price] = size
+
+    new_bids = tuple(
+        Level(p, bids[p]) for p in sorted(bids.keys(), reverse=True)
+    )
+    new_asks = tuple(
+        Level(p, asks[p]) for p in sorted(asks.keys())
+    )
+    return dataclasses.replace(
+        base,
+        side_bids=new_bids,
+        side_asks=new_asks,
+        ts_ns=new_ts_ns if new_ts_ns is not None else base.ts_ns,
+        source_seq=new_source_seq if new_source_seq is not None else base.source_seq,
     )

@@ -12,6 +12,7 @@ from active_bots.execution.book import (
     Level,
     ROUNDING_CONFIG,
     SIZE_QUANTUM,
+    apply_deltas,
     freeze_last_book,
     quantize_price,
     walk_book,
@@ -243,3 +244,135 @@ def test_quantize_price_unknown_tick_raises() -> None:
     # float input must be rejected on the boundary.
     with pytest.raises(TypeError):
         quantize_price(0.5, Decimal("0.01"))  # type: ignore[arg-type]
+
+
+# ----- Per-side tick size (spec §2.2 / §8.2 nautilus_trader #2980) -----
+
+
+def test_per_side_tick_inherits_from_default() -> None:
+    b = _mk_book(
+        bids=[("0.49", "10")],
+        asks=[("0.51", "10")],
+        tick="0.01",
+    )
+    assert b.bids_tick == Decimal("0.01")
+    assert b.asks_tick == Decimal("0.01")
+
+
+def test_per_side_tick_asymmetric_finer_asks() -> None:
+    # YES-side book near the top end: asks live at 0.001-tick precision
+    # while bids are still on 0.01 tick (the asymmetric case from #2980).
+    b = Book(
+        token_id="tok",
+        side_bids=(Level(Decimal("0.49"), Decimal("10")),),
+        side_asks=(Level(Decimal("0.999"), Decimal("10")),),
+        tick_size=Decimal("0.01"),
+        tick_size_asks=Decimal("0.001"),
+        ts_ns=0,
+    )
+    assert b.bids_tick == Decimal("0.01")
+    assert b.asks_tick == Decimal("0.001")
+    # walk_book must accept a 0.999 ask on a 0.001-tick side without rejecting
+    # the book. A 0.01-tick validator would have thrown because 0.999 > 0.99.
+    res = walk_book(
+        b,
+        side="BUY",
+        requested_shares=Decimal("5"),
+        worst_price_limit=Decimal("0.999"),
+    )
+    assert res.classification == "full"
+    assert res.vwap == Decimal("0.999")
+
+
+def test_walk_rejects_worst_price_outside_sided_tick_bounds() -> None:
+    # asks_tick = 0.01 → limit 0.999 should be rejected for BUY (outside [0.01, 0.99])
+    # even though bids_tick=0.001 would allow it.
+    b = Book(
+        token_id="tok",
+        side_bids=(Level(Decimal("0.499"), Decimal("10")),),
+        side_asks=(Level(Decimal("0.51"), Decimal("10")),),
+        tick_size=Decimal("0.01"),
+        tick_size_bids=Decimal("0.001"),
+        ts_ns=0,
+    )
+    with pytest.raises(ValueError, match="py-clob-client #218"):
+        walk_book(
+            b, side="BUY",
+            requested_shares=Decimal("5"),
+            worst_price_limit=Decimal("0.999"),
+        )
+
+
+# ----- apply_deltas -----
+
+
+def test_apply_deltas_add_new_level() -> None:
+    base = _mk_book(
+        bids=[("0.49", "10")],
+        asks=[("0.51", "10")],
+        ts_ns=1000,
+    )
+    deltas = [{"side": "SELL", "price": "0.52", "size": "7"}]
+    new = apply_deltas(base, deltas, new_ts_ns=2000)
+    assert new.ts_ns == 2000
+    assert new.side_asks == (
+        Level(Decimal("0.51"), Decimal("10")),
+        Level(Decimal("0.52"), Decimal("7")),
+    )
+    # base is untouched (frozen)
+    assert base.ts_ns == 1000
+    assert len(base.side_asks) == 1
+
+
+def test_apply_deltas_update_existing_level() -> None:
+    base = _mk_book(
+        bids=[("0.49", "10")],
+        asks=[("0.51", "10")],
+    )
+    deltas = [{"side": "SELL", "price": "0.51", "size": "25"}]
+    new = apply_deltas(base, deltas)
+    assert new.side_asks == (Level(Decimal("0.51"), Decimal("25")),)
+
+
+def test_apply_deltas_remove_level_with_zero_size() -> None:
+    base = _mk_book(
+        bids=[("0.49", "10"), ("0.48", "5")],
+        asks=[("0.51", "10")],
+    )
+    deltas = [{"side": "BUY", "price": "0.48", "size": "0"}]
+    new = apply_deltas(base, deltas)
+    assert new.side_bids == (Level(Decimal("0.49"), Decimal("10")),)
+
+
+def test_apply_deltas_sort_invariant_preserved() -> None:
+    # Asks should remain ascending; bids descending, regardless of delta order.
+    base = _mk_book(
+        bids=[("0.49", "10")],
+        asks=[("0.55", "10")],
+    )
+    deltas = [
+        {"side": "SELL", "price": "0.60", "size": "5"},
+        {"side": "SELL", "price": "0.52", "size": "5"},
+        {"side": "BUY", "price": "0.45", "size": "3"},
+        {"side": "BUY", "price": "0.48", "size": "4"},
+    ]
+    new = apply_deltas(base, deltas)
+    ask_prices = [lvl.price for lvl in new.side_asks]
+    assert ask_prices == sorted(ask_prices)
+    bid_prices = [lvl.price for lvl in new.side_bids]
+    assert bid_prices == sorted(bid_prices, reverse=True)
+
+
+def test_apply_deltas_ignores_unknown_side() -> None:
+    base = _mk_book(bids=[("0.49", "10")], asks=[("0.51", "10")])
+    # "BID" / "ASK" (wrong nouns) should be no-ops rather than mutate the book
+    deltas = [{"side": "BID", "price": "0.40", "size": "99"}]
+    new = apply_deltas(base, deltas)
+    assert new.side_bids == base.side_bids
+    assert new.side_asks == base.side_asks
+
+
+def test_apply_deltas_rejects_float_price() -> None:
+    base = _mk_book(bids=[("0.49", "10")], asks=[("0.51", "10")])
+    with pytest.raises(TypeError):
+        apply_deltas(base, [{"side": "BUY", "price": 0.48, "size": "5"}])  # type: ignore[dict-item]
