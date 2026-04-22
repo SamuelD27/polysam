@@ -37,8 +37,14 @@ REAL_DB = REPO_ROOT / "data" / "btc5m.db"
 
 
 def _real_overlap_window() -> Optional[tuple[str, str]]:
-    """If real events.jsonl and btc5m.db share >= 30 min of overlap, return
-    the overlap as ISO strings; otherwise None."""
+    """If real events.jsonl entries live inside a 30+ minute window that also
+    has >= 10 orderbook snapshot rows AND at least one matching slug exists
+    in the markets table, return that window as ISO strings. Otherwise None.
+
+    A bounding-box intersection is not enough: events may span 01:10-09:44Z
+    while orderbooks exist at 14:07 yesterday and 11:40 today — the rectangle
+    intersects but has no actual data inside.
+    """
     if not REAL_EVENTS.exists() or not REAL_DB.exists():
         return None
     try:
@@ -47,25 +53,68 @@ def _real_overlap_window() -> Optional[tuple[str, str]]:
         return None
     if ev_min is None or ev_max is None:
         return None
+    iso_lo = datetime.fromtimestamp(ev_min, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    iso_hi = datetime.fromtimestamp(ev_max, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    if ev_max - ev_min < 30 * 60:
+        return None
     try:
-        ob_min_s, ob_max_s = _orderbooks_range(REAL_DB)
-    except Exception:
+        conn = sqlite3.connect(f"file:{REAL_DB}?mode=ro", uri=True)
+    except sqlite3.Error:
         return None
-    if ob_min_s is None or ob_max_s is None:
-        return None
-    ob_min = _iso_to_epoch(ob_min_s)
-    ob_max = _iso_to_epoch(ob_max_s)
-    lo = max(ev_min, ob_min)
-    hi = min(ev_max, ob_max)
-    if hi - lo < 30 * 60:
-        return None
-    iso_lo = datetime.fromtimestamp(lo, tz=timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-    iso_hi = datetime.fromtimestamp(hi, tz=timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    try:
+        # Count orderbook rows whose snapshot_time falls inside the events range.
+        row = conn.execute(
+            "SELECT COUNT(*) FROM orderbooks WHERE snapshot_time BETWEEN ? AND ?",
+            (iso_lo, iso_hi),
+        ).fetchone()
+        ob_rows = row[0] if row else 0
+        if ob_rows < 10:
+            return None
+        # At least one slug must be shared between events and markets table.
+        events_slugs = _events_slugs(REAL_EVENTS, ev_min, ev_max)
+        if not events_slugs:
+            return None
+        placeholders = ",".join("?" for _ in events_slugs)
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM markets WHERE slug IN ({placeholders})",
+            tuple(events_slugs),
+        ).fetchone()
+        shared = row[0] if row else 0
+        if shared == 0:
+            return None
+    finally:
+        conn.close()
     return iso_lo, iso_hi
+
+
+def _events_slugs(path: Path, lo: float, hi: float) -> set[str]:
+    out: set[str] = set()
+    with path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("type") != "entry_filled":
+                continue
+            ts = row.get("ts")
+            if ts is None:
+                continue
+            ts = float(ts)
+            if ts < lo or ts > hi:
+                continue
+            pos = row.get("position") or {}
+            slug = pos.get("slug")
+            if slug:
+                out.add(slug)
+    return out
 
 
 def _events_range(path: Path) -> tuple[Optional[float], Optional[float]]:
