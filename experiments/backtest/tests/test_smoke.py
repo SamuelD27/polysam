@@ -315,6 +315,7 @@ def test_smoke_synthetic_end_to_end(tmp_path: Path) -> None:
         fee_category="crypto",
         mode="freeze_depleted",
         seed=7,
+        input_format="sqlite",
     )
     assert result == out_path
     assert out_path.exists(), "harness did not write parquet file"
@@ -386,6 +387,8 @@ def test_smoke_real_overlap_if_present(tmp_path: Path) -> None:
         mode="freeze_depleted",
         seed=7,
         staleness_hard_ms=10 * 60 * 1000,  # 10 min -- loose diagnostic mode
+        input_format="sqlite",
+        staleness_policy="allow_stale_diagnostic",
     )
     assert out_path.exists()
 

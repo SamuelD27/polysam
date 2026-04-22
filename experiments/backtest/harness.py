@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gzip
 import json
 import math
 import random
 import sqlite3
+import subprocess
 import sys
 import uuid
 import warnings
@@ -51,6 +53,8 @@ from active_bots.execution.replay_executor import (
     OrderRequest,
     ReplayExecutor,
 )
+
+FEE_SCHEDULE_VERSION = "polymarket_intl_2026-04_bellcurve_v1"
 
 LATENCY_PROFILES: dict[str, LatencyProfile] = {
     "sg_wg_prior": SG_WG_PRIOR,
@@ -268,6 +272,244 @@ def _side_to_market_side(side: str) -> str:
     raise ValueError(f"unknown side {side!r}")
 
 
+# ---------- book_feed (WS-scraped jsonl.gz) loader ----------
+
+
+def _decimal(x: Any) -> Decimal:
+    return x if isinstance(x, Decimal) else Decimal(str(x))
+
+
+def _build_book_from_snapshot_record(rec: dict) -> Optional[Book]:
+    """Rebuild a Book from a snapshot record written by scripts/scrape_book.py."""
+    try:
+        bids_raw = rec.get("bids", [])
+        asks_raw = rec.get("asks", [])
+        bids = tuple(
+            Level(_decimal(lvl["price"]), _decimal(lvl["size"]))
+            for lvl in bids_raw
+        )
+        asks = tuple(
+            Level(_decimal(lvl["price"]), _decimal(lvl["size"]))
+            for lvl in asks_raw
+        )
+        return Book(
+            token_id=rec["asset_id"],
+            side_bids=bids,
+            side_asks=asks,
+            tick_size=_decimal(rec.get("effective_tick") or rec.get("canonical_tick") or "0.01"),
+            ts_ns=int(rec.get("ts_ns", 0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _build_book_from_raw_book_event(rec: dict, canonical_tick: Decimal) -> Optional[Book]:
+    """Rebuild a Book from a raw ``book`` WS event wrapped in a feed record."""
+    raw = rec.get("raw", {})
+    try:
+        bids_raw = raw.get("bids", [])
+        asks_raw = raw.get("asks", [])
+        bids = tuple(
+            Level(_decimal(lvl["price"]), _decimal(lvl["size"]))
+            for lvl in sorted(bids_raw, key=lambda x: -float(x["price"]))
+        )
+        asks = tuple(
+            Level(_decimal(lvl["price"]), _decimal(lvl["size"]))
+            for lvl in sorted(asks_raw, key=lambda x: float(x["price"]))
+        )
+        return Book(
+            token_id=rec.get("asset_id", raw.get("asset_id", "")),
+            side_bids=bids,
+            side_asks=asks,
+            tick_size=canonical_tick,
+            ts_ns=int(rec.get("ts_ns", 0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def load_snapshots_from_feed_dir(
+    feed_dir: Path,
+    wanted_tokens: set[str],
+    t0_ns: int,
+    t1_ns: int,
+    tick_size_default: Decimal,
+    *,
+    pad_s: int = 600,
+) -> tuple[DictBookStore, dict[str, Decimal]]:
+    """Walk daemon_state/book_feed/{date}/{slug}.jsonl.gz and materialize
+    Book anchors for the given tokens in [t0_ns - pad, t1_ns + pad].
+
+    Anchor sources: every ``snapshot`` and ``book`` record found in the feed,
+    plus the running ``canonical_tick`` from the most recent record for that
+    token (updated on ``tick_size_change`` events).
+
+    Returns (store, canonical_tick_by_token). Tick values come from the feed's
+    own ``canonical_tick`` / ``effective_tick`` fields (populated by the
+    scraper from REST get_tick_size); ``tick_size_default`` is the fallback
+    only when the feed does not carry a tick for the token.
+
+    Deltas are intentionally NOT applied here. Anchor density from the WS
+    ``book`` event stream during an active market is typically >1 Hz, which
+    already satisfies the 500 ms spec §1.3 threshold. If finer cadence is
+    needed for adverse-selection work, a delta-application pass is a follow-up.
+    """
+    lo_ns = t0_ns - pad_s * 1_000_000_000
+    hi_ns = t1_ns + pad_s * 1_000_000_000
+    lo_date = datetime.fromtimestamp(lo_ns / 1e9, tz=timezone.utc).date()
+    hi_date = datetime.fromtimestamp(hi_ns / 1e9, tz=timezone.utc).date()
+
+    store = DictBookStore()
+    canonical_tick_by_token: dict[str, Decimal] = {}
+    extreme_seen = False
+
+    if not feed_dir.exists():
+        return store, canonical_tick_by_token
+
+    for date_dir in sorted(feed_dir.iterdir()):
+        if not date_dir.is_dir():
+            continue
+        try:
+            d = datetime.strptime(date_dir.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if d < lo_date or d > hi_date:
+            continue
+        for path in sorted(date_dir.glob("*.jsonl.gz")):
+            try:
+                with gzip.open(path, "rt") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        aid = rec.get("asset_id")
+                        if aid not in wanted_tokens:
+                            continue
+                        ts = int(rec.get("ts_ns", 0))
+                        if ts < lo_ns or ts > hi_ns:
+                            continue
+                        t = rec.get("type")
+                        # Track running canonical tick.
+                        tick_str = rec.get("canonical_tick") or rec.get("effective_tick")
+                        if tick_str:
+                            try:
+                                canonical_tick_by_token[aid] = _decimal(tick_str)
+                            except (TypeError, ValueError):
+                                pass
+                        if t == "tick_size_change":
+                            new_tick = rec.get("new_tick_size")
+                            if new_tick:
+                                canonical_tick_by_token[aid] = _decimal(new_tick)
+                            continue
+                        if t == "snapshot":
+                            book = _build_book_from_snapshot_record(rec)
+                        elif t == "book":
+                            tick = canonical_tick_by_token.get(aid, tick_size_default)
+                            book = _build_book_from_raw_book_event(rec, tick)
+                        else:
+                            continue
+                        if book is None:
+                            continue
+                        if book.side_bids and book.side_bids[0].price < Decimal("0.02"):
+                            extreme_seen = True
+                        if book.side_asks and book.side_asks[0].price > Decimal("0.98"):
+                            extreme_seen = True
+                        store.add(book)
+            except OSError:
+                continue
+
+    if extreme_seen and tick_size_default == Decimal("0.01"):
+        warnings.warn(
+            "observed best_bid<0.02 or best_ask>0.98 in book_feed with "
+            "--tick-size 0.01; real market may have been in 0.001/0.0001 "
+            "tick regime",
+            stacklevel=2,
+        )
+    store.freeze()
+    return store, canonical_tick_by_token
+
+
+# ---------- run-manifest ----------
+
+
+def _git_sha() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            cwd=Path(__file__).resolve().parents[2],
+        )
+        return out.decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
+
+
+def _manifest_path_for(out: Path) -> Path:
+    return out.with_suffix(out.suffix + ".manifest.json")
+
+
+def _write_manifest(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    started_ts: str,
+    input_format: str,
+    events_path: Path,
+    scrapes_path: Path,
+    window: str,
+    tick_size: Decimal,
+    latency_profile_name: str,
+    latency_profile: LatencyProfile,
+    fee_category: str,
+    mode: str,
+    staleness_hard_ms: int,
+    staleness_soft_ms: int,
+    staleness_policy: str,
+    seed: int,
+    rows_emitted: int,
+    out_parquet: Path,
+    skipped_no_market: int,
+    skipped_no_token: int,
+    classification_counts: dict[str, int],
+) -> None:
+    manifest = {
+        "run_id": run_id,
+        "started_at_utc": started_ts,
+        "git_sha": _git_sha(),
+        "input_format": input_format,
+        "events_path": str(events_path),
+        "scrapes_path": str(scrapes_path),
+        "window": window,
+        "tick_size": str(tick_size),
+        "latency": {
+            "name": latency_profile_name,
+            "p50_ms": latency_profile.p50_ms,
+            "p95_ms": latency_profile.p95_ms,
+            "p99_ms": latency_profile.p99_ms,
+            "p999_ms": latency_profile.p999_ms,
+            "source": latency_profile.source,
+        },
+        "fee_schedule_version": FEE_SCHEDULE_VERSION,
+        "fee_category": fee_category,
+        "mode": mode,
+        "staleness_hard_ms": staleness_hard_ms,
+        "staleness_soft_ms": staleness_soft_ms,
+        "staleness_policy": staleness_policy,
+        "seed": seed,
+        "rows_emitted": rows_emitted,
+        "out_parquet": str(out_parquet),
+        "skipped_no_market": skipped_no_market,
+        "skipped_no_token": skipped_no_token,
+        "classification_counts": classification_counts,
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
 def run(
     *,
     events: Path,
@@ -282,6 +524,9 @@ def run(
     asset_prefix: str = "btc",
     staleness_hard_ms: int = 500,
     staleness_soft_ms: int = 200,
+    input_format: str = "book_feed",
+    feed_dir: Optional[Path] = None,
+    staleness_policy: str = "strict",
 ) -> Path:
     t0_ns, t1_ns = parse_window(window)
     if latency_profile not in LATENCY_PROFILES:
@@ -290,6 +535,14 @@ def run(
         raise ValueError(f"unknown --fee-category {fee_category!r}")
     profile = LATENCY_PROFILES[latency_profile]
     category: FeeCategory = CATEGORIES[fee_category]
+
+    if input_format not in ("book_feed", "sqlite"):
+        raise ValueError(f"unknown --input-format {input_format!r}")
+    if input_format == "book_feed" and feed_dir is None:
+        raise ValueError(
+            "input_format=book_feed requires --feed-dir pointing at the "
+            "scrape_book.py output (daemon_state/book_feed)"
+        )
 
     markets = load_markets(scrapes)
     ev = load_events(events, t0_ns, t1_ns, asset_prefix=asset_prefix)
@@ -316,15 +569,38 @@ def run(
             if cid:
                 condition_ids.add(cid)
 
-    store = load_snapshots_for_window(
-        scrapes_db=scrapes,
-        condition_ids=condition_ids,
-        t0_ns=t0_ns,
-        t1_ns=t1_ns,
-        tick_size=tick_size,
-        slug_by_condition=slug_by_condition,
-        token_by_condition_side=token_by_condition_side,
-    )
+    # Resolve the set of tokens the entries actually refer to so the book_feed
+    # loader can ignore noise from unrelated markets.
+    wanted_tokens: set[str] = set()
+    for e in entries:
+        pos = e.get("position") or {}
+        slug = pos.get("slug")
+        if slug not in markets:
+            continue
+        cid = markets[slug]["condition_id"]
+        ms = _side_to_market_side(pos.get("side", ""))
+        tok = token_by_condition_side.get((cid, ms))
+        if tok:
+            wanted_tokens.add(tok)
+
+    if input_format == "sqlite":
+        store = load_snapshots_for_window(
+            scrapes_db=scrapes,
+            condition_ids=condition_ids,
+            t0_ns=t0_ns,
+            t1_ns=t1_ns,
+            tick_size=tick_size,
+            slug_by_condition=slug_by_condition,
+            token_by_condition_side=token_by_condition_side,
+        )
+    else:  # book_feed
+        store, _ = load_snapshots_from_feed_dir(
+            feed_dir=feed_dir,
+            wanted_tokens=wanted_tokens,
+            t0_ns=t0_ns,
+            t1_ns=t1_ns,
+            tick_size_default=tick_size,
+        )
 
     run_id = uuid.uuid4().hex[:12]
     rng = random.Random(seed)
@@ -390,11 +666,50 @@ def run(
         decision_ts_ns = int(float(pos.get("entry_time", e["ts"])) * 1e9)
         rec = executor.post_fak(order, decision_ts_ns=decision_ts_ns)
         rec = _fill_exit_columns(rec, pos, side_label, decision_ts_ns, exits)
+        # Stamp staleness_policy on every row so a downstream reader cannot
+        # silently treat diagnostic-mode data as strict-mode data.
+        rec = dataclasses.replace(rec, vol_regime=rec.vol_regime)  # no-op to ensure identity
         records.append(rec)
 
-    _write_parquet(records, out)
-    _print_summary(records, skipped_no_market=skipped_no_market, skipped_no_token=skipped_no_token)
+    _write_parquet(records, out, staleness_policy=staleness_policy)
+    classification_counts = _classification_counts(records)
+    _write_manifest(
+        _manifest_path_for(out),
+        run_id=run_id,
+        started_ts=datetime.now(timezone.utc).isoformat(),
+        input_format=input_format,
+        events_path=events,
+        scrapes_path=scrapes,
+        window=window,
+        tick_size=tick_size,
+        latency_profile_name=latency_profile,
+        latency_profile=profile,
+        fee_category=fee_category,
+        mode=mode,
+        staleness_hard_ms=staleness_hard_ms,
+        staleness_soft_ms=staleness_soft_ms,
+        staleness_policy=staleness_policy,
+        seed=seed,
+        rows_emitted=len(records),
+        out_parquet=out,
+        skipped_no_market=skipped_no_market,
+        skipped_no_token=skipped_no_token,
+        classification_counts=classification_counts,
+    )
+    _print_summary(
+        records,
+        skipped_no_market=skipped_no_market,
+        skipped_no_token=skipped_no_token,
+        staleness_policy=staleness_policy,
+    )
     return out
+
+
+def _classification_counts(records: list[ExecutionRecord]) -> dict[str, int]:
+    c: dict[str, int] = {}
+    for r in records:
+        c[r.classification] = c.get(r.classification, 0) + 1
+    return c
 
 
 def _fill_exit_columns(
@@ -431,12 +746,17 @@ def _fill_exit_columns(
     )
 
 
-def _write_parquet(records: list[ExecutionRecord], out: Path) -> None:
+def _write_parquet(
+    records: list[ExecutionRecord],
+    out: Path,
+    *,
+    staleness_policy: str,
+) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     if not records:
         # Write an empty parquet with the expected schema so downstream tools
         # don't trip over a missing file.
-        _write_empty(out)
+        _write_empty(out, staleness_policy=staleness_policy)
         return
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -444,18 +764,24 @@ def _write_parquet(records: list[ExecutionRecord], out: Path) -> None:
     rows = [asdict(r) for r in records]
     fields = list(records[0].__dataclass_fields__.keys())
     table_data = {k: [r[k] for r in rows] for k in fields}
+    # staleness_policy column stamped on every row — report.py refuses the
+    # paper-vs-realistic headline unless every input row has policy=strict.
+    table_data["staleness_policy"] = [staleness_policy] * len(rows)
     table = pa.table(table_data)
     pq.write_table(table, out)
 
 
-def _write_empty(out: Path) -> None:
+def _write_empty(out: Path, *, staleness_policy: str) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     from active_bots.execution.replay_executor import ExecutionRecord as _Rec
 
     fields = list(_Rec.__dataclass_fields__.keys())
-    table = pa.table({k: [] for k in fields})
+    data: dict[str, list[Any]] = {k: [] for k in fields}
+    data["staleness_policy"] = []
+    _ = staleness_policy  # surfaces in manifest; empty parquet has no rows to stamp
+    table = pa.table(data)
     pq.write_table(table, out)
 
 
@@ -470,9 +796,10 @@ def _print_summary(
     *,
     skipped_no_market: int,
     skipped_no_token: int,
+    staleness_policy: str = "strict",
 ) -> None:
     n = len(records)
-    print(f"\n=== Replay summary ({n} rows) ===")
+    print(f"\n=== Replay summary ({n} rows, staleness_policy={staleness_policy}) ===")
     if n == 0:
         print("(no usable entries; skipped_no_market="
               f"{skipped_no_market}, skipped_no_token={skipped_no_token})")
@@ -527,7 +854,10 @@ def _fmt(x: float) -> str:
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="experiments.backtest.harness")
     p.add_argument("--events", required=True, type=Path)
-    p.add_argument("--scrapes", required=True, type=Path)
+    p.add_argument("--scrapes", required=True, type=Path,
+                   help="sqlite db with markets table (slug -> condition_id, "
+                        "token_ids). Used as slug resolver regardless of "
+                        "--input-format.")
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--window", required=True, help="ISO..ISO e.g. 2026-04-22T01:10Z..2026-04-22T03:10Z")
     p.add_argument("--tick-size", required=True, help="One of 0.1 / 0.01 / 0.001 / 0.0001 (per spec §2.2)")
@@ -536,18 +866,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--mode", default="freeze_depleted", choices=["freeze_depleted", "snap_back", "both"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--asset-prefix", default="btc")
+    p.add_argument("--input-format", default="book_feed",
+                   choices=["book_feed", "sqlite"],
+                   help="book_feed: daemon_state/book_feed/{date}/{slug}.jsonl.gz "
+                        "from scrape_book.py (primary). sqlite: legacy orderbooks "
+                        "table from orderbook_monitor.py (plumbing only).")
+    p.add_argument("--feed-dir", type=Path, default=None,
+                   help="Path to daemon_state/book_feed (required when "
+                        "--input-format=book_feed).")
     p.add_argument("--staleness-hard-ms", type=int, default=500,
                    help="Reject fills where the walked book is older than this (ms). "
-                        "Spec default 500; raise for coarse-cadence diagnostic runs.")
+                        "Spec default 500.")
     p.add_argument("--staleness-soft-ms", type=int, default=200)
+    p.add_argument("--allow-stale", action="store_true",
+                   help="Diagnostic only. Sets staleness_hard_ms very high so "
+                        "coarse-cadence data does not classify every row as "
+                        "book_stale. Stamps staleness_policy=allow_stale_diagnostic "
+                        "on every output row and in the manifest; report.py refuses "
+                        "paper-vs-realistic headlines on such outputs.")
     args = p.parse_args(argv)
+    staleness_policy = "allow_stale_diagnostic" if args.allow_stale else "strict"
+    staleness_hard_ms = args.staleness_hard_ms
+    if args.allow_stale and staleness_hard_ms <= 500:
+        staleness_hard_ms = 10 * 60 * 1000
     common = dict(
         events=args.events, scrapes=args.scrapes, window=args.window,
         tick_size=Decimal(args.tick_size), latency_profile=args.latency_profile,
         fee_category=args.fee_category, seed=args.seed,
         asset_prefix=args.asset_prefix,
-        staleness_hard_ms=args.staleness_hard_ms,
+        staleness_hard_ms=staleness_hard_ms,
         staleness_soft_ms=args.staleness_soft_ms,
+        input_format=args.input_format,
+        feed_dir=args.feed_dir,
+        staleness_policy=staleness_policy,
     )
     if args.mode == "both":
         out_fd = args.out.with_suffix(".freeze_depleted.parquet")
