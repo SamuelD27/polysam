@@ -9,10 +9,18 @@ Ctrl-C exits cleanly; launch_daemon.sh stops the daemon on exit.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# When run as `python3 scripts/dashboard.py`, sys.path[0] is scripts/, so the
+# repo-root `active_bots` package isn't importable. Add the repo root before
+# touching anything from active_bots.
+REPO = Path(__file__).resolve().parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 import requests
 from rich.text import Text
@@ -23,9 +31,7 @@ from textual.containers import Container
 from textual.widgets import Static, DataTable, RichLog
 from textual.worker import Worker, WorkerState
 
-from active_bots.execution.token_resolver import TokenResolver
-
-REPO = Path(__file__).resolve().parent.parent
+from active_bots.execution.token_resolver import TokenResolver  # noqa: E402
 STATE_DIR   = REPO / "daemon_state"
 STATE_FILE  = STATE_DIR / "state.json"
 LOG_FILE    = STATE_DIR / "daemon.log"
