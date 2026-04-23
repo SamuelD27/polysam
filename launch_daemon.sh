@@ -98,20 +98,24 @@ pick_dashboard_cmd() {
         rust)
             echo "[launch] DASHBOARD=rust is IN DEVELOPMENT -- not verified against live daemon. Use DASHBOARD=python to revert." >&2
             if [[ -x "$POLYCHART_BIN" ]]; then
+                echo "[launch] -> starting RUST TUI ($POLYCHART_BIN)" >&2
                 echo "$POLYCHART_BIN"
             else
                 echo "[launch] DASHBOARD=rust but $POLYCHART_BIN missing;" >&2
                 echo "[launch]   build it with:  cd tui && cargo build --release" >&2
                 echo "[launch]   falling back to python dashboard" >&2
+                echo "[launch] -> starting PYTHON TUI (tui/python/dashboard.py)" >&2
                 echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
             fi
             ;;
         python)
+            echo "[launch] -> starting PYTHON TUI (tui/python/dashboard.py)" >&2
             echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
             ;;
         *)
             echo "[launch] DASHBOARD=$choice not recognised (use python|rust);" >&2
             echo "[launch]   falling back to python" >&2
+            echo "[launch] -> starting PYTHON TUI (tui/python/dashboard.py)" >&2
             echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
             ;;
     esac
