@@ -1,7 +1,13 @@
 """Single-page markdown report from a replay parquet.
 
-Emits the headline paper-vs-book-walked ROI comparison plus a bps-level
-decomposition and the regime-conditional attribution table.
+Emits (in strict mode) the paper-vs-book-walked ROI comparison plus bps-
+level decomposition and a regime-conditional attribution table.
+
+When the input parquet's ``staleness_policy`` column contains anything
+other than ``strict`` on any row, the paper-vs-realistic headline is
+SUPPRESSED (spec §8.1.2 footgun). Row counts, classification breakdown,
+attribution-sum-to-total_IS invariant check, and manifest echo still
+print — they are what plumbing smoke tests need.
 
 Usage:
 
@@ -11,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 
@@ -31,10 +38,6 @@ def _median(xs):
     return xs[n // 2] if n % 2 == 1 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
 
 
-def _sum(xs):
-    return sum(_finite(xs))
-
-
 def _fmt_bps(x: float) -> str:
     if not math.isfinite(x):
         return "n/a"
@@ -47,29 +50,112 @@ def _fmt_pct(x: float) -> str:
     return f"{x * 100:+.2f}%"
 
 
+def _read_staleness_policy(table: pq.Table) -> str:
+    """Return 'strict' if every row is 'strict', otherwise the first non-strict
+    value found. Returns 'missing' if the column is absent from the parquet
+    (legacy file from before R1.6). Legacy is treated as non-strict for safety."""
+    names = set(table.column_names)
+    if "staleness_policy" not in names:
+        return "missing"
+    vals = table.column("staleness_policy").to_pylist()
+    if not vals:
+        return "strict"
+    uniq = set(vals)
+    if uniq == {"strict"}:
+        return "strict"
+    # return the first non-strict value for readability
+    for v in vals:
+        if v != "strict":
+            return str(v)
+    return "strict"
+
+
+def _sum_invariant_check(cols: dict, idxs: list[int]) -> tuple[int, int, int]:
+    """Return (checked, matched, nan_skipped) for rows where total_IS should
+    equal sum(half_spread + book_walk + latency_drift + fees) within 1e-9."""
+    checked = 0
+    matched = 0
+    skipped = 0
+    for i in idxs:
+        parts = [
+            cols.get("half_spread_cost", [])[i],
+            cols.get("book_walk_cost", [])[i],
+            cols.get("latency_drift_cost", [])[i],
+            cols.get("fees_cost", [])[i],
+        ]
+        total = cols.get("total_IS", [])[i]
+        if any(p is None or (isinstance(p, float) and math.isnan(p)) for p in parts):
+            skipped += 1
+            continue
+        if total is None or (isinstance(total, float) and math.isnan(total)):
+            skipped += 1
+            continue
+        checked += 1
+        s = sum(float(p) for p in parts)
+        if abs(float(total) - s) < 1e-9:
+            matched += 1
+    return checked, matched, skipped
+
+
+def _manifest_for(parquet_path: Path) -> dict | None:
+    candidate = parquet_path.with_suffix(parquet_path.suffix + ".manifest.json")
+    if not candidate.exists():
+        return None
+    try:
+        return json.loads(candidate.read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def report(parquet_path: Path) -> str:
     table = pq.read_table(str(parquet_path))
     n = table.num_rows
+    policy = _read_staleness_policy(table)
+    strict = (policy == "strict")
+
     lines: list[str] = []
     lines.append(f"# Book-walked replay report — {parquet_path.name}")
     lines.append("")
-    lines.append(f"Rows: **{n}**")
+    manifest = _manifest_for(parquet_path)
+    if manifest is not None:
+        lat = manifest.get("latency", {})
+        lines.append(
+            f"run_id: `{manifest.get('run_id')}`  "
+            f"git_sha: `{manifest.get('git_sha', '')[:12]}`  "
+            f"input_format: `{manifest.get('input_format')}`  "
+            f"mode: `{manifest.get('mode')}`"
+        )
+        lines.append(
+            f"window: `{manifest.get('window')}`  "
+            f"tick_size: `{manifest.get('tick_size')}`  "
+            f"latency: `{lat.get('name')}` "
+            f"(p50={lat.get('p50_ms')}ms, p95={lat.get('p95_ms')}ms, "
+            f"p99={lat.get('p99_ms')}ms, p999={lat.get('p999_ms')}ms, "
+            f"src={lat.get('source')})"
+        )
+        lines.append(
+            f"fee: `{manifest.get('fee_schedule_version')}` "
+            f"({manifest.get('fee_category')})  "
+            f"staleness: `{manifest.get('staleness_policy')}` "
+            f"(hard={manifest.get('staleness_hard_ms')}ms, "
+            f"soft={manifest.get('staleness_soft_ms')}ms)"
+        )
+        lines.append("")
+    lines.append(f"Rows: **{n}**  staleness_policy: **`{policy}`**")
     if n == 0:
         lines.append("")
         lines.append("_Empty parquet. Nothing to report._")
         return "\n".join(lines)
 
     cols = {c: table.column(c).to_pylist() for c in table.column_names}
+    cls = cols.get("classification") or []
 
     # Classification breakdown.
-    cls = cols.get("classification") or []
     counts: dict[str, int] = {}
     for c in cls:
         counts[c] = counts.get(c, 0) + 1
-    lines.append(
-        "Classifications: "
-        + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    )
+    lines.append("Classifications: "
+                 + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
     # Book staleness.
     stale = [s for s in cols.get("book_staleness_ms", []) if s >= 0]
@@ -80,13 +166,27 @@ def report(parquet_path: Path) -> str:
         lines.append(f"book_staleness_ms: median={med} p95={p95}")
     lines.append("")
 
-    # ROI comparison — paired rows only (both paper and realised present).
+    # Attribution-sum invariant check. This is what plumbing smoke tests need.
+    good_idx = [i for i, c in enumerate(cls) if c in ("full", "partial")]
+    checked, matched, skipped_nan = _sum_invariant_check(cols, good_idx)
+    lines.append(
+        f"Attribution-sum invariant (total_IS == Σ components): "
+        f"checked={checked} matched={matched} nan_skipped={skipped_nan}"
+    )
+    if checked and checked != matched:
+        lines.append(
+            f"**WARNING**: attribution-sum mismatches on {checked - matched} rows. "
+            f"This is a bug, not data — investigate replay_executor.post_fak."
+        )
+    lines.append("")
+
+    # Paired rows for ROI.
     paper = cols.get("paper_pnl_flat_0_5", [])
     realised = cols.get("realised_pnl_at_close", [])
     notional = cols.get("requested_notional_usdc", [])
-    paired_paper = []
-    paired_realised = []
-    paired_notional = []
+    paired_paper: list[float] = []
+    paired_realised: list[float] = []
+    paired_notional: list[float] = []
     for pp, rr, nn in zip(paper, realised, notional):
         if (
             isinstance(pp, float) and math.isfinite(pp)
@@ -96,21 +196,26 @@ def report(parquet_path: Path) -> str:
             paired_paper.append(pp)
             paired_realised.append(rr)
             paired_notional.append(nn)
-    lines.append(f"Paired (entry + exit) rows: **{len(paired_paper)}**")
-    if paired_paper:
-        gross = sum(paired_notional)
-        paper_roi = sum(paired_paper) / gross
-        realised_roi = sum(paired_realised) / gross
-        haircut = paper_roi - realised_roi
+
+    if strict:
+        lines.append(f"Paired (entry + exit) rows: **{len(paired_paper)}**")
+        if paired_paper:
+            gross = sum(paired_notional)
+            paper_roi = sum(paired_paper) / gross
+            realised_roi = sum(paired_realised) / gross
+            haircut = paper_roi - realised_roi
+            lines.append(
+                f"Paper flat-0.5 ROI: **{_fmt_pct(paper_roi)}** vs "
+                f"realised ROI: **{_fmt_pct(realised_roi)}** "
+                f"(haircut: **{_fmt_pct(haircut)}**)"
+            )
+    else:
         lines.append(
-            f"Paper flat-0.5 ROI: **{_fmt_pct(paper_roi)}** vs "
-            f"realised ROI: **{_fmt_pct(realised_roi)}** "
-            f"(haircut: **{_fmt_pct(haircut)}**)"
+            f"Paired (entry + exit) rows: **{len(paired_paper)}** "
+            f"(ROI comparison suppressed: staleness_policy=`{policy}`)"
         )
 
     # Decomposition.
-    good_idx = [i for i, c in enumerate(cls) if c in ("full", "partial")]
-
     def _col(name):
         return [cols[name][i] for i in good_idx] if name in cols else []
 
@@ -128,7 +233,8 @@ def report(parquet_path: Path) -> str:
     lines.append(f"- book_walk_cost:          {_fmt_bps(med_bw)}")
     lines.append(f"- fees_cost:               {_fmt_bps(med_fee)}")
     lines.append(f"- total_IS (sum):          {_fmt_bps(med_total)}")
-    lines.append(f"- diff_paper_minus_real:   {_fmt_bps(med_diff)}")
+    if strict:
+        lines.append(f"- diff_paper_minus_real:   {_fmt_bps(med_diff)}")
 
     # Regime table.
     lines.append("")
@@ -136,11 +242,22 @@ def report(parquet_path: Path) -> str:
     lines.append("")
     lines.append(attribute(parquet_path))
 
-    # Narrative bullet.
+    # Headline — suppressed on non-strict runs.
     lines.append("")
     lines.append("## Headline")
     lines.append("")
-    if paired_paper:
+    if not strict:
+        lines.append(
+            f"_Headline suppressed: parquet staleness_policy=`{policy}`. "
+            f"Schema validation, row counts, attribution-sum invariant, "
+            f"regime breakdown, and MinTRL above are still meaningful "
+            f"for plumbing smoke checks._"
+        )
+    elif paired_paper:
+        gross = sum(paired_notional)
+        paper_roi = sum(paired_paper) / gross
+        realised_roi = sum(paired_realised) / gross
+        haircut = paper_roi - realised_roi
         headline = (
             f"Paper flat-0.5 ROI {_fmt_pct(paper_roi)} vs "
             f"book-walked-equivalent ROI {_fmt_pct(realised_roi)}, "
@@ -148,9 +265,9 @@ def report(parquet_path: Path) -> str:
             f"{_fmt_bps(med_hs)} spread, {_fmt_bps(med_bw)} walk, "
             f"{_fmt_bps(med_ld)} latency, {_fmt_bps(med_fee)} fees."
         )
+        lines.append(headline)
     else:
-        headline = "No paired entry/exit rows; cannot compute haircut yet."
-    lines.append(headline)
+        lines.append("No paired entry/exit rows; cannot compute haircut yet.")
     return "\n".join(lines)
 
 
