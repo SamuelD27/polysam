@@ -156,6 +156,64 @@ def _strip_emoji(s: str) -> str:
     )
 
 
+def _side_text(side: str) -> Text:
+    if side == "Up":
+        return Text("Up  ", style="green")
+    if side == "Down":
+        return Text("Down", style="red")
+    return Text(f"{side:<4}", style="white")
+
+
+def _kind_text(kind: str) -> Text:
+    if kind == "BUY":
+        return Text("BUY ", style="bold bright_green")
+    if kind == "SELL":
+        return Text("SELL", style="bold bright_yellow")
+    if kind == "RES":
+        return Text("RES ", style="bold cyan")
+    return Text(f"{kind:<4}", style="white")
+
+
+def _render_action_line(a: dict) -> Text:
+    """Render one action dict (from EventsTailer) as a single Text line."""
+    ts = a.get("ts", 0)
+    tm = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "--:--:--"
+    line = Text()
+    line.append(tm, style="dim")
+    line.append("  ")
+    line.append_text(_kind_text(a.get("kind", "?")))
+    line.append(" ")
+    line.append_text(_side_text(a.get("side", "?")))
+    line.append(" ")
+
+    kind = a.get("kind")
+    if kind == "BUY":
+        price = a.get("price") or 0.0
+        size = a.get("size_usdc") or 0.0
+        line.append(f"@ ${price:.2f}", style="white")
+        line.append(f"   (${size:.2f})", style="dim")
+    elif kind == "SELL":
+        price = a.get("price") or 0.0
+        pnl = a.get("pnl") or 0.0
+        line.append(f"@ ${price:.2f}", style="white")
+        line.append("   ")
+        line.append(f"{pnl:+.2f}", style=pnl_color(pnl))
+        line.append("   ")
+        line.append(str(a.get("exit_type") or ""), style="dim")
+    elif kind == "RES":
+        won = a.get("won")
+        pnl = a.get("pnl") or 0.0
+        if won is True:
+            line.append("WON ", style="bold green")
+        elif won is False:
+            line.append("LOST", style="bold red")
+        else:
+            line.append("RES ", style="cyan")
+        line.append("   ")
+        line.append(f"{pnl:+.2f}", style=pnl_color(pnl))
+    return line
+
+
 MARKET_DURATION = 300
 
 
@@ -718,12 +776,57 @@ class OrderbookWidget(Container):
 
 
 class BaselinesWidget(Static):
-    def on_mount(self) -> None:
-        self.update("baselines placeholder")
+    """Two-line paper-benchmark banner: BASE + ENHANCED stats."""
+
+    def render_state(self, state: dict | None) -> None:
+        if state is None:
+            self.update("[dim]baselines: waiting[/]")
+            return
+        lines: list[Text] = []
+        for key, label in (("base", "BASE    "), ("enhanced", "ENHANCED")):
+            blob = state.get(key) or {}
+            stats = _compute_stats(blob.get("stats") or {})
+            line = Text()
+            line.append(f"{label}  ", style="bold")
+            line.append(f"PnL {stats['total_pnl']:+.2f}  ",
+                        style=pnl_color(stats['total_pnl']))
+            line.append(f"ROI {stats['roi']:+.1f}%  ",
+                        style=pnl_color(stats['roi']))
+            line.append(f"{stats['total']} tr W={stats['wins']} L={stats['losses']}  ",
+                        style="#94a3b8")
+            line.append(f"DD ${stats['max_drawdown']:.2f}", style="red")
+            lines.append(line)
+        self.update(Text("\n").join(lines))
 
 
 class OrdersLogWidget(RichLog):
-    pass
+    """Streaming log of refined-strategy actions, newest at bottom.
+
+    Tracks already-written actions by fingerprint so repeated ingest() of the
+    same EventsTailer deque does not duplicate lines.
+    """
+
+    DEFAULT_CSS = ""  # rely on dashboard.tcss for colours
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("max_lines", ACTION_CAP)
+        kwargs.setdefault("wrap", False)
+        kwargs.setdefault("markup", False)
+        super().__init__(*args, **kwargs)
+        self._seen: set[int] = set()
+
+    def ingest(self, actions) -> None:
+        for a in actions:
+            fp = hash((
+                a.get("ts"),
+                a.get("kind"),
+                a.get("strategy"),
+                round((a.get("price") or 0.0), 4),
+            ))
+            if fp in self._seen:
+                continue
+            self._seen.add(fp)
+            self.write(_render_action_line(a))
 
 
 class DashboardApp(App):
@@ -809,6 +912,8 @@ class DashboardApp(App):
             self.tailer.pnl_series.get("refined", []),
         )
         self.query_one(OrderbookWidget).render_snapshot(snap)
+        self.query_one(BaselinesWidget).render_state(state)
+        self.query_one(OrdersLogWidget).ingest(self.tailer.refined_actions)
 
 
 def main() -> int:
