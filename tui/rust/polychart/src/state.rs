@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::events::Action;
 use crate::http::OrderbookSnapshot;
 use crate::state_reader::StateSnapshot;
 
@@ -35,6 +36,9 @@ pub struct AppState {
 
     // Latest CLOB orderbook snapshot (None until the first poll).
     pub orderbook: Option<OrderbookSnapshot>,
+
+    // Tail of refined-strategy actions for the orders log panel.
+    pub refined_actions: VecDeque<Action>,
 
     pub quit: bool,
 }

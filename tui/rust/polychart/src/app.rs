@@ -108,8 +108,9 @@ pub async fn run() -> Result<()> {
                 };
                 tailer = returned;
                 if let Ok(mut app) = shared.lock() {
-                    // Swap tailer's series into the app's PnL map each tick.
+                    // Swap tailer outputs into the app.
                     app.pnl_series = tailer.pnl_series.clone();
+                    app.refined_actions = tailer.refined_actions.clone();
                 }
             }
         });
