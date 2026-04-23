@@ -1,747 +1,88 @@
 #!/usr/bin/env python3
-"""Live TUI dashboard for daemon_base_v1.
+"""Live Textual TUI dashboard for daemon_base_v1 (read-only).
 
-Reads daemon_state/state.json (refreshed by the daemon every 5s) and
-daemon_state/daemon.log + events.jsonl (streamed live), renders a single
-full-screen layout that refreshes at ~2 Hz.
-
-Run in its own terminal alongside the daemon:
-
-    conda activate polymarket-env
-    python3 scripts/dashboard.py
-
-Ctrl-C to exit.
+Reads daemon_state/state.json, events.jsonl, daemon.log -- never writes.
+Renders at ~2 Hz via a single _tick() that reads state.json once per frame.
+Launch:  conda activate polymarket-env && python3 scripts/dashboard.py
+Ctrl-C exits cleanly; launch_daemon.sh stops the daemon on exit.
 """
-
 from __future__ import annotations
 
-import json
-import time
-from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 
-from rich.align import Align
-from rich.console import Console, Group
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container
+from textual.widgets import Static, DataTable, RichLog
 
 REPO = Path(__file__).resolve().parent.parent
-STATE_DIR = REPO / "daemon_state"
-STATE_FILE = STATE_DIR / "state.json"
-LOG_FILE = STATE_DIR / "daemon.log"
+STATE_DIR   = REPO / "daemon_state"
+STATE_FILE  = STATE_DIR / "state.json"
+LOG_FILE    = STATE_DIR / "daemon.log"
 EVENTS_FILE = STATE_DIR / "events.jsonl"
-KILL_FILE = STATE_DIR / "KILL"
+KILL_FILE   = STATE_DIR / "KILL"
 
 MARKET_DURATION = 300
-REFRESH_HZ = 2
 
-SPARK_CHARS = " ▁▂▃▄▅▆▇█"
-SPARK_MIN_WIDTH = 20
-SPARK_MAX_WIDTH = 120
-PRICE_HISTORY_CAP = 80
-ACTION_CAP = 50
-LOG_TAIL_LINES = 10
-RECENT_TRADES_CAP = 5
 
+class HeaderWidget(Static):
+    def on_mount(self) -> None:
+        self.update("header - waiting for daemon")
 
-@dataclass(frozen=True)
-class TailerSnapshot:
-    base_actions: tuple[dict, ...]
-    enh_actions: tuple[dict, ...]
-    refined_actions: tuple[dict, ...]
-    unified_actions: tuple[dict, ...]
-    events: tuple[dict, ...]
 
+class LiveCurvesWidget(Container):
+    def compose(self) -> ComposeResult:
+        yield Static("UP - / DOWN -", id="hero-prices")
+        yield Static("btc chart placeholder", id="chart-btc")
+        yield Static("market/fair chart placeholder", id="chart-mkt")
 
-def read_json(path: Path) -> dict | None:
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
 
+class MainStrategyWidget(Container):
+    def compose(self) -> ComposeResult:
+        yield Static("refined headline placeholder", id="refined-headline")
+        yield Static("refined secondary placeholder", id="refined-secondary")
+        yield Static("pnl chart placeholder", id="chart-pnl")
+        yield Static("no position", id="refined-position")
+        yield DataTable(id="refined-trades")
 
-def tail_lines(path: Path, n: int = 8) -> list[str]:
-    if not path.exists():
-        return []
-    try:
-        with path.open("rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            block = 4096
-            buf = b""
-            while size > 0 and buf.count(b"\n") <= n:
-                read = min(block, size)
-                size -= read
-                f.seek(size)
-                buf = f.read(read) + buf
-            return [line for line in buf.decode(errors="replace").splitlines()[-n:]]
-    except OSError:
-        return []
 
+class OrderbookWidget(Container):
+    def compose(self) -> ComposeResult:
+        yield Static("book header placeholder", id="book-hdr")
+        yield DataTable(id="book-table")
 
-def pnl_color(v: float) -> str:
-    if v > 0:
-        return "bold green"
-    if v < 0:
-        return "bold red"
-    return "white"
 
+class BaselinesWidget(Static):
+    def on_mount(self) -> None:
+        self.update("baselines placeholder")
 
-def conn_pill(ok: bool) -> Text:
-    return Text("●", style="green") if ok else Text("●", style="red")
 
+class OrdersLogWidget(RichLog):
+    pass
 
-def fmt_secs(s: float) -> str:
-    if s is None:
-        return "–"
-    return f"{int(s // 60):d}:{int(s % 60):02d}"
 
+class DashboardApp(App):
+    CSS_PATH = "dashboard.tcss"
+    BINDINGS = [Binding("ctrl+c", "quit", "Quit"), Binding("q", "quit", "Quit")]
 
-def build_header(d: dict) -> Panel:
-    conn = d.get("connections", {})
-    binance_ok = bool(conn.get("binance"))
-    rtds_ok = bool(conn.get("rtds"))
-
-    t_zero = d.get("t_zero") or 0
-    elapsed = time.time() - t_zero if t_zero else 0
-    remaining = max(0.0, MARKET_DURATION - elapsed)
-    bar_width = 40
-    filled = int(bar_width * min(elapsed / MARKET_DURATION, 1.0))
-    bar = "█" * filled + "░" * (bar_width - filled)
-
-    kill = "KILL" if KILL_FILE.exists() else " ok "
-    kill_style = "bold red on yellow" if KILL_FILE.exists() else "dim green"
-
-    t = Table.grid(expand=True, padding=(0, 1))
-    t.add_column(justify="left")
-    t.add_column(justify="center")
-    t.add_column(justify="right")
-
-    left = Text()
-    left.append("BTC  ", style="bold cyan")
-    left.append(f"${d.get('btc_price', 0):>10,.2f}", style="bold")
-    left.append("  σ=")
-    left.append(f"{(d.get('sigma') or 0)*100:.2f}%", style="magenta")
-    left.append(f"  strike ${d.get('strike') or 0:,.0f}", style="dim")
-
-    center = Text()
-    center.append("Market  ", style="bold")
-    center.append(d.get("slug") or "–", style="yellow")
-    center.append(f"  [{bar}]  ", style="dim")
-    center.append(f"{fmt_secs(remaining)} left", style="cyan")
-
-    right = Text()
-    right.append("binance ", style="dim")
-    right.append_text(conn_pill(binance_ok))
-    right.append("  rtds ", style="dim")
-    right.append_text(conn_pill(rtds_ok))
-    right.append("  [")
-    right.append(kill, style=kill_style)
-    right.append("]")
-
-    t.add_row(left, center, right)
-    return Panel(t, border_style="bright_blue", title="polymarket-hustle", title_align="left")
-
-
-def _action_from_event(ev: dict) -> dict | None:
-    """Convert an event into a compact action dict for the order logs.
-
-    Returns None for events that aren't trade actions.
-    """
-    t = ev.get("type")
-    ts = ev.get("ts", 0)
-    strategy = ev.get("strategy") or ""
-    if t == "entry_filled":
-        pos = ev.get("position") or {}
-        return {
-            "ts": ts,
-            "kind": "BUY",
-            "strategy": strategy,
-            "side": pos.get("side", "?"),
-            "price": pos.get("entry_price", 0.0),
-            "size_usdc": pos.get("size_usdc", 0.0),
-            "pnl": None,
-            "exit_type": None,
-            "won": None,
-        }
-    if t == "exit_filled":
-        tr = ev.get("trade") or {}
-        return {
-            "ts": ts,
-            "kind": "SELL",
-            "strategy": strategy,
-            "side": tr.get("side", "?"),
-            "price": tr.get("exit_price", 0.0),
-            "size_usdc": tr.get("size_usdc", 0.0),
-            "pnl": tr.get("pnl", 0.0),
-            "exit_type": tr.get("exit_type", ""),
-            "won": None,
-        }
-    if t == "resolve":
-        tr = ev.get("trade") or {}
-        return {
-            "ts": ts,
-            "kind": "RES",
-            "strategy": strategy,
-            "side": tr.get("side", "?"),
-            "price": tr.get("exit_price", 0.0),
-            "size_usdc": tr.get("size_usdc", 0.0),
-            "pnl": tr.get("pnl", 0.0),
-            "exit_type": tr.get("exit_type", "RESOLUTION"),
-            "won": bool(tr.get("won")),
-        }
-    return None
-
-
-def _side_text(side: str) -> Text:
-    if side == "Up":
-        return Text("Up  ", style="green")
-    if side == "Down":
-        return Text("Down", style="red")
-    return Text(f"{side:<4}", style="white")
-
-
-def _kind_text(kind: str) -> Text:
-    if kind == "BUY":
-        return Text("BUY ", style="bold bright_green")
-    if kind == "SELL":
-        return Text("SELL", style="bold bright_yellow")
-    if kind == "RES":
-        return Text("RES ", style="bold cyan")
-    return Text(f"{kind:<4}", style="white")
-
-
-def _render_action_line(a: dict, *, prefix: Text | None = None) -> Text:
-    """Render one action as a single Text line."""
-    ts = a.get("ts", 0)
-    tm = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "--:--:--"
-    line = Text()
-    line.append(tm, style="dim")
-    line.append("  ")
-    if prefix is not None:
-        line.append_text(prefix)
-        line.append(" ")
-    line.append_text(_kind_text(a.get("kind", "?")))
-    line.append(" ")
-    line.append_text(_side_text(a.get("side", "?")))
-    line.append(" ")
-
-    kind = a.get("kind")
-    if kind == "BUY":
-        price = a.get("price") or 0.0
-        size = a.get("size_usdc") or 0.0
-        line.append(f"@ ${price:.2f}", style="white")
-        line.append(f"   (${size:.2f})", style="dim")
-    elif kind == "SELL":
-        price = a.get("price") or 0.0
-        pnl = a.get("pnl") or 0.0
-        line.append(f"@ ${price:.2f}", style="white")
-        line.append("   ")
-        line.append(f"{pnl:+.2f}", style=pnl_color(pnl))
-        line.append("   ")
-        line.append(str(a.get("exit_type") or ""), style="dim")
-    elif kind == "RES":
-        won = a.get("won")
-        pnl = a.get("pnl") or 0.0
-        if won is True:
-            line.append("WON ", style="bold green")
-        elif won is False:
-            line.append("LOST", style="bold red")
-        else:
-            line.append("RES ", style="cyan")
-        line.append("   ")
-        line.append(f"{pnl:+.2f}", style=pnl_color(pnl))
-    return line
-
-
-def build_orders_panel(actions: tuple[dict, ...] | deque[dict]) -> Panel:
-    if not actions:
-        body: Text | Group = Text("no orders yet", style="dim")
-    else:
-        lines = [_render_action_line(a) for a in list(actions)]
-        body = Group(*lines)
-    return Panel(body, title="orders", border_style="grey37", title_align="left")
-
-
-def _compute_stats(stats: dict) -> dict:
-    """Derive display-friendly numbers from a stats blob."""
-    total = stats.get("total_trades", 0) or 0
-    wins = stats.get("wins", 0) or 0
-    losses = stats.get("losses", 0) or 0
-    total_pnl = stats.get("total_pnl", 0.0) or 0.0
-    total_risked = stats.get("total_risked", 0.0) or 0.0
-    wr = 100.0 * wins / total if total else 0.0
-    roi = (total_pnl / total_risked * 100) if total_risked else 0.0
-    return {
-        "total": total, "wins": wins, "losses": losses,
-        "total_pnl": total_pnl, "total_risked": total_risked,
-        "wr": wr, "roi": roi,
-        "max_drawdown": stats.get("max_drawdown", 0) or 0,
-        "streak": stats.get("current_streak", 0) or 0,
-        "streak_type": stats.get("streak_type") or "",
-    }
-
-
-def build_comparison_banner(d: dict) -> Panel:
-    """Compact 2-line banner showing BASE + ENHANCED paper-benchmark stats."""
-    base = _compute_stats((d.get("base") or {}).get("stats", {}) or {})
-    enh = _compute_stats((d.get("enhanced") or {}).get("stats", {}) or {})
-    enh_extra = (d.get("enhanced") or {}).get("extra", {}) or {}
-
-    t = Table.grid(expand=True, padding=(0, 1))
-    t.add_column(justify="left",  width=12)
-    t.add_column(justify="left",  width=14)  # PnL
-    t.add_column(justify="left",  width=22)  # trades
-    t.add_column(justify="left",  width=14)  # ROI
-    t.add_column(justify="left",  width=14)  # DD
-    t.add_column(justify="left")              # extras
-
-    for label, s, extra in (
-        ("BASE",     base, None),
-        ("ENHANCED", enh,  enh_extra),
-    ):
-        name_cell = Text(f"{label}", style="bold")
-        name_cell.append("  paper", style="dim")
-        pnl_cell = Text(f"PnL {s['total_pnl']:+.2f}", style=pnl_color(s["total_pnl"]))
-        trades_cell = Text(
-            f"{s['total']}tr W={s['wins']} L={s['losses']} {s['wr']:.0f}%",
-            style="dim white" if s["total"] else "dim",
-        )
-        roi_cell = Text(f"ROI {s['roi']:+.1f}%", style=pnl_color(s["roi"]))
-        dd_cell = Text(f"DD ${s['max_drawdown']:.1f}", style="red dim")
-
-        extras_cell = Text("")
-        if extra is not None:
-            extras_cell.append("TP/SL/Res ", style="dim")
-            extras_cell.append(
-                f"{extra.get('tp_count',0)}/{extra.get('sl_count',0)}/{extra.get('resolution_count',0)}",
-                style="white",
-            )
-            extras_cell.append("  sq ", style="dim")
-            sq_active = extra.get("squeeze_active")
-            extras_cell.append(
-                "●" if sq_active else "○",
-                style="magenta" if sq_active else "dim",
-            )
-            extras_cell.append(f" {extra.get('spike_score', 0):.1f}", style="dim")
-        t.add_row(name_cell, pnl_cell, trades_cell, roi_cell, dd_cell, extras_cell)
-
-    return Panel(t, title="[bold]benchmarks[/] [dim]— paper, for comparison[/]",
-                 border_style="grey50", title_align="left")
-
-
-def build_refined_panel(blob: dict, d: dict,
-                        actions: tuple[dict, ...] | deque[dict]) -> Panel:
-    """The main strategy panel. Bigger and more detailed than the benchmarks."""
-    stats = blob.get("stats", {}) or {}
-    extra = blob.get("extra", {}) or {}
-    pos = blob.get("open_position")
-    trades = blob.get("closed_trades", [])[-RECENT_TRADES_CAP:]
-    s = _compute_stats(stats)
-    fair = blob.get("fair_price")
-    market_up = d.get("market_price_up")
-
-    # Headline stats row — single wide line
-    headline = Table.grid(expand=True, padding=(0, 2))
-    headline.add_column(justify="left")
-    headline.add_column(justify="left")
-    headline.add_column(justify="left")
-    headline.add_column(justify="left")
-    headline.add_column(justify="left")
-    headline.add_column(justify="left")
-
-    pnl_t = Text()
-    pnl_t.append("PnL ", style="dim")
-    pnl_t.append(f"{s['total_pnl']:+.2f}", style=f"bold {pnl_color(s['total_pnl'])}")
-
-    roi_t = Text()
-    roi_t.append("ROI ", style="dim")
-    roi_t.append(f"{s['roi']:+.1f}%", style=f"bold {pnl_color(s['roi'])}")
-
-    trades_t = Text()
-    trades_t.append("trades ", style="dim")
-    trades_t.append(f"{s['total']}", style="bold")
-    trades_t.append(f"  W={s['wins']} L={s['losses']} ", style="dim")
-    trades_t.append(f"{s['wr']:.0f}%", style="bold cyan" if s["total"] else "dim")
-
-    risked_t = Text()
-    risked_t.append("risked ", style="dim")
-    risked_t.append(f"${s['total_risked']:.0f}", style="white")
-
-    dd_t = Text()
-    dd_t.append("max DD ", style="dim")
-    dd_t.append(f"${s['max_drawdown']:.2f}", style="red")
-
-    streak_t = Text()
-    streak_t.append("streak ", style="dim")
-    s_style = "green" if s["streak_type"] == "W" else "red" if s["streak_type"] == "L" else "dim"
-    streak_t.append(
-        f"{s['streak']} {s['streak_type']}" if s["streak_type"] else "–", style=s_style,
-    )
-    headline.add_row(pnl_t, roi_t, trades_t, risked_t, dd_t, streak_t)
-
-    # Secondary row — fair vs market, exit counts
-    second = Table.grid(expand=True, padding=(0, 2))
-    second.add_column(justify="left")
-    second.add_column(justify="left")
-    second.add_column(justify="left")
-    second.add_column(justify="left")
-
-    fair_t = Text()
-    fair_t.append("fair(Up) ", style="dim")
-    fair_t.append(f"{fair:.3f}" if fair is not None else "–", style="cyan")
-
-    market_t = Text()
-    market_t.append("market(Up) ", style="dim")
-    market_t.append(f"{market_up:.3f}" if market_up is not None else "–", style="yellow")
-
-    edge_t = Text()
-    if fair is not None and market_up is not None:
-        delta = fair - market_up
-        edge_t.append("edge ", style="dim")
-        edge_t.append(
-            f"{abs(delta):+.3f}",
-            style="green" if abs(delta) >= 0.10 else "dim",
-        )
-        edge_t.append("  side ", style="dim")
-        edge_t.append(
-            "Up" if delta > 0 else ("Down" if delta < 0 else "–"),
-            style="green" if delta > 0 else ("red" if delta < 0 else "dim"),
-        )
-    else:
-        edge_t.append("edge –", style="dim")
-
-    exits_t = Text()
-    exits_t.append("TP/SL/Res ", style="dim")
-    exits_t.append(
-        f"{extra.get('tp_count',0)}/{extra.get('sl_count',0)}/{extra.get('resolution_count',0)}",
-        style="white",
-    )
-    last_xt = extra.get("last_exit_type") or "–"
-    exits_t.append("  last ", style="dim")
-    exits_t.append(str(last_xt), style="dim")
-
-    second.add_row(fair_t, market_t, edge_t, exits_t)
-
-    # Open position block
-    if pos:
-        pos_tbl = Table.grid(expand=True, padding=(0, 2))
-        pos_tbl.add_column(justify="left")
-        pos_tbl.add_column(justify="left")
-        pos_tbl.add_column(justify="left")
-        pos_tbl.add_column(justify="left")
-        pos_tbl.add_column(justify="left")
-
-        side = pos.get("side", "?")
-        side_style = "bold green" if side == "Up" else "bold red"
-        entry_px = pos.get("entry_price", 0)
-
-        open_t = Text("OPEN ", style="bold yellow")
-        open_t.append(side, style=side_style)
-
-        entry_t = Text()
-        entry_t.append("entry ", style="dim")
-        entry_t.append(f"{entry_px:.3f}", style="white")
-
-        size_t = Text()
-        size_t.append("size ", style="dim")
-        size_t.append(f"${pos.get('size_usdc', 0):.2f}", style="white")
-        size_t.append(f" ({pos.get('size_shares', 0):.1f} sh)", style="dim")
-
-        edge_t2 = Text()
-        edge_t2.append("edge ", style="dim")
-        edge_t2.append(f"{pos.get('edge', 0):.3f}", style="cyan")
-
-        # Unrealized
-        realizable = None
-        if market_up is not None:
-            realizable = market_up if side == "Up" else 1.0 - market_up
-        unreal_t = Text()
-        if realizable is not None:
-            favor = realizable - entry_px
-            unreal_t.append("realizable ", style="dim")
-            unreal_t.append(f"{realizable:.3f}", style="yellow")
-            unreal_t.append("  favor ", style="dim")
-            unreal_t.append(
-                f"{favor:+.3f}",
-                style=pnl_color(favor),
-            )
-        else:
-            unreal_t.append("realizable –", style="dim")
-
-        pos_tbl.add_row(open_t, entry_t, size_t, edge_t2, unreal_t)
-        pos_panel = Panel(pos_tbl, title="[bold]position[/]",
-                          border_style="yellow", title_align="left", padding=(0, 1))
-    else:
-        pos_panel = Panel(Align.center(Text("no position", style="dim")),
-                          title="[bold]position[/]", border_style="grey37",
-                          title_align="left", padding=(0, 1))
-
-    # Recent trades — wider table
-    trade_tbl = Table(box=None, show_header=True, expand=True, padding=(0, 1))
-    trade_tbl.add_column("t", style="dim", width=6)
-    trade_tbl.add_column("side", width=5)
-    trade_tbl.add_column("px in→out", width=14)
-    trade_tbl.add_column("size", justify="right", width=8)
-    trade_tbl.add_column("pnl", justify="right", width=10)
-    trade_tbl.add_column("ROI", justify="right", width=8)
-    trade_tbl.add_column("why", width=6)
-    trade_tbl.add_column("hold", justify="right", width=6)
-    for t in reversed(trades):
-        ts = t.get("resolved_time", 0)
-        tm = time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
-        side = t.get("side", "?")
-        side_style = "green" if side == "Up" else "red"
-        pnl = t.get("pnl", 0)
-        size_usdc = t.get("size_usdc", 0) or 0
-        t_roi = (pnl / size_usdc * 100) if size_usdc else 0
-        hold = t.get("hold_time_s")
-        hold_str = f"{int(hold)}s" if hold else "–"
-        trade_tbl.add_row(
-            tm,
-            Text(side, style=side_style),
-            f"{t.get('entry_price', 0):.3f}→{t.get('exit_price', 0):.3f}",
-            f"${size_usdc:.0f}",
-            Text(f"{pnl:+.2f}", style=pnl_color(pnl)),
-            Text(f"{t_roi:+.1f}%", style=pnl_color(t_roi)),
-            t.get("exit_type", ""),
-            hold_str,
-        )
-    if not trades:
-        trade_tbl.add_row("–", "–", "–", "–", "–", "–", "–", "–")
-
-    orders_panel = build_orders_panel(actions)
-
-    body = Group(
-        headline,
-        second,
-        pos_panel,
-        Panel(trade_tbl, title="[bold]recent trades[/]",
-              border_style="grey37", title_align="left"),
-        orders_panel,
-    )
-    title = "[bold bright_cyan]REFINED[/] [yellow](main strategy — live-capable)[/]"
-    return Panel(body, title=title, border_style="bright_cyan",
-                 title_align="left", padding=(0, 1))
-
-
-def build_extras_panel(d: dict) -> Panel:
-    """Refined-strategy detailed extras (squeeze removed — always off)."""
-    extra = d.get("refined", {}).get("extra", {}) or {}
-    tbl = Table.grid(expand=True, padding=(0, 2))
-    tbl.add_column(justify="left")
-    tbl.add_column(justify="left")
-    tbl.add_column(justify="left")
-    tbl.add_column(justify="left")
-    tbl.add_row(
-        Text("last exit", style="dim"),
-        str(extra.get("last_exit_type") or "–"),
-        Text("last zone", style="dim"),
-        str(extra.get("last_time_zone") or "–"),
-    )
-    tbl.add_row(
-        Text("edge trades", style="dim"),
-        str(extra.get("edge_trades", 0)),
-        Text("config", style="dim"),
-        "TP_MIN=0.08  TP_ABS=0.15  squeeze=off",
-    )
-    return Panel(tbl, title="[bold]refined extras[/]",
-                 border_style="bright_cyan", title_align="left")
-
-
-def build_log_panel(lines: list[str]) -> Panel:
-    body = Text("\n".join(lines), style="grey70", overflow="ellipsis")
-    return Panel(body, title=f"daemon.log (last {LOG_TAIL_LINES})",
-                 border_style="grey37", title_align="left")
-
-
-def _render_prices_line(market_up: float | None) -> Text:
-    line = Text(no_wrap=True, overflow="crop")
-    if market_up is None:
-        line.append("UP   —  ", style="dim")
-        line.append(" " * 7)
-        line.append("DOWN   —", style="dim")
-        return line
-    up = max(0.0, min(1.0, float(market_up)))
-    down = 1.0 - up
-    line.append(f"UP  ${up:.2f}", style="bold bright_green")
-    line.append(" " * 7)
-    line.append(f"DOWN  ${down:.2f}", style="bold bright_red")
-    return line
-
-
-def _render_sparkline(prices: deque[float], width: int) -> Text:
-    line = Text()
-    if not prices:
-        line.append("no price history", style="dim")
-        return line
-    data = list(prices)[-width:]
-    lo = min(data)
-    hi = max(data)
-    if hi == lo:
-        bars = "▄" * len(data)
-    else:
-        span = hi - lo
-        n = len(SPARK_CHARS) - 1
-        bars = "".join(
-            SPARK_CHARS[max(0, min(n, int((v - lo) / span * n)))]
-            for v in data
-        )
-    line.append(f"${lo:,.0f}  ", style="dim")
-    line.append(bars, style="bright_cyan")
-    line.append(f"  ${hi:,.0f}", style="dim")
-    return line
-
-
-def _render_stream_line(a: dict) -> Text:
-    strat = a.get("strategy") or ""
-    if strat == "refined":
-        prefix = Text("[R]", style="bright_cyan")
-    elif strat == "enhanced":
-        prefix = Text("[E]", style="cyan")
-    elif strat == "base":
-        prefix = Text("[B]", style="white")
-    else:
-        prefix = Text("[?]", style="dim")
-    return _render_action_line(a, prefix=prefix)
-
-
-def build_live_panel(d: dict, prices: deque[float],
-                     unified: tuple[dict, ...] | deque[dict],
-                     *, console_width: int) -> Panel:
-    market_up = d.get("market_price_up") if d else None
-    prices_line = Align.center(_render_prices_line(market_up))
-
-    # Live panel occupies ~2/3 of total console width; subtract ~14 chars for
-    # panel padding/borders and the "$lo  " / "  $hi" labels on the sparkline.
-    spark_width = max(
-        SPARK_MIN_WIDTH,
-        min(SPARK_MAX_WIDTH, console_width * 2 // 3 - 6 - 14),
-    )
-    spark_line = Align.center(_render_sparkline(prices, width=spark_width))
-
-    stream = list(unified)[-5:]
-    if stream:
-        stream_body: Text | Group = Group(*(_render_stream_line(a) for a in stream))
-    else:
-        stream_body = Text("no stream yet", style="dim")
-    stream_panel = Panel(stream_body, title="stream", border_style="grey37",
-                         title_align="left", padding=(0, 1))
-
-    body = Group(prices_line, Text(""), spark_line, Text(""), stream_panel)
-    return Panel(body, title="live", border_style="bright_blue", title_align="left")
-
-
-def render(d: dict, log_lines: list[str], snap: TailerSnapshot,
-           prices: deque[float], *, console_width: int) -> Layout:
-    if d is None:
-        return Layout(Panel(Align.center(Text("waiting for daemon_state/state.json…",
-                                               style="dim")), border_style="red"))
-
-    layout = Layout(name="root")
-    layout.split(
-        Layout(build_header(d), size=3, name="header"),
-        Layout(build_comparison_banner(d), size=4, name="banner"),
-        Layout(build_refined_panel(d.get("refined", {}) or {}, d,
-                                   snap.refined_actions), name="main"),
-        Layout(build_extras_panel(d), size=4, name="extras"),
-        Layout(name="footer", size=14),
-    )
-    layout["footer"].split_row(
-        Layout(build_log_panel(log_lines), name="log", ratio=1),
-        Layout(build_live_panel(d, prices, snap.unified_actions,
-                                console_width=console_width),
-               name="live", ratio=2),
-    )
-    return layout
-
-
-class EventsTailer:
-    def __init__(self, path: Path, cap: int = 200):
-        self.path = path
-        self.events: deque[dict] = deque(maxlen=cap)
-        self.base_actions: deque[dict] = deque(maxlen=ACTION_CAP)
-        self.enh_actions: deque[dict] = deque(maxlen=ACTION_CAP)
-        self.refined_actions: deque[dict] = deque(maxlen=ACTION_CAP)
-        self.unified_actions: deque[dict] = deque(maxlen=ACTION_CAP)
-        self._pos = 0
-
-    def _dispatch(self, ev: dict) -> None:
-        action = _action_from_event(ev)
-        if action is None:
-            return
-        strat = action.get("strategy")
-        if strat == "base":
-            self.base_actions.append(action)
-        elif strat == "enhanced":
-            self.enh_actions.append(action)
-        elif strat == "refined":
-            self.refined_actions.append(action)
-        self.unified_actions.append(action)
-
-    def update(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            size = self.path.stat().st_size
-            if size < self._pos:
-                self._pos = 0  # file rotated/truncated
-            with self.path.open("rb") as f:
-                f.seek(self._pos)
-                data = f.read()
-                self._pos = f.tell()
-            for line in data.decode(errors="replace").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                self.events.append(ev)
-                self._dispatch(ev)
-        except OSError:
-            return
-
-    def snapshot(self) -> TailerSnapshot:
-        return TailerSnapshot(
-            base_actions=tuple(self.base_actions),
-            enh_actions=tuple(self.enh_actions),
-            refined_actions=tuple(self.refined_actions),
-            unified_actions=tuple(self.unified_actions),
-            events=tuple(self.events),
-        )
+    def compose(self) -> ComposeResult:
+        with Container(id="root"):
+            yield HeaderWidget(id="header")
+            yield LiveCurvesWidget(id="live")
+            yield MainStrategyWidget(id="main")
+            yield OrderbookWidget(id="book")
+            with Container(id="bottom-right"):
+                yield BaselinesWidget(id="baselines")
+                yield OrdersLogWidget(id="orders-log", max_lines=50)
 
 
 def main() -> int:
-    console = Console()
     if not STATE_DIR.exists():
-        console.print(f"[red]{STATE_DIR} missing — start the daemon first[/]")
+        print(f"[dashboard] {STATE_DIR} missing - start the daemon first")
         return 2
-
-    tailer = EventsTailer(EVENTS_FILE)
-    prices: deque[float] = deque(maxlen=PRICE_HISTORY_CAP)
-    with Live(console=console, refresh_per_second=REFRESH_HZ, screen=True) as live:
-        while True:
-            d = read_json(STATE_FILE)
-            log_lines = tail_lines(LOG_FILE, LOG_TAIL_LINES)
-            tailer.update()
-            snap = tailer.snapshot()
-            if d:
-                btc = d.get("btc_price")
-                if isinstance(btc, (int, float)) and btc > 0:
-                    prices.append(float(btc))
-            live.update(render(d, log_lines, snap, prices,
-                               console_width=console.size.width))
-            time.sleep(1.0 / REFRESH_HZ)
+    DashboardApp().run()
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        print("\n[dashboard] exit")
+    raise SystemExit(main())
