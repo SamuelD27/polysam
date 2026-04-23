@@ -31,7 +31,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-REPO = Path(__file__).resolve().parent.parent
+# File lives at tui/python/dashboard_legacy.py; daemon_state/ is at the
+# repo root, so go up three levels, not two.
+REPO = Path(__file__).resolve().parent.parent.parent
 STATE_DIR = REPO / "daemon_state"
 STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = STATE_DIR / "daemon.log"
