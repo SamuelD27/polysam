@@ -14,11 +14,35 @@ const HARD_DEPTH_CAP: usize = 10;
 const BAR_WIDTH: usize = 20;
 
 pub fn draw_orderbook(frame: &mut Frame, area: Rect, app: &AppState) {
+    // Right-side status: show either spread or the failure reason so
+    // the panel header spans the full width.
+    let right_title = match app.orderbook.as_ref() {
+        None => Line::from(Span::styled(
+            " waiting ",
+            Style::default().fg(theme::DIM),
+        )),
+        Some(snap) => match snap.status {
+            OrderbookSide::Ok => Line::from(Span::styled(
+                format!(" spread {:.3} ", snap.spread),
+                Style::default().fg(theme::DIM),
+            )),
+            OrderbookSide::Empty => Line::from(Span::styled(
+                " empty ",
+                Style::default().fg(theme::DIM),
+            )),
+            OrderbookSide::Error => Line::from(Span::styled(
+                format!(" {} ", snap.error.as_deref().unwrap_or("error")),
+                Style::default().fg(theme::NEG),
+            )),
+        },
+    };
+
     let block = Block::default()
         .title(Line::from(Span::styled(
             " orderbook ",
             Style::default().fg(theme::DIM),
         )))
+        .title_top(right_title.right_aligned())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::BORDER_DIM));

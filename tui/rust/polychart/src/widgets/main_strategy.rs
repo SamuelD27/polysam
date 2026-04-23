@@ -25,6 +25,20 @@ use crate::theme;
 use crate::util::{humanize_slug, ts_hms};
 
 pub fn draw_main_strategy(frame: &mut Frame, area: Rect, app: &AppState) {
+    // Right-side status: refined session PnL so the header uses the full
+    // width with meaningful content.
+    let refined_pnl = app
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.refined.as_ref())
+        .map(|b| b.stats.total_pnl)
+        .unwrap_or(0.0);
+    let right_title = Line::from(Span::styled(
+        format!(" PnL {refined_pnl:+.2} "),
+        sign_style(refined_pnl),
+    ))
+    .right_aligned();
+
     let block = Block::default()
         .title(Line::from(Span::styled(
             " refined ",
@@ -32,6 +46,7 @@ pub fn draw_main_strategy(frame: &mut Frame, area: Rect, app: &AppState) {
                 .fg(theme::BORDER_MAIN)
                 .add_modifier(Modifier::BOLD),
         )))
+        .title_top(right_title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::BORDER_MAIN));

@@ -11,11 +11,34 @@ use crate::state_reader::Stats;
 use crate::theme;
 
 pub fn draw_baselines(frame: &mut Frame, area: Rect, app: &AppState) {
+    // Right-side status element: aggregate session PnL across both
+    // baselines so the panel header uses the full width.
+    let base_pnl = app
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.base.as_ref())
+        .map(|b| b.stats.total_pnl)
+        .unwrap_or(0.0);
+    let enh_pnl = app
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.enhanced.as_ref())
+        .map(|b| b.stats.total_pnl)
+        .unwrap_or(0.0);
+    let combined = base_pnl + enh_pnl;
+
     let block = Block::default()
         .title(Line::from(Span::styled(
             " baselines ",
             Style::default().fg(theme::DIM),
         )))
+        .title_top(
+            Line::from(Span::styled(
+                format!(" combined {combined:+.2} "),
+                sign_style(combined),
+            ))
+            .right_aligned(),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::BORDER_DIM));

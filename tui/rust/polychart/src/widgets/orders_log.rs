@@ -12,11 +12,19 @@ use crate::theme;
 use crate::util::ts_hms;
 
 pub fn draw_orders_log(frame: &mut Frame, area: Rect, app: &AppState) {
+    let count = app.refined_actions.len();
+    let right_title = Line::from(Span::styled(
+        format!(" {count} actions "),
+        Style::default().fg(theme::DIM),
+    ))
+    .right_aligned();
+
     let block = Block::default()
         .title(Line::from(Span::styled(
             " orders ",
             Style::default().fg(theme::DIM),
         )))
+        .title_top(right_title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::BORDER_DIM));
