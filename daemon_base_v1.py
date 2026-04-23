@@ -316,13 +316,15 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
     # the operator runs LIVE_MODE with POLYMARKET_DRY_RUN unset.
     if dry_run:
         from active_bots.execution.dry_run_executor import DryRunExecutor
+        from active_bots.execution.token_resolver import TokenResolver
+        resolver = TokenResolver()
         funder = os.environ.get("POLYMARKET_FUNDER", "").strip()
         logger.info(
             "executor=live-dryrun (paper fills + live-shape metadata; no CLOB posts) "
             "funder=%s portfolio=%s max_trade_size=$%.2f (%s)",
             funder, portfolio_str, effective_max, source,
         )
-        return DryRunExecutor(), None, risk
+        return DryRunExecutor(), resolver, risk
 
     from active_bots.execution.live_executor import LiveExecutor
     from active_bots.execution.reconciler import Reconciler
