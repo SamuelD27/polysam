@@ -27,6 +27,7 @@ from active_bots.execution.invariants import (
     invariant_fee_symmetry,
     invariant_fill_qty_bounds,
     invariant_monotonic_fill_prices,
+    invariant_order_price_respects_218_bound,
     invariant_price_bounds_respect_tick,
     invariant_residual_conservation,
     invariant_total_is_sum,
@@ -342,3 +343,86 @@ def test_invariant_total_is_sum_skips_book_stale():
     assert rec.classification == "book_stale"
     # Should not raise (skipped per contract).
     invariant_total_is_sum(rec)
+
+
+# ----- py-clob-client #218 REST validator bound -----
+
+
+def _mk_book(bids, asks, *, tick="0.01", tick_bids=None, tick_asks=None) -> Book:
+    return Book(
+        token_id="tok",
+        side_bids=tuple(Level(Decimal(p), Decimal(s)) for p, s in bids),
+        side_asks=tuple(Level(Decimal(p), Decimal(s)) for p, s in asks),
+        tick_size=Decimal(tick),
+        tick_size_bids=Decimal(tick_bids) if tick_bids else None,
+        tick_size_asks=Decimal(tick_asks) if tick_asks else None,
+        ts_ns=0,
+    )
+
+
+def test_invariant_218_rejects_buy_near_one() -> None:
+    # 0.01-tick BUY with worst_price_limit=0.995 is the exact #218 case:
+    # frontend accepts it, REST rejects on submit. Replay must match REST.
+    book = _mk_book(bids=[("0.49", "10")], asks=[("0.51", "10")])
+    with pytest.raises(AssertionError, match="py-clob-client/issues/218"):
+        invariant_order_price_respects_218_bound(
+            worst_price_limit=Decimal("0.995"),
+            side="BUY",
+            book=book,
+        )
+
+
+def test_invariant_218_rejects_sell_near_zero() -> None:
+    # 0.01-tick SELL with worst_price_limit=0.005 — analogous near-zero case.
+    book = _mk_book(bids=[("0.49", "10")], asks=[("0.51", "10")])
+    with pytest.raises(AssertionError, match="py-clob-client/issues/218"):
+        invariant_order_price_respects_218_bound(
+            worst_price_limit=Decimal("0.005"),
+            side="SELL",
+            book=book,
+        )
+
+
+def test_invariant_218_accepts_exact_tick_bounds() -> None:
+    # Exactly at [tick, 1-tick] must pass (0.01 and 0.99 on a 0.01 tick).
+    book = _mk_book(bids=[("0.49", "10")], asks=[("0.51", "10")])
+    invariant_order_price_respects_218_bound(
+        worst_price_limit=Decimal("0.99"), side="BUY", book=book,
+    )
+    invariant_order_price_respects_218_bound(
+        worst_price_limit=Decimal("0.01"), side="SELL", book=book,
+    )
+
+
+def test_invariant_218_uses_per_side_tick() -> None:
+    # Asks side runs 0.001 tick (YES near extremes). A 0.995 BUY is now
+    # legitimate; a 0.0005 BUY still isn't because asks_tick=0.001 floor.
+    book = _mk_book(
+        bids=[("0.49", "10")],
+        asks=[("0.995", "10")],
+        tick="0.01",
+        tick_asks="0.001",
+    )
+    # Accepts at 0.995 on asks_tick=0.001
+    invariant_order_price_respects_218_bound(
+        worst_price_limit=Decimal("0.995"), side="BUY", book=book,
+    )
+    # Still rejects below 0.001
+    with pytest.raises(AssertionError, match="py-clob-client/issues/218"):
+        invariant_order_price_respects_218_bound(
+            worst_price_limit=Decimal("0.0005"),
+            side="BUY",
+            book=book,
+        )
+
+
+def test_invariant_price_bounds_uses_per_side_tick() -> None:
+    # A book whose asks live at 0.999 (0.001 tick) must not trigger a 0.01-tick
+    # bound violation on the bid side — per-side ticks are independent.
+    book = _mk_book(
+        bids=[("0.49", "10")],
+        asks=[("0.999", "10")],
+        tick="0.01",
+        tick_asks="0.001",
+    )
+    invariant_price_bounds_respect_tick(book)  # must not raise

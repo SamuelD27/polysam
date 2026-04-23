@@ -125,19 +125,64 @@ def invariant_residual_conservation(
 
 
 def invariant_price_bounds_respect_tick(book: Book) -> None:
-    """Every level price is in [tick_size, 1 - tick_size]."""
-    lo = book.tick_size
-    hi = Decimal(1) - book.tick_size
+    """Every level price is in [tick, 1 - tick] on its own side.
+
+    Per spec §8.2 nautilus_trader #2980, a book can carry different ticks
+    on its bid and ask sides (e.g. YES at 0.001 tick, NO at 0.01 tick on
+    the same market at the same instant). The bound is enforced per-side.
+    """
+    bid_lo = book.bids_tick
+    bid_hi = Decimal(1) - book.bids_tick
     for lvl in book.side_bids:
-        if lvl.price < lo or lvl.price > hi:
+        if lvl.price < bid_lo or lvl.price > bid_hi:
             raise AssertionError(
-                f"bid price {lvl.price} outside [{lo}, {hi}] tick={book.tick_size}"
+                f"bid price {lvl.price} outside [{bid_lo}, {bid_hi}] "
+                f"bids_tick={book.bids_tick}"
             )
+    ask_lo = book.asks_tick
+    ask_hi = Decimal(1) - book.asks_tick
     for lvl in book.side_asks:
-        if lvl.price < lo or lvl.price > hi:
+        if lvl.price < ask_lo or lvl.price > ask_hi:
             raise AssertionError(
-                f"ask price {lvl.price} outside [{lo}, {hi}] tick={book.tick_size}"
+                f"ask price {lvl.price} outside [{ask_lo}, {ask_hi}] "
+                f"asks_tick={book.asks_tick}"
             )
+
+
+def invariant_order_price_respects_218_bound(
+    worst_price_limit: Decimal,
+    side: str,
+    book: Book,
+) -> None:
+    """Reject any ``worst_price_limit`` that the Polymarket REST validator
+    would reject at order-submission time.
+
+    The Polymarket REST API rejects limit orders at 0.991-0.999 (ask side,
+    buys) and 0.001-0.009 (bid side, sells) on 0.01-tick markets even
+    though the frontend accepts them. The analogous bound holds for
+    0.001-tick (reject 0.0001-0.0009 and 0.9991-0.9999) and 0.0001-tick
+    markets. This invariant runs at replay time so we cannot emit a fill
+    that live would have silently refused — the replay-vs-live diff would
+    otherwise show a spurious non-zero delta.
+
+    See: https://github.com/Polymarket/py-clob-client/issues/218
+    """
+    if side == "BUY":
+        tick = book.asks_tick
+    elif side == "SELL":
+        tick = book.bids_tick
+    else:
+        raise AssertionError(f"invalid side {side!r}")
+    lo = tick
+    hi = Decimal(1) - tick
+    if worst_price_limit < lo or worst_price_limit > hi:
+        raise AssertionError(
+            f"worst_price_limit {worst_price_limit} outside "
+            f"[{lo}, {hi}] for side={side} tick={tick}. "
+            f"Polymarket REST validator rejects this order even if the "
+            f"frontend displays the price. "
+            f"See https://github.com/Polymarket/py-clob-client/issues/218"
+        )
 
 
 def invariant_staleness_monotonic_within_session(
