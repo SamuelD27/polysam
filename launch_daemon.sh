@@ -268,7 +268,7 @@ stop_daemon() {
 
 trap 'stop_live_gui; stop_daemon; exit 0' INT TERM
 
-# ── TUI dashboard in foreground (DASHBOARD=rust|python, rust default) ────
+# ── TUI dashboard in foreground (DASHBOARD=python|rust, python default) ──
 echo "[launch] starting TUI dashboard (Ctrl-C stops dashboard + daemon)"
 sleep 2
 # shellcheck disable=SC2046
