@@ -280,10 +280,113 @@ class HeaderWidget(Static):
 
 
 class LiveCurvesWidget(Container):
+    """Hero UP/DOWN prices + BTC chart + market/fair overlay chart.
+
+    Maintains rolling deques per series, capped at PRICE_HISTORY_CAP.
+    Resets all deques on market rollover (t_zero change).
+    """
+
     def compose(self) -> ComposeResult:
-        yield Static("UP - / DOWN -", id="hero-prices")
-        yield Static("btc chart placeholder", id="chart-btc")
-        yield Static("market/fair chart placeholder", id="chart-mkt")
+        yield Static("", id="hero-prices")
+        yield PlotextPlot(id="chart-btc")
+        yield PlotextPlot(id="chart-mkt")
+
+    def on_mount(self) -> None:
+        self._btc: deque[tuple[float, float]] = deque(maxlen=PRICE_HISTORY_CAP)
+        self._mkt: deque[tuple[float, float]] = deque(maxlen=PRICE_HISTORY_CAP)
+        self._fair: deque[tuple[float, float]] = deque(maxlen=PRICE_HISTORY_CAP)
+        self._last_t_zero: float | None = None
+
+    def render_state(self, state: dict | None) -> None:
+        hero = self.query_one("#hero-prices", Static)
+        if state is None:
+            hero.update("[dim]waiting for daemon[/]")
+            return
+
+        # Reset deques on market rollover.
+        t_zero = state.get("t_zero")
+        if t_zero != self._last_t_zero:
+            self._btc.clear()
+            self._mkt.clear()
+            self._fair.clear()
+            self._last_t_zero = t_zero
+
+        now = time.time()
+        btc = state.get("btc_price")
+        if isinstance(btc, (int, float)) and btc > 0:
+            self._btc.append((now, float(btc)))
+        mkt = state.get("market_price_up")
+        if isinstance(mkt, (int, float)):
+            self._mkt.append((now, float(mkt)))
+        fair = (state.get("refined") or {}).get("fair_price")
+        if isinstance(fair, (int, float)):
+            self._fair.append((now, float(fair)))
+
+        self._render_hero(mkt, hero)
+        self._render_btc_chart()
+        self._render_mkt_chart()
+
+    def _render_hero(self, mkt, hero: Static) -> None:
+        if not isinstance(mkt, (int, float)):
+            line = Text()
+            line.append("UP  -    ", style="dim")
+            line.append("DOWN  -", style="dim")
+            hero.update(line)
+            return
+        up = max(0.0, min(1.0, float(mkt)))
+        line = Text()
+        line.append(f"UP  ${up:.2f}", style="bold #4ade80")
+        line.append("       ")
+        line.append(f"DOWN  ${1 - up:.2f}", style="bold #f87171")
+        hero.update(line)
+
+    def _render_btc_chart(self) -> None:
+        plot = self.query_one("#chart-btc", PlotextPlot)
+        plt = plot.plt
+        plt.clear_figure()
+        plt.theme("pro")
+        if self._btc:
+            xs = [t for t, _ in self._btc]
+            ys = [v for _, v in self._btc]
+            plt.plot(xs, ys, color="cyan", marker="braille")
+            lo, hi = min(ys), max(ys)
+            if lo == hi:
+                plt.ylim(lo - 1.0, hi + 1.0)
+            else:
+                # 0.05% padding either side keeps small moves readable
+                pad = (hi - lo) * 0.1 + 0.5
+                plt.ylim(lo - pad, hi + pad)
+        plt.title("BTC USD")
+        plt.xaxes(False, False)
+        plt.yaxes(True, False)
+        plot.refresh()
+
+    def _render_mkt_chart(self) -> None:
+        plot = self.query_one("#chart-mkt", PlotextPlot)
+        plt = plot.plt
+        plt.clear_figure()
+        plt.theme("pro")
+        if self._mkt:
+            xs = [t for t, _ in self._mkt]
+            ys = [v for _, v in self._mkt]
+            plt.plot(xs, ys, color="white", marker="braille", label="mkt")
+        if self._fair:
+            xs = [t for t, _ in self._fair]
+            ys = [v for _, v in self._fair]
+            # Colour the fair line by sign of (fair - mkt) at the latest point.
+            fair_colour = "white"
+            if self._mkt:
+                last_fair = ys[-1]
+                last_mkt = self._mkt[-1][1]
+                fair_colour = ("green" if last_fair > last_mkt
+                               else "red" if last_fair < last_mkt
+                               else "white")
+            plt.plot(xs, ys, color=fair_colour, marker="braille", label="fair")
+        plt.ylim(0.0, 1.0)
+        plt.title("market / fair up")
+        plt.xaxes(False, False)
+        plt.yaxes(True, False)
+        plot.refresh()
 
 
 class MainStrategyWidget(Container):
@@ -479,6 +582,7 @@ class DashboardApp(App):
         state = read_json(STATE_FILE)
         self.tailer.update()
         self.query_one(HeaderWidget).render_state(state)
+        self.query_one(LiveCurvesWidget).render_state(state)
         self.query_one(MainStrategyWidget).render_state(
             state,
             self.tailer.pnl_series.get("refined", []),
