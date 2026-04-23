@@ -1,13 +1,16 @@
 """Single-page markdown report from a replay parquet.
 
 Emits (in strict mode) the paper-vs-book-walked ROI comparison plus bps-
-level decomposition and a regime-conditional attribution table.
+level decomposition, a regime-conditional attribution table, and MinTRL
+per spec §6.4 (Bailey & López de Prado 2014) so the operator can see
+how many trades per fold the observed sample would need for a defended
+Sharpe separation.
 
 When the input parquet's ``staleness_policy`` column contains anything
 other than ``strict`` on any row, the paper-vs-realistic headline is
 SUPPRESSED (spec §8.1.2 footgun). Row counts, classification breakdown,
-attribution-sum-to-total_IS invariant check, and manifest echo still
-print — they are what plumbing smoke tests need.
+attribution-sum-to-total_IS invariant check, MinTRL (always), and
+manifest echo still print — they are what plumbing smoke tests need.
 
 Usage:
 
@@ -95,6 +98,59 @@ def _sum_invariant_check(cols: dict, idxs: list[int]) -> tuple[int, int, int]:
         if abs(float(total) - s) < 1e-9:
             matched += 1
     return checked, matched, skipped
+
+
+def _mintrl_estimate(
+    per_trade_pnls: list[float],
+    sr_nuisance: float = 1.0,
+    alpha: float = 0.05,
+) -> float | None:
+    """Minimum Track Record Length per Bailey & López de Prado 2014 §6.4:
+
+        MinTRL = 1 + (1 - γ₃·SR + ¼(γ₄-1)·SR²) · (Z_α / (SR - SR*))²
+
+    where SR is the per-trade Sharpe of the sample, γ₃/γ₄ are skew and
+    kurtosis (Fisher: kurtosis-excess), SR* is the nuisance Sharpe to
+    beat, and Z_α is the normal 1-α quantile. Spec's alpha=0.05 fixes
+    Z_α = 1.6448536269514722.
+
+    The per-trade series is NOT annualised — for the 5-min BTC Up/Down
+    strategy an "annualised Sharpe" is a fiction because the strategy
+    trades in discrete 5-min windows and only N of them per day.
+    Per-trade SR is defensibly comparable to the nuisance SR* of another
+    paper-traded strategy variant at the same horizon.
+
+    Returns None if fewer than 5 observations, zero variance, or
+    SR == SR* (infinite MinTRL).
+    """
+    vals = [v for v in per_trade_pnls if isinstance(v, float) and math.isfinite(v)]
+    n = len(vals)
+    if n < 5:
+        return None
+    mean = sum(vals) / n
+    var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+    if var <= 0:
+        return None
+    sd = math.sqrt(var)
+    sr = mean / sd
+    m3 = sum((v - mean) ** 3 for v in vals) / n
+    m4 = sum((v - mean) ** 4 for v in vals) / n
+    s3 = sd ** 3
+    s4 = sd ** 4
+    skew = m3 / s3 if s3 > 0 else 0.0
+    kurt_excess = (m4 / s4 - 3.0) if s4 > 0 else 0.0
+    z_alpha = 1.6448536269514722
+    denom = sr - sr_nuisance
+    if denom == 0:
+        return None
+    factor = 1.0 - skew * sr + 0.25 * kurt_excess * sr * sr
+    if factor <= 0:
+        # Pathological moments (very heavy tail with favourable skew) can
+        # drive factor negative — the formula's normal-world correction
+        # isn't valid there. Fall back to the gaussian term so the number
+        # is a lower bound rather than nonsense.
+        factor = 1.0
+    return 1.0 + factor * (z_alpha / denom) ** 2
 
 
 def _manifest_for(parquet_path: Path) -> dict | None:
@@ -241,6 +297,47 @@ def report(parquet_path: Path) -> str:
     lines.append("## Regime-conditional attribution")
     lines.append("")
     lines.append(attribute(parquet_path))
+
+    # MinTRL per spec §6.4. Shown in both strict and non-strict modes —
+    # a plumbing-smoke run still reveals whether the observed sample is
+    # large enough to support the Sharpe claim we will eventually make.
+    lines.append("")
+    lines.append("## MinTRL (spec §6.4)")
+    lines.append("")
+    realised_for_mintrl = [
+        v for v in realised if isinstance(v, float) and math.isfinite(v)
+    ]
+    paper_for_mintrl = [
+        v for v in paper if isinstance(v, float) and math.isfinite(v)
+    ]
+    if realised_for_mintrl:
+        m_real_0 = _mintrl_estimate(realised_for_mintrl, sr_nuisance=0.0)
+        m_real_1 = _mintrl_estimate(realised_for_mintrl, sr_nuisance=1.0)
+        lines.append(
+            f"- realised_pnl_at_close series "
+            f"(n={len(realised_for_mintrl)}): "
+            f"MinTRL vs SR*=0.0 = "
+            f"{('%.1f' % m_real_0) if m_real_0 else 'n/a'}, "
+            f"MinTRL vs SR*=1.0 = "
+            f"{('%.1f' % m_real_1) if m_real_1 else 'n/a'}"
+        )
+    if paper_for_mintrl:
+        m_pp_0 = _mintrl_estimate(paper_for_mintrl, sr_nuisance=0.0)
+        m_pp_1 = _mintrl_estimate(paper_for_mintrl, sr_nuisance=1.0)
+        lines.append(
+            f"- paper_pnl_flat_0_5 series "
+            f"(n={len(paper_for_mintrl)}): "
+            f"MinTRL vs SR*=0.0 = "
+            f"{('%.1f' % m_pp_0) if m_pp_0 else 'n/a'}, "
+            f"MinTRL vs SR*=1.0 = "
+            f"{('%.1f' % m_pp_1) if m_pp_1 else 'n/a'}"
+        )
+    if not realised_for_mintrl and not paper_for_mintrl:
+        lines.append("- (no paired PnL series yet; need >= 5 observations)")
+    lines.append(
+        "- Bailey & López de Prado 2014 per-trade formulation; "
+        "α=0.05 (Z=1.645). Not annualised."
+    )
 
     # Headline — suppressed on non-strict runs.
     lines.append("")
