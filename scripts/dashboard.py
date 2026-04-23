@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from pathlib import Path
 
 from rich.text import Text
@@ -148,6 +149,90 @@ def _strip_emoji(s: str) -> str:
 
 
 MARKET_DURATION = 300
+
+
+class EventsTailer:
+    """Tail daemon_state/events.jsonl by byte offset; accumulate per-strategy PnL.
+
+    Read-only on the file. Resets state on truncation/rotation. Idempotent
+    on repeated update() calls when no new events have arrived.
+    """
+
+    def __init__(self, path: Path, cap: int = 200) -> None:
+        self.path = path
+        self.events: deque[dict] = deque(maxlen=cap)
+        self.base_actions: deque[dict] = deque(maxlen=ACTION_CAP)
+        self.enh_actions: deque[dict] = deque(maxlen=ACTION_CAP)
+        self.refined_actions: deque[dict] = deque(maxlen=ACTION_CAP)
+        self.unified_actions: deque[dict] = deque(maxlen=ACTION_CAP)
+        self.pnl_series: dict[str, list[tuple[float, float]]] = {}
+        self._cum: dict[str, float] = {}
+        self._pos = 0
+
+    def _dispatch(self, ev: dict) -> None:
+        action = _action_from_event(ev)
+        if action is not None:
+            strat = action.get("strategy")
+            if strat == "base":
+                self.base_actions.append(action)
+            elif strat == "enhanced":
+                self.enh_actions.append(action)
+            elif strat == "refined":
+                self.refined_actions.append(action)
+            self.unified_actions.append(action)
+
+        # Per-strategy cumulative PnL — only realized events count.
+        t = ev.get("type")
+        if t in ("exit_filled", "resolve"):
+            strat = ev.get("strategy") or ""
+            pnl = ((ev.get("trade") or {}).get("pnl")) or 0.0
+            self._cum[strat] = self._cum.get(strat, 0.0) + float(pnl)
+            self.pnl_series.setdefault(strat, []).append(
+                (float(ev.get("ts", 0.0)), self._cum[strat])
+            )
+            self._decimate_if_needed(strat)
+
+    def _decimate_if_needed(self, strat: str) -> None:
+        series = self.pnl_series.get(strat) or []
+        if len(series) <= PNL_SERIES_CAP:
+            return
+        # Keep first, last, and evenly-spaced middle. Never drop the running tail.
+        first, last = series[0], series[-1]
+        middle = series[1:-1]
+        middle_count = PNL_SERIES_CAP - 2
+        if middle_count <= 0 or not middle:
+            self.pnl_series[strat] = [first, last]
+            return
+        step = max(1, len(middle) // middle_count)
+        sampled = middle[::step][:middle_count]
+        self.pnl_series[strat] = [first, *sampled, last]
+
+    def update(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            size = self.path.stat().st_size
+            if size < self._pos:
+                # File rotated or truncated — replay from the top.
+                self._pos = 0
+                self._cum.clear()
+                self.pnl_series.clear()
+            with self.path.open("rb") as f:
+                f.seek(self._pos)
+                data = f.read()
+                self._pos = f.tell()
+            for line in data.decode(errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                self.events.append(ev)
+                self._dispatch(ev)
+        except OSError:
+            return
 
 
 class HeaderWidget(Static):
