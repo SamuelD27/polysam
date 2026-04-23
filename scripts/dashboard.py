@@ -353,7 +353,7 @@ class LiveCurvesWidget(Container):
             if lo == hi:
                 plt.ylim(lo - 1.0, hi + 1.0)
             else:
-                # 0.05% padding either side keeps small moves readable
+                # 10% of range with a $0.50 floor so flat windows stay readable
                 pad = (hi - lo) * 0.1 + 0.5
                 plt.ylim(lo - pad, hi + pad)
         plt.title("BTC USD")
