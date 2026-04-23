@@ -46,6 +46,7 @@ pub async fn run() -> Result<()> {
     let state_dir = resolve_state_dir();
     let state_path = state_dir.join("state.json");
     let events_path = state_dir.join("events.jsonl");
+    let kill_path = state_dir.join("KILL");
 
     let shared: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState::new()));
 
@@ -53,19 +54,24 @@ pub async fn run() -> Result<()> {
     {
         let shared = Arc::clone(&shared);
         let path = state_path.clone();
+        let kill_path = kill_path.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(500));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                let kill = tokio::fs::metadata(&kill_path).await.is_ok();
                 match read_state_json_async(&path).await {
                     Ok(Some(snap)) => {
                         if let Ok(mut app) = shared.lock() {
                             app.apply_state_snapshot(snap);
+                            app.kill_active = kill;
                         }
                     }
                     Ok(None) => {
-                        // file missing; nothing to do
+                        if let Ok(mut app) = shared.lock() {
+                            app.kill_active = kill;
+                        }
                     }
                     Err(e) => {
                         // Non-fatal: a mid-rename read can still fail;
@@ -149,13 +155,5 @@ async fn run_render_loop(shared: Arc<Mutex<AppState>>) -> Result<()> {
 /// for microseconds.
 fn take_render_snapshot(shared: &Arc<Mutex<AppState>>) -> AppState {
     let app = shared.lock().expect("app state mutex poisoned");
-    AppState {
-        snapshot: app.snapshot.clone(),
-        last_t_zero: app.last_t_zero,
-        btc_series: app.btc_series.clone(),
-        mkt_series: app.mkt_series.clone(),
-        fair_series: app.fair_series.clone(),
-        pnl_series: app.pnl_series.clone(),
-        quit: app.quit,
-    }
+    app.clone()
 }

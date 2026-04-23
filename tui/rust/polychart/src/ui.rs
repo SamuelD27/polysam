@@ -68,17 +68,16 @@ mod tests {
         let backend = TestBackend::new(180, 50);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        // Six panel borders means six distinct titles somewhere in the
-        // buffer; assert at least one glyph survived per panel.
-        let text = buf
+        let text = terminal
+            .backend()
+            .buffer()
             .content
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        for expected in [
-            "header", "live", "refined", "orderbook", "baselines", "orders",
-        ] {
+        // Panels with titles survive empty AppState; the header shows
+        // "waiting for market" when no state.json is present.
+        for expected in ["waiting for market", "live", "refined", "orderbook", "baselines", "orders"] {
             assert!(
                 text.contains(expected),
                 "expected '{expected}' in rendered buffer"

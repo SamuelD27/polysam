@@ -15,7 +15,7 @@ pub const PRICE_HISTORY_CAP: usize = 300;
 pub const PNL_SERIES_CAP: usize = 2000;
 pub const PNL_VISIBLE_WINDOW: usize = 300;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub snapshot: Option<StateSnapshot>,
     pub last_t_zero: Option<i64>,
@@ -28,6 +28,9 @@ pub struct AppState {
     // Persistent per-strategy cumulative PnL: decimates middle past cap,
     // preserves first and last points. Reset only on events.jsonl truncation.
     pub pnl_series: HashMap<String, Vec<(f64, f64)>>,
+
+    // Whether daemon_state/KILL exists as of the last state tick.
+    pub kill_active: bool,
     pub quit: bool,
 }
 

@@ -9,6 +9,7 @@ mod state;
 mod state_reader;
 mod theme;
 mod ui;
+mod util;
 mod widgets;
 
 use std::path::{Path, PathBuf};
