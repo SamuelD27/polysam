@@ -86,15 +86,17 @@ if [[ "$MODE" == "preflight" ]]; then
     exit $?
 fi
 
-# ── Dashboard picker: DASHBOARD=rust|python (rust default) ───────────────
-# If DASHBOARD is unset we default to rust; if the polychart binary is
-# missing we print a build hint and fall back to python so developers
-# aren't locked out by a missing target/release/ artefact.
+# ── Dashboard picker: DASHBOARD=python|rust (python default) ─────────────
+# Python TUI is the stable default. The Rust TUI (polychart) is opt-in via
+# DASHBOARD=rust until it's verified end-to-end against a live daemon; on
+# opt-in we warn once so the choice stays deliberate. Missing polychart
+# binary falls back to python with a build hint.
 POLYCHART_BIN="$PROJECT_DIR/tui/target/release/polychart"
 pick_dashboard_cmd() {
-    local choice="${DASHBOARD:-rust}"
+    local choice="${DASHBOARD:-python}"
     case "$choice" in
         rust)
+            echo "[launch] DASHBOARD=rust is IN DEVELOPMENT -- not verified against live daemon. Use DASHBOARD=python to revert." >&2
             if [[ -x "$POLYCHART_BIN" ]]; then
                 echo "$POLYCHART_BIN"
             else
@@ -108,7 +110,7 @@ pick_dashboard_cmd() {
             echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
             ;;
         *)
-            echo "[launch] DASHBOARD=$choice not recognised (use rust|python);" >&2
+            echo "[launch] DASHBOARD=$choice not recognised (use python|rust);" >&2
             echo "[launch]   falling back to python" >&2
             echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
             ;;

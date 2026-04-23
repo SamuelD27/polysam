@@ -12,6 +12,17 @@ Two implementations live side-by-side:
 
 ---
 
+## Status
+
+- **`tui/python/dashboard.py`** — STABLE, default, invoked by
+  `launch_daemon.sh` with no env vars.
+- **`tui/rust/polychart`** — IN DEVELOPMENT. Feature-complete but not
+  verified end-to-end against a live daemon. Opt in with
+  `DASHBOARD=rust ./launch_daemon.sh`. Revert with `DASHBOARD=python`
+  or by unsetting the variable.
+
+---
+
 ## Directory layout
 
 ```
