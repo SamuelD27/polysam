@@ -21,6 +21,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.widgets import Static, DataTable, RichLog
+from textual.worker import Worker, WorkerState
 
 from active_bots.execution.token_resolver import TokenResolver
 
@@ -682,6 +683,8 @@ class OrderbookWidget(Container):
         hdr.update(header)
 
         # Adaptive depth: clamp to half of (table rows - 1 spread row).
+        # Floor of 3 levels per side keeps the panel populated even on first
+        # render before the layout has settled (tbl.size.height starts at 0).
         avail_rows = max(3, tbl.size.height)
         depth = max(3, min(self.HARD_DEPTH_CAP, (avail_rows - 1) // 2))
 
@@ -743,6 +746,7 @@ class DashboardApp(App):
         self._poller: OrderbookPoller | None = None
         self._poller_slug: str | None = None
         self._last_book_poll = 0.0
+        self._book_worker_inflight = False
         self.set_interval(0.5, self._tick)
 
     def _ensure_poller(self, slug: str | None) -> None:
@@ -750,26 +754,48 @@ class DashboardApp(App):
             self._poller = None
             self._poller_slug = None
             return
-        if slug == self._poller_slug and self._poller is not None:
-            return
+        if slug == self._poller_slug:
+            return  # already attempted this slug (success or fail)
+        self._poller_slug = slug
         try:
             tokens = self._resolver.resolve(slug)
         except Exception:
             tokens = None
-        self._poller_slug = slug
         if tokens is None:
             self._poller = None
             return
         self._poller = OrderbookPoller(tokens.yes_token_id)
 
-    def _maybe_poll_book(self) -> OrderbookSnapshot | None:
+    def _maybe_poll_book(self) -> "OrderbookSnapshot | None":
+        """Return the latest snapshot. Trigger a worker poll if cadence elapsed.
+
+        Polling runs in a background thread so the 3 s HTTP timeout never
+        blocks the Textual event loop.
+        """
         if self._poller is None:
             return None
         now = time.time()
-        if now - self._last_book_poll < self._poller.current_interval:
-            return self._poller.last_snapshot
-        self._last_book_poll = now
-        return self._poller.poll_once()
+        if (now - self._last_book_poll >= self._poller.current_interval
+                and not self._book_worker_inflight):
+            self._last_book_poll = now
+            self._book_worker_inflight = True
+            self.run_worker(
+                self._poll_book_worker,
+                name="book-poll",
+                thread=True,
+                exclusive=True,
+            )
+        return self._poller.last_snapshot
+
+    def _poll_book_worker(self) -> None:
+        """Background-thread function: one HTTP call to the CLOB /book endpoint."""
+        poller = self._poller
+        if poller is None:
+            return
+        try:
+            poller.poll_once()
+        finally:
+            self._book_worker_inflight = False
 
     def _tick(self) -> None:
         state = read_json(STATE_FILE)

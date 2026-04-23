@@ -95,3 +95,42 @@ def test_poller_empty_book_marked_empty_not_error():
     snap = p.poll_once()
     assert snap.status == "empty"
     assert snap.error is None
+
+
+def test_ensure_poller_does_not_busy_loop_on_resolve_failure(monkeypatch):
+    """If TokenResolver returns None, we must not re-resolve every tick."""
+    import dashboard as d
+
+    # Bypass full app init.
+    app = d.DashboardApp.__new__(d.DashboardApp)
+    app._resolver = MagicMock()
+    app._resolver.resolve.return_value = None
+    app._poller = None
+    app._poller_slug = None
+
+    app._ensure_poller("slug-X")
+    app._ensure_poller("slug-X")
+    app._ensure_poller("slug-X")
+
+    # Only the first call should hit the resolver.
+    assert app._resolver.resolve.call_count == 1
+    assert app._poller is None  # confirmed unresolvable
+    assert app._poller_slug == "slug-X"
+
+
+def test_ensure_poller_retries_on_slug_change(monkeypatch):
+    """A new slug must trigger a fresh resolve, even if the previous failed."""
+    import dashboard as d
+
+    app = d.DashboardApp.__new__(d.DashboardApp)
+    app._resolver = MagicMock()
+    app._resolver.resolve.side_effect = [None, MagicMock(yes_token_id="tok-Y")]
+    app._poller = None
+    app._poller_slug = None
+
+    app._ensure_poller("slug-X")  # first slug fails
+    app._ensure_poller("slug-Y")  # second slug succeeds
+
+    assert app._resolver.resolve.call_count == 2
+    assert isinstance(app._poller, d.OrderbookPoller)
+    assert app._poller.token_id == "tok-Y"
