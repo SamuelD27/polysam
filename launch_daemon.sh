@@ -86,6 +86,35 @@ if [[ "$MODE" == "preflight" ]]; then
     exit $?
 fi
 
+# ── Dashboard picker: DASHBOARD=rust|python (rust default) ───────────────
+# If DASHBOARD is unset we default to rust; if the polychart binary is
+# missing we print a build hint and fall back to python so developers
+# aren't locked out by a missing target/release/ artefact.
+POLYCHART_BIN="$PROJECT_DIR/tui/target/release/polychart"
+pick_dashboard_cmd() {
+    local choice="${DASHBOARD:-rust}"
+    case "$choice" in
+        rust)
+            if [[ -x "$POLYCHART_BIN" ]]; then
+                echo "$POLYCHART_BIN"
+            else
+                echo "[launch] DASHBOARD=rust but $POLYCHART_BIN missing;" >&2
+                echo "[launch]   build it with:  cd tui && cargo build --release" >&2
+                echo "[launch]   falling back to python dashboard" >&2
+                echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
+            fi
+            ;;
+        python)
+            echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
+            ;;
+        *)
+            echo "[launch] DASHBOARD=$choice not recognised (use rust|python);" >&2
+            echo "[launch]   falling back to python" >&2
+            echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
+            ;;
+    esac
+}
+
 # ── Status: attach dashboard to a daemon that's already running ──────────
 if [[ "$MODE" == "status" ]]; then
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -93,7 +122,8 @@ if [[ "$MODE" == "status" ]]; then
     else
         echo "[launch] WARNING: no running daemon (no PID file or stale). Dashboard will show last snapshot."
     fi
-    exec python3 "$PROJECT_DIR/tui/python/dashboard.py"
+    # shellcheck disable=SC2046
+    exec $(pick_dashboard_cmd)
 fi
 
 # ── Kill any stale daemon (PID-file + process scan) ──────────────────────
@@ -154,37 +184,37 @@ fi
 
 echo "[launch] daemon pid=$DAEMON_PID"
 
-# ── Streamlit web GUI (host netns, reads state files only) ───────────────
-start_streamlit() {
-    if [[ ! -f "$PROJECT_DIR/scripts/dashboard_streamlit.py" ]]; then
-        return
-    fi
-    if ! command -v streamlit >/dev/null 2>&1; then
-        echo "[launch] streamlit not installed; skipping web GUI (run: uv pip install -r requirements.txt)"
+# ── Live web GUI (aiohttp + websocket, reads state files only) ──────────
+GUI_PORT=3006
+GUI_URL="http://localhost:${GUI_PORT}"
+
+start_live_gui() {
+    if [[ ! -f "$PROJECT_DIR/scripts/live_dashboard.py" ]]; then
+        echo "[launch] scripts/live_dashboard.py missing; skipping web GUI"
         return
     fi
     local spid
-    streamlit run "$PROJECT_DIR/scripts/dashboard_streamlit.py" \
-        --server.port 3006 \
-        --server.address 0.0.0.0 \
-        --server.headless true \
-        --server.fileWatcherType none \
-        --browser.gatherUsageStats false \
-        > "$STATE_DIR/streamlit.log" 2>&1 &
+    python3 "$PROJECT_DIR/scripts/live_dashboard.py" --port "$GUI_PORT" \
+        > "$STATE_DIR/live_gui.log" 2>&1 &
     spid=$!
-    echo "[launch] streamlit GUI pid=$spid http://localhost:3006"
-    echo "$spid" > "$STATE_DIR/streamlit.pid"
+    echo "$spid" > "$STATE_DIR/live_gui.pid"
+    echo "[launch] ============================================================"
+    echo "[launch]   web GUI:  $GUI_URL   (pid=$spid)"
+    echo "[launch]   log:      $STATE_DIR/live_gui.log"
+    echo "[launch]   rich TUI: starts below, Ctrl-C stops everything"
+    echo "[launch] ============================================================"
+    if [[ -z "${NO_BROWSER:-}" ]] && command -v xdg-open >/dev/null 2>&1; then
+        (sleep 2 && xdg-open "$GUI_URL" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
+    fi
 }
 
-start_streamlit
-
-stop_streamlit() {
+stop_live_gui() {
     local spid=""
-    if [[ -f "$STATE_DIR/streamlit.pid" ]]; then
-        spid=$(cat "$STATE_DIR/streamlit.pid" 2>/dev/null || true)
+    if [[ -f "$STATE_DIR/live_gui.pid" ]]; then
+        spid=$(cat "$STATE_DIR/live_gui.pid" 2>/dev/null || true)
     fi
     if [[ -n "$spid" ]] && kill -0 "$spid" 2>/dev/null; then
-        echo "[launch] stopping streamlit pid=$spid"
+        echo "[launch] stopping live GUI pid=$spid"
         kill "$spid" 2>/dev/null || true
         for _ in 1 2 3 4 5 6; do
             if ! kill -0 "$spid" 2>/dev/null; then
@@ -193,15 +223,16 @@ stop_streamlit() {
             sleep 1
         done
         if kill -0 "$spid" 2>/dev/null; then
-            echo "[launch] streamlit did not exit in 6s; SIGKILL"
+            echo "[launch] live GUI did not exit in 6s; SIGKILL"
             kill -9 "$spid" 2>/dev/null || true
         fi
         wait "$spid" 2>/dev/null || true
     fi
-    # Safety net: any stray streamlit process bound to this dashboard.
-    pkill -f "streamlit run.*dashboard_streamlit" 2>/dev/null || true
-    rm -f "$STATE_DIR/streamlit.pid"
+    pkill -f "python.*scripts/live_dashboard\.py" 2>/dev/null || true
+    rm -f "$STATE_DIR/live_gui.pid"
 }
+
+start_live_gui
 
 stop_daemon() {
     # Bounded escalation: SIGTERM the known PID + cmdline match,
@@ -233,14 +264,15 @@ stop_daemon() {
     fi
 }
 
-trap 'stop_streamlit; stop_daemon; exit 0' INT TERM
+trap 'stop_live_gui; stop_daemon; exit 0' INT TERM
 
-# ── Rich TUI dashboard in foreground ─────────────────────────────────────
+# ── TUI dashboard in foreground (DASHBOARD=rust|python, rust default) ────
 echo "[launch] starting TUI dashboard (Ctrl-C stops dashboard + daemon)"
 sleep 2
-python3 "$PROJECT_DIR/tui/python/dashboard.py" || true
+# shellcheck disable=SC2046
+$(pick_dashboard_cmd) || true
 
-# Dashboard exited (Ctrl-C). Stop streamlit + daemon too.
-stop_streamlit
+# Dashboard exited (Ctrl-C). Stop live GUI + daemon too.
+stop_live_gui
 stop_daemon
 echo "[launch] daemon stopped"
