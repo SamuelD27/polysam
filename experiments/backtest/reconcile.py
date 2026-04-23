@@ -70,9 +70,14 @@ def _matches_live_predicate(row: dict) -> bool:
             has_ack = True
         if d.get("order_id") not in (None, ""):
             has_order_id = True
-        # Live executors commonly name this 'fill_price' or 'filled_price';
-        # accept both — we're only checking non-null presence here.
-        for key in ("fill_price", "filled_price", "executed_price"):
+        # Live executors commonly name the fill price 'fill_price' or
+        # 'filled_price'; our LiveExecutor.enter() persists it as
+        # 'entry_price' (the actual avg fill, not the strategy's pre-call
+        # estimate), so accept that alias too. Paper mode also stamps
+        # entry_price, but reconcile's gate requires BOTH order_id AND
+        # ack_ts AND fill_price — paper lacks order_id/ack_ts, so this
+        # alias cannot accidentally let paper rows through.
+        for key in ("fill_price", "filled_price", "executed_price", "entry_price"):
             if d.get(key) not in (None, ""):
                 has_fill_price = True
                 break

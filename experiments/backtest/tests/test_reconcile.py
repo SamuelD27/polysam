@@ -100,6 +100,28 @@ def test_count_live_fills_accepts_filled_price_alias(tmp_path: Path) -> None:
     assert count_live_fills(events) == 1
 
 
+def test_count_live_fills_accepts_entry_price_alias_for_live_fills(tmp_path: Path) -> None:
+    # LiveExecutor.enter() persists the actual fill avg_price as 'entry_price';
+    # the predicate must accept this. Paper mode lacks order_id/ack_ts so it
+    # cannot accidentally slip through via this alias.
+    events = tmp_path / "events.jsonl"
+    _write_events(
+        events,
+        [
+            {
+                "ts": 1.0,
+                "type": "entry_filled",
+                "position": {
+                    "order_id": "dry-run-1776910000001",
+                    "ack_ts": 1.00035,
+                    "entry_price": 0.48,  # LiveExecutor's fill_price alias
+                },
+            },
+        ],
+    )
+    assert count_live_fills(events) == 1
+
+
 def test_reconcile_raises_no_live_fills_on_paper(tmp_path: Path) -> None:
     events = tmp_path / "events.jsonl"
     _write_events(
