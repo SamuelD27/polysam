@@ -5,6 +5,7 @@
 
 mod app;
 mod events;
+mod http;
 mod state;
 mod state_reader;
 mod theme;

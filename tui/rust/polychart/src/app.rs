@@ -20,6 +20,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::events::EventsTailer;
+use crate::http::{OrderbookPoller, TokenResolver};
 use crate::state::AppState;
 use crate::state_reader::{read_state_json_async, resolve_state_dir};
 use crate::ui;
@@ -109,6 +110,51 @@ pub async fn run() -> Result<()> {
                 if let Ok(mut app) = shared.lock() {
                     // Swap tailer's series into the app's PnL map each tick.
                     app.pnl_series = tailer.pnl_series.clone();
+                }
+            }
+        });
+    }
+
+    // CLOB orderbook poller: resolves the YES token once per slug, then
+    // polls /book on its own cadence (2s base, 10s backoff).
+    {
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let resolver = std::sync::Arc::new(TokenResolver::new());
+            let mut poller: Option<OrderbookPoller> = None;
+            let mut current_slug: Option<String> = None;
+            loop {
+                // Figure out what slug we should be polling.
+                let desired_slug = {
+                    let app = match shared.lock() {
+                        Ok(a) => a,
+                        Err(_) => return,
+                    };
+                    app.snapshot.as_ref().and_then(|s| s.slug.clone())
+                };
+
+                // Rebuild the poller on slug change.
+                if desired_slug != current_slug {
+                    current_slug = desired_slug.clone();
+                    poller = None;
+                    if let Some(ref slug) = current_slug {
+                        if let Some(tokens) = resolver.resolve(slug).await {
+                            poller = Some(OrderbookPoller::new(tokens.yes_token_id));
+                        }
+                    }
+                }
+
+                if let Some(p) = poller.as_mut() {
+                    let snap = p.poll_once().await;
+                    let interval = p.current_interval;
+                    if let Ok(mut app) = shared.lock() {
+                        app.orderbook = Some(snap);
+                    }
+                    tokio::time::sleep(interval).await;
+                } else {
+                    // No poller yet (slug missing or unresolvable);
+                    // check again in a second.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
         });

@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::http::OrderbookSnapshot;
 use crate::state_reader::StateSnapshot;
 
 pub const PRICE_HISTORY_CAP: usize = 300;
@@ -31,6 +32,10 @@ pub struct AppState {
 
     // Whether daemon_state/KILL exists as of the last state tick.
     pub kill_active: bool,
+
+    // Latest CLOB orderbook snapshot (None until the first poll).
+    pub orderbook: Option<OrderbookSnapshot>,
+
     pub quit: bool,
 }
 
