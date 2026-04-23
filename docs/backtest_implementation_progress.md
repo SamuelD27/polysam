@@ -8,12 +8,18 @@ has passing tests; no uncommitted code is load-bearing.
 **Spec (authoritative contract):**
 `docs/book_walked_replay_backtester_spec.md` (committed 098123b).
 
-**Last activity on backtest/execution:** `5bf31f1 fix(execution): DryRunExecutor
-for behavioural-realistic live dryrun` (R2.1 Option C).
+**Last activity on backtest/execution:** `f390c20 fix(execution): construct
+TokenResolver in live+dryrun so token_id lands on refined entries` — the
+last R2.1 verification blocker; without it `DryRunExecutor` received a
+`MarketCtx` with `yes_token_id=None` / `no_token_id=None` and stamped
+`result.token_id=None` on every entry.
 
 **Local-only commits not pushed to `polysam` yet:**
-`aab45e7`, `d92026b`, `5bf31f1`. Pending the post-Option-C dryrun re-run
-verification before push.
+`aab45e7`, `d92026b`, `5bf31f1`, `f390c20`. Post-fix short-run dryrun
+verification PASSED — a refined `entry_filled` captured during the test
+run carried `order_id="dry-run-1776930517783"`, `token_id=<77-digit
+ERC-1155 YES id>`, `ack_ts=1776930517.78…`, and a realistic
+`entry_price=0.07` (not the 0.5/0.5 pre-Option-C artefact).
 
 ---
 
@@ -237,40 +243,39 @@ If go:
 | 1 | WS scraper 30-min clean run (5 sub-gates) | **GREEN.** 8 files / 35.5 MB, 383k `price_change`, 0 sequence_gaps, 0 reconnects, p50 inter-event gap = 0.1 ms |
 | 2 | Tunnel + CLOB auth | **GREEN.** Funder address confirmed `0xf5f6fbf6d64890b59a70a33e45fd705957d34049` via CLOB `/auth/derive-api-key`; balance-allowance round-trip returned $91.79 |
 | 3 | Funding + proxy-vs-EOA | **GREEN.** Trading address = EOA, not a proxy. No deposit/transfer pre-flight needed |
-| 4 | Dryrun produces predicate-shape events | **PENDING** — verification of `5bf31f1` re-run still outstanding |
+| 4 | Dryrun produces predicate-shape events | **GREEN.** Post-`f390c20` refined `entry_filled` carries populated `order_id`, `token_id`, `ack_ts`, and a non-0.5 `entry_price` (verified 2026-04-23). |
 
 ---
 
 ## Resume checklist (when unpausing)
 
-1. **Ctrl-C** any running daemon (the one that launched during R2.1
-   Option B may still be active — check `daemon_state/daemon.pid` and
-   `ps -eo pid,etime,cmd | grep daemon_base_v1`).
+1. **Ctrl-C** any running daemon (check `daemon_state/daemon.pid` and
+   `ps -eo pid,etime,cmd | grep daemon_base_v1`). ✓ DONE at pause.
 
-2. **Re-run dryrun with the Option C fix:**
-   ```bash
-   cd /home/samsam/polymarket-hustle
-   ./launch_daemon.sh live dryrun
-   ```
-   Expected startup log:
-   `[daemon_base_v1] executor=live-dryrun (paper fills + live-shape metadata; no CLOB posts)`
-   Let it run 15 min, Ctrl-C.
+2. **Re-run dryrun with the Option C fix:** ✓ DONE 2026-04-23 via
+   `POLYMARKET_MODE=live POLYMARKET_DRY_RUN=1 python3 daemon_base_v1.py`
+   (ran ~4 min, waited for one refined entry, clean shutdown). Startup
+   log line confirmed: `executor=live-dryrun (paper fills + live-shape
+   metadata; no CLOB posts)`.
 
-3. **Verify event shape** (Claude can do this part):
-   ```bash
-   grep '"type": *"entry_filled"' daemon_state/events.jsonl | tail -10 \
-     | python3 -c 'import sys,json; [print(json.dumps(json.loads(l),indent=2)) for l in sys.stdin]'
-   ```
-   Expect: each position dict has `order_id` starting `"dry-run-"`,
-   `ack_ts` populated, `entry_price` varying across rows (not a flat
-   0.50).
+3. **Verify event shape** ✓ DONE. One new refined `entry_filled`
+   captured:
+   `order_id="dry-run-1776930517783"`,
+   `token_id="84479084923870139997020786283485327672690044198469033114676395937158355542051"`,
+   `ack_ts=1776930517.7839868`,
+   `entry_price=0.07` (not 0.5).
+   Pre-fix entries for contrast still visible higher up in
+   `daemon_state/events.jsonl` with `token_id: null`.
 
 4. **Push to polysam** if step 3 passes:
    ```bash
    git push polysam Sam-Dev
    ```
-   Target commits: `aab45e7`, `d92026b`, `5bf31f1` (plus any R1 follow-ups
-   not yet pushed — `git log polysam/Sam-Dev..Sam-Dev` to confirm).
+   Target commits: `aab45e7`, `d92026b`, `5bf31f1`, `f390c20` (plus any
+   dashboard / tui-rust follow-ups not yet pushed — run
+   `git log polysam/Sam-Dev..Sam-Dev` to confirm; there are ~44 unpushed
+   commits on `Sam-Dev` at this pause, most of them dashboard/TUI work
+   interleaved with the backtest slice).
 
 5. **First real LIVE_MODE capture** — operator's explicit go-ahead
    required; Claude does not launch this. Command template:
