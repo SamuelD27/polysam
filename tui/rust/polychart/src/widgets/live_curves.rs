@@ -261,6 +261,53 @@ mod tests {
     use crate::state_reader::StateSnapshot;
     use ratatui::{backend::TestBackend, Terminal};
 
+    /// Smoke test: verify the chart actually emits braille line glyphs
+    /// (not scatter dots) at a realistic data scale. Prevents regression
+    /// to Marker::Dot on the strike line or main series.
+    #[test]
+    fn btc_chart_renders_with_braille_line_glyphs() {
+        let mut app = AppState::new();
+        app.snapshot = Some(StateSnapshot {
+            strike: Some(77_999.0),
+            ..Default::default()
+        });
+        for i in 0..300usize {
+            let t = 1_000_000.0 + i as f64 * 0.5;
+            let y = 78_000.0 + ((i as f64) * 0.02).sin() * 3.0;
+            app.btc_series.push_back((t, y));
+        }
+        let backend = TestBackend::new(100, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_live_curves(frame, frame.area(), &app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // Braille block chars we'd expect from continuous line segments.
+        // If the chart regresses to Marker::Dot, we see '⠂'/'⠄' etc.
+        // instead of the line-trace glyphs below.
+        let line_glyphs = ['⠉', '⠒', '⠤', '⣀'];
+        let line_hits: usize = line_glyphs
+            .iter()
+            .map(|g| text.matches(*g).count())
+            .sum();
+        assert!(
+            line_hits > 40,
+            "expected >40 braille line glyphs, got {line_hits}: render was\n{text}"
+        );
+        // Scatter-dot marker '⠂' should NOT dominate; allow a handful.
+        let dot_hits = text.matches('⠂').count();
+        assert!(
+            dot_hits < 20,
+            "too many scatter dots ({dot_hits}); chart regressed to Marker::Dot?"
+        );
+    }
+
     fn state_with_prices(up: Option<f64>, btc_pts: usize) -> AppState {
         let mut app = AppState::new();
         app.snapshot = Some(StateSnapshot {
