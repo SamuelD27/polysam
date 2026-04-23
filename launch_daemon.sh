@@ -93,7 +93,7 @@ if [[ "$MODE" == "status" ]]; then
     else
         echo "[launch] WARNING: no running daemon (no PID file or stale). Dashboard will show last snapshot."
     fi
-    exec python3 "$PROJECT_DIR/scripts/dashboard.py"
+    exec python3 "$PROJECT_DIR/tui/python/dashboard.py"
 fi
 
 # ── Kill any stale daemon (PID-file + process scan) ──────────────────────
@@ -238,7 +238,7 @@ trap 'stop_streamlit; stop_daemon; exit 0' INT TERM
 # ── Rich TUI dashboard in foreground ─────────────────────────────────────
 echo "[launch] starting TUI dashboard (Ctrl-C stops dashboard + daemon)"
 sleep 2
-python3 "$PROJECT_DIR/scripts/dashboard.py" || true
+python3 "$PROJECT_DIR/tui/python/dashboard.py" || true
 
 # Dashboard exited (Ctrl-C). Stop streamlit + daemon too.
 stop_streamlit

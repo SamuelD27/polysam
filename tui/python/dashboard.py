@@ -16,10 +16,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-# When run as `python3 scripts/dashboard.py`, sys.path[0] is scripts/, so the
-# repo-root `active_bots` package isn't importable. Add the repo root before
-# touching anything from active_bots.
-REPO = Path(__file__).resolve().parent.parent
+# When run as `python3 tui/python/dashboard.py`, sys.path[0] is tui/python/,
+# so the repo-root `active_bots` package isn't importable. Add the repo root
+# before touching anything from active_bots.
+# tui/python/dashboard.py -> repo root is three parents up (python -> tui -> repo).
+REPO = Path(__file__).resolve().parent.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 

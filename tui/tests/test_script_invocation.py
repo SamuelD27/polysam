@@ -1,6 +1,6 @@
-"""Regression: 'python3 scripts/dashboard.py' must import cleanly.
+"""Regression: 'python3 tui/python/dashboard.py' must import cleanly.
 
-When run as a script, sys.path[0] is scripts/, NOT the repo root, so the
+When run as a script, sys.path[0] is tui/python/, NOT the repo root, so the
 `from active_bots.execution.token_resolver import TokenResolver` line
 will ModuleNotFoundError unless dashboard.py adds the repo root to
 sys.path itself. This test simulates the script-invocation environment.
@@ -10,11 +10,11 @@ import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
-SCRIPT = REPO / "scripts" / "dashboard.py"
+SCRIPT = REPO / "tui" / "python" / "dashboard.py"
 
 
 def test_dashboard_imports_when_invoked_as_script(tmp_path):
-    """Spawn a fresh interpreter with only scripts/ on sys.path[0] and
+    """Spawn a fresh interpreter with only tui/python/ on sys.path[0] and
     confirm `import dashboard` succeeds (i.e. its own sys.path manipulation
     finds active_bots at the repo root)."""
     # -I = isolated mode: skips PYTHONPATH and user site-packages, mirroring
