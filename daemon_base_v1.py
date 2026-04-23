@@ -286,11 +286,8 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
         else "<none>"
     )
 
-    # Paper path: POLYMARKET_MODE=paper, or live-mode client build failed.
-    # dry_run is now routed through LiveExecutor(dry_run=True) so the live
-    # order-construction code path runs and entry records get order_id +
-    # ack_ts stamped; LiveExecutor's _place_market_order short-circuits
-    # before any network call (see live_executor.py:316).
+    # Paper: POLYMARKET_MODE=paper. Real paper-mode session with no live
+    # credentials and no CLOB client build.
     if mode != "live":
         logger.info(
             "executor=paper (POLYMARKET_MODE=%s) portfolio=%s max_trade_size=$%.2f (%s)",
@@ -298,8 +295,7 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
         )
         return PaperExecutor(), None, risk
 
-    # mode == "live". Fall back to paper only if the client never built —
-    # this is the real safety net, not a dry_run short-circuit.
+    # mode == "live" with client-build failure → real safety net back to paper.
     if client is None:
         logger.error(
             "LIVE MODE REQUESTED BUT FAILED TO INIT CLIENT: %s",
@@ -312,6 +308,22 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
         )
         return PaperExecutor(), None, risk
 
+    # mode == "live" with DRY_RUN=1 → DryRunExecutor: PaperExecutor fill math
+    # (realistic fills at strategy's requested mid; ProfitGrabber TP/SL fire
+    # at real prices; PnL is meaningful) wrapped with LiveExecutor-shaped
+    # metadata (order_id='dry-run-<ms>', token_id from MarketCtx). Does NOT
+    # exercise live_executor.py — that path is exercised only the first time
+    # the operator runs LIVE_MODE with POLYMARKET_DRY_RUN unset.
+    if dry_run:
+        from active_bots.execution.dry_run_executor import DryRunExecutor
+        funder = os.environ.get("POLYMARKET_FUNDER", "").strip()
+        logger.info(
+            "executor=live-dryrun (paper fills + live-shape metadata; no CLOB posts) "
+            "funder=%s portfolio=%s max_trade_size=$%.2f (%s)",
+            funder, portfolio_str, effective_max, source,
+        )
+        return DryRunExecutor(), None, risk
+
     from active_bots.execution.live_executor import LiveExecutor
     from active_bots.execution.reconciler import Reconciler
     from active_bots.execution.token_resolver import TokenResolver
@@ -321,14 +333,13 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
     reconciler = Reconciler(funder_address=funder) if funder else None
 
     logger.info(
-        "executor=live%s funder=%s portfolio=%s max_trade_size=$%.2f (%s) "
+        "executor=live funder=%s portfolio=%s max_trade_size=$%.2f (%s) "
         "daily_loss=$%.0f session_loss=$%.0f",
-        " (DRY_RUN: signed orders logged, not posted)" if dry_run else "",
         funder, portfolio_str, effective_max, source,
         risk_cfg.max_daily_loss_usdc, risk_cfg.max_session_loss_usdc,
     )
     return (
-        LiveExecutor(client, resolver, risk, reconciler=reconciler, dry_run=dry_run),
+        LiveExecutor(client, resolver, risk, reconciler=reconciler, dry_run=False),
         resolver,
         risk,
     )
