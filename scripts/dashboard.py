@@ -14,6 +14,7 @@ from collections import deque
 from pathlib import Path
 
 from rich.text import Text
+from textual_plotext import PlotextPlot
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
@@ -286,12 +287,160 @@ class LiveCurvesWidget(Container):
 
 
 class MainStrategyWidget(Container):
+    TRADES_COLUMNS = ("t", "side", "in->out", "size", "pnl", "ROI", "why", "hold")
+
     def compose(self) -> ComposeResult:
-        yield Static("refined headline placeholder", id="refined-headline")
-        yield Static("refined secondary placeholder", id="refined-secondary")
-        yield Static("pnl chart placeholder", id="chart-pnl")
+        yield Static("", id="refined-headline")
+        yield Static("", id="refined-secondary")
+        yield PlotextPlot(id="chart-pnl")
         yield Static("no position", id="refined-position")
-        yield DataTable(id="refined-trades")
+        yield DataTable(id="refined-trades", zebra_stripes=False,
+                        cursor_type="none")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#refined-trades", DataTable)
+        for col in self.TRADES_COLUMNS:
+            tbl.add_column(col, key=col)
+
+    def render_state(
+        self,
+        state: dict | None,
+        actions,
+        pnl_series: list[tuple[float, float]],
+    ) -> None:
+        if state is None:
+            self.query_one("#refined-headline", Static).update(
+                "[dim]waiting for state.json[/]"
+            )
+            return
+
+        blob = state.get("refined") or {}
+        stats = _compute_stats(blob.get("stats") or {})
+        extra = blob.get("extra") or {}
+        fair = blob.get("fair_price")
+        mkt = state.get("market_price_up")
+
+        self._render_headline(state, stats)
+        self._render_secondary(fair, mkt, extra)
+        self._render_pnl_chart(pnl_series)
+        self._render_position(blob.get("open_position"), mkt)
+        self._render_trades(blob.get("closed_trades") or [])
+
+    # --- pieces --------------------------------------------------------
+
+    def _render_headline(self, state: dict, stats: dict) -> None:
+        t_zero = state.get("t_zero") or 0
+        slug = state.get("slug") or ""
+        line1 = Text()
+        if t_zero:
+            line1.append(
+                "Market: BTC "
+                + time.strftime("%Y-%m-%d T-T+5m", time.localtime(t_zero)),
+                style="bold",
+            )
+        else:
+            line1.append(f"Market: {slug}", style="bold")
+
+        line2 = Text()
+        line2.append(f"PnL {stats['total_pnl']:+.2f}  ",
+                     style=f"bold {pnl_color(stats['total_pnl'])}")
+        line2.append(f"ROI {stats['roi']:+.1f}%  ",
+                     style=pnl_color(stats['roi']))
+        line2.append(f"{stats['total']} tr  ", style="bold")
+        line2.append(f"W={stats['wins']} L={stats['losses']} {stats['wr']:.0f}%  ",
+                     style="#94a3b8")
+        line2.append(f"DD ${stats['max_drawdown']:.2f}  ", style="red")
+        st = stats['streak_type']
+        st_style = "green" if st == "W" else "red" if st == "L" else "#94a3b8"
+        line2.append(f"streak {stats['streak']} {st or '-'}", style=st_style)
+
+        self.query_one("#refined-headline", Static).update(
+            Text("\n").join([line1, line2])
+        )
+
+    def _render_secondary(self, fair, mkt, extra: dict) -> None:
+        sec = Text()
+        sec.append(f"fair {fair:.3f}  " if fair is not None else "fair -    ",
+                   style="#eab308")
+        sec.append(f"mkt {mkt:.3f}  " if mkt is not None else "mkt -    ",
+                   style="#e2e8f0")
+        if fair is not None and mkt is not None:
+            d_ = fair - mkt
+            sec.append(f"edge {d_:+.3f}  ",
+                       style="green" if abs(d_) >= 0.1 else "#94a3b8")
+            side = "Up" if d_ > 0 else "Down" if d_ < 0 else "-"
+            side_style = "green" if d_ > 0 else "red" if d_ < 0 else "#94a3b8"
+            sec.append(f"side {side}  ", style=side_style)
+        sec.append(
+            f"TP/SL/Res {extra.get('tp_count',0)}/"
+            f"{extra.get('sl_count',0)}/{extra.get('resolution_count',0)}",
+            style="white",
+        )
+        self.query_one("#refined-secondary", Static).update(sec)
+
+    def _render_pnl_chart(self, pnl_series) -> None:
+        plot = self.query_one("#chart-pnl", PlotextPlot)
+        plt = plot.plt
+        plt.clear_figure()
+        plt.theme("pro")
+        if pnl_series:
+            xs = [ts for ts, _ in pnl_series]
+            ys = [v for _, v in pnl_series]
+            colour = "green" if ys[-1] > 0 else "red" if ys[-1] < 0 else "white"
+            plt.plot(xs, ys, color=colour, marker="braille")
+            lo, hi = min(ys), max(ys)
+            if lo == hi:
+                plt.ylim(lo - 0.5, hi + 0.5)
+            else:
+                plt.ylim(lo, hi)
+        plt.xaxes(False, False)
+        plt.yaxes(False, False)
+        plot.refresh()
+
+    def _render_position(self, pos, mkt) -> None:
+        if not pos:
+            self.query_one("#refined-position", Static).update(
+                Text("no position", style="dim")
+            )
+            return
+        side = pos.get("side", "?")
+        side_style = "bold green" if side == "Up" else "bold red"
+        entry = pos.get("entry_price") or 0.0
+        t = Text()
+        t.append("OPEN ", style="bold yellow")
+        t.append(f"{side}  ", style=side_style)
+        t.append(f"entry {entry:.3f}  ", style="white")
+        t.append(f"size ${pos.get('size_usdc', 0):.2f}  ", style="white")
+        t.append(f"edge {pos.get('edge', 0):.3f}", style="cyan")
+        if mkt is not None:
+            realizable = mkt if side == "Up" else 1.0 - mkt
+            favor = realizable - entry
+            t.append(f"  realizable {realizable:.3f}  favor {favor:+.3f}",
+                     style=pnl_color(favor))
+        self.query_one("#refined-position", Static).update(t)
+
+    def _render_trades(self, closed_trades) -> None:
+        tbl = self.query_one("#refined-trades", DataTable)
+        tbl.clear()
+        trades = closed_trades[-RECENT_TRADES_CAP:]
+        for tr in reversed(trades):
+            ts = tr.get("resolved_time") or 0
+            tm = time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
+            side = tr.get("side", "?")
+            pnl = tr.get("pnl", 0) or 0
+            size_usdc = tr.get("size_usdc", 0) or 0
+            t_roi = (pnl / size_usdc * 100) if size_usdc else 0
+            hold = tr.get("hold_time_s")
+            tbl.add_row(
+                tm,
+                Text(side, style="green" if side == "Up" else "red"),
+                f"{tr.get('entry_price', 0):.3f}->{tr.get('exit_price', 0):.3f}",
+                f"${size_usdc:.0f}",
+                Text(f"{pnl:+.2f}", style=pnl_color(pnl)),
+                Text(f"{t_roi:+.1f}%", style=pnl_color(t_roi)),
+                tr.get("exit_type", "") or "",
+                f"{int(hold)}s" if hold else "-",
+            )
 
 
 class OrderbookWidget(Container):
@@ -324,11 +473,18 @@ class DashboardApp(App):
                 yield OrdersLogWidget(id="orders-log", max_lines=ACTION_CAP)
 
     def on_mount(self) -> None:
+        self.tailer = EventsTailer(EVENTS_FILE)
         self.set_interval(0.5, self._tick)
 
     def _tick(self) -> None:
         state = read_json(STATE_FILE)
+        self.tailer.update()
         self.query_one(HeaderWidget).render_state(state)
+        self.query_one(MainStrategyWidget).render_state(
+            state,
+            self.tailer.refined_actions,
+            self.tailer.pnl_series.get("refined", []),
+        )
 
 
 def main() -> int:
