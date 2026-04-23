@@ -93,3 +93,31 @@ def test_tailer_skips_malformed_lines(tmp_path):
     t = d.EventsTailer(p)
     t.update()
     assert len(t.pnl_series["refined"]) == 2
+
+
+def test_tailer_defers_partial_trailing_line(tmp_path):
+    """If a tick lands mid-write, the partial line must not be lost."""
+    p = tmp_path / "events.jsonl"
+    full_line = (
+        '{"ts": 1, "type": "exit_filled", "strategy": "refined",'
+        ' "trade": {"pnl": 1.0}}\n'
+    )
+    # Simulate a write that only made it halfway.
+    partial = full_line[:40]
+    p.write_bytes(partial.encode())
+    t = d.EventsTailer(p)
+    t.update()
+    assert t.pnl_series == {}, "partial line must not dispatch"
+    # Daemon completes the write; next tick must see the full event.
+    p.write_bytes(full_line.encode())
+    t.update()
+    assert list(t.pnl_series["refined"]) == [(1.0, 1.0)]
+
+
+def test_tailer_defers_partial_trailing_line_without_newlines(tmp_path):
+    """Chunk with zero newlines must rewind fully, not advance past bytes."""
+    p = tmp_path / "events.jsonl"
+    p.write_bytes(b'{"ts":1,"ty')  # pure partial, no newline at all
+    t = d.EventsTailer(p)
+    t.update()
+    assert t._pos == 0, "must not advance past bytes we haven't parsed"

@@ -213,7 +213,7 @@ class EventsTailer:
         try:
             size = self.path.stat().st_size
             if size < self._pos:
-                # File rotated or truncated — replay from the top.
+                # File truncated - replay from the top.
                 self._pos = 0
                 self._cum.clear()
                 self.pnl_series.clear()
@@ -221,12 +221,21 @@ class EventsTailer:
                 f.seek(self._pos)
                 data = f.read()
                 self._pos = f.tell()
+            # Defer any trailing partial line (daemon mid-write) until next tick.
+            if data and not data.endswith(b"\n"):
+                last_nl = data.rfind(b"\n")
+                if last_nl == -1:
+                    # Full chunk is a partial line; rewind fully, try again next tick.
+                    self._pos -= len(data)
+                    return
+                self._pos -= (len(data) - last_nl - 1)
+                data = data[: last_nl + 1]
             for line in data.decode(errors="replace").splitlines():
-                line = line.strip()
-                if not line:
+                stripped = line.strip()
+                if not stripped:
                     continue
                 try:
-                    ev = json.loads(line)
+                    ev = json.loads(stripped)
                 except ValueError:
                     continue
                 self.events.append(ev)
