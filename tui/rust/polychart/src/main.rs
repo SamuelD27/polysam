@@ -5,6 +5,7 @@
 //! default mode prints one line per second so the build + state-reader
 //! wiring is observable without ratatui.
 
+mod events;
 mod state;
 mod state_reader;
 
