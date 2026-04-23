@@ -106,7 +106,7 @@ fn draw_btc_chart(frame: &mut Frame, area: Rect, app: &AppState) {
         datasets.push(
             Dataset::default()
                 .name("strike")
-                .marker(symbols::Marker::Dot)
+                .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(theme::CHART_STRIKE))
                 .data(strike_data),
