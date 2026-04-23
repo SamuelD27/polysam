@@ -11,14 +11,18 @@ from __future__ import annotations
 import json
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
+import requests
 from rich.text import Text
 from textual_plotext import PlotextPlot
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.widgets import Static, DataTable, RichLog
+
+from active_bots.execution.token_resolver import TokenResolver
 
 REPO = Path(__file__).resolve().parent.parent
 STATE_DIR   = REPO / "daemon_state"
@@ -31,6 +35,8 @@ RECENT_TRADES_CAP = 5
 ACTION_CAP = 50
 PRICE_HISTORY_CAP = 300       # ~5 min at 1 Hz state writes
 PNL_SERIES_CAP = 2000         # per-strategy decimation cap
+
+CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
 
 def read_json(path: Path) -> dict | None:
@@ -150,6 +156,95 @@ def _strip_emoji(s: str) -> str:
 
 
 MARKET_DURATION = 300
+
+
+@dataclass
+class OrderbookSnapshot:
+    """One snapshot of the YES-token orderbook for the current market."""
+    status: str                                                          # ok | empty | error
+    bids: list[tuple[float, float]] = field(default_factory=list)        # (price, size) desc
+    asks: list[tuple[float, float]] = field(default_factory=list)        # (price, size) asc
+    best_bid: float = 0.0
+    best_ask: float = 0.0
+    spread: float = 0.0
+    mid: float = 0.0
+    error: str | None = None
+
+
+class OrderbookPoller:
+    """Poll the Polymarket CLOB /book endpoint for one token id.
+
+    2 s base cadence; backs off to 10 s after `failure_threshold` consecutive
+    failures; returns to base on the first success. Read-only over HTTPS;
+    network failures are recorded into the snapshot and never raise.
+    """
+
+    def __init__(
+        self,
+        token_id: str,
+        *,
+        session: requests.Session | None = None,
+        base_interval: float = 2.0,
+        backoff_interval: float = 10.0,
+        failure_threshold: int = 3,
+        timeout: float = 3.0,
+    ) -> None:
+        self.token_id = token_id
+        self._session = session or requests.Session()
+        self.base_interval = base_interval
+        self.backoff_interval = backoff_interval
+        self.failure_threshold = failure_threshold
+        self._timeout = timeout
+        self.current_interval = base_interval
+        self._consecutive_failures = 0
+        self.last_snapshot: OrderbookSnapshot | None = None
+
+    def poll_once(self) -> OrderbookSnapshot:
+        try:
+            r = self._session.get(
+                CLOB_BOOK_URL,
+                params={"token_id": self.token_id},
+                timeout=self._timeout,
+            )
+            r.raise_for_status()
+            payload = r.json()
+        except requests.Timeout:
+            return self._record_failure("timeout")
+        except requests.RequestException as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            return self._record_failure(str(code) if code else e.__class__.__name__)
+        except ValueError:
+            return self._record_failure("bad-json")
+
+        bids = [(float(b["price"]), float(b["size"]))
+                for b in (payload.get("bids") or [])]
+        asks = [(float(a["price"]), float(a["size"]))
+                for a in (payload.get("asks") or [])]
+        bids.sort(key=lambda x: -x[0])
+        asks.sort(key=lambda x: x[0])
+        best_bid = bids[0][0] if bids else 0.0
+        best_ask = asks[0][0] if asks else 0.0
+        spread = (best_ask - best_bid) if (best_bid and best_ask) else 0.0
+        mid = (best_bid + best_ask) / 2 if (best_bid and best_ask) else 0.0
+
+        self._consecutive_failures = 0
+        self.current_interval = self.base_interval
+        snap = OrderbookSnapshot(
+            status="ok" if (bids or asks) else "empty",
+            bids=bids, asks=asks,
+            best_bid=best_bid, best_ask=best_ask,
+            spread=spread, mid=mid,
+        )
+        self.last_snapshot = snap
+        return snap
+
+    def _record_failure(self, reason: str) -> OrderbookSnapshot:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.failure_threshold:
+            self.current_interval = self.backoff_interval
+        snap = OrderbookSnapshot(status="error", error=reason)
+        self.last_snapshot = snap
+        return snap
 
 
 class EventsTailer:
@@ -546,9 +641,77 @@ class MainStrategyWidget(Container):
 
 
 class OrderbookWidget(Container):
+    """Render the YES-token orderbook: asks desc, spread row, bids desc.
+
+    Depth bars scale to the largest size in the visible book. Adaptive depth:
+    the widget shows up to 10 levels per side, capped by available rows.
+    """
+
+    HARD_DEPTH_CAP = 10
+    BAR_WIDTH = 20
+
     def compose(self) -> ComposeResult:
-        yield Static("book header placeholder", id="book-hdr")
-        yield DataTable(id="book-table")
+        yield Static("", id="book-hdr")
+        yield DataTable(id="book-table", zebra_stripes=False, cursor_type="none")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#book-table", DataTable)
+        for col in ("side", "price", "size", "depth"):
+            tbl.add_column(col, key=col)
+
+    def render_snapshot(self, snap: OrderbookSnapshot | None) -> None:
+        hdr = self.query_one("#book-hdr", Static)
+        tbl = self.query_one("#book-table", DataTable)
+        tbl.clear()
+
+        if snap is None:
+            hdr.update("[dim]book: no poll yet[/]")
+            return
+        if snap.status == "error":
+            hdr.update(f"[dim]no book data (reason: {snap.error})[/]")
+            return
+        if snap.status == "empty":
+            hdr.update("[dim]book empty[/]")
+            return
+
+        header = Text()
+        header.append(f"bid {snap.best_bid:.3f}  ", style="green")
+        header.append(f"ask {snap.best_ask:.3f}  ", style="red")
+        header.append(f"spread {snap.spread:.3f}  mid {snap.mid:.3f}",
+                      style="#94a3b8")
+        hdr.update(header)
+
+        # Adaptive depth: clamp to half of (table rows - 1 spread row).
+        avail_rows = max(3, tbl.size.height)
+        depth = max(3, min(self.HARD_DEPTH_CAP, (avail_rows - 1) // 2))
+
+        asks_top = snap.asks[:depth][::-1]    # render highest ask first
+        bids_top = snap.bids[:depth]
+        sizes = [s for _, s in asks_top] + [s for _, s in bids_top]
+        max_size = max(sizes) if sizes else 1.0
+
+        def bar(size: float) -> str:
+            n = int(self.BAR_WIDTH * (size / max_size)) if max_size else 0
+            return "#" * n  # ASCII bar; CSS colours via Text style
+
+        for px, sz in asks_top:
+            tbl.add_row(
+                Text("ASK", style="red"),
+                f"{px:.3f}", f"{sz:.1f}",
+                Text(bar(sz), style="red"),
+            )
+        tbl.add_row(
+            Text("---", style="#94a3b8"),
+            Text("spread", style="#94a3b8"),
+            f"{snap.spread:.3f}",
+            "",
+        )
+        for px, sz in bids_top:
+            tbl.add_row(
+                Text("BID", style="green"),
+                f"{px:.3f}", f"{sz:.1f}",
+                Text(bar(sz), style="green"),
+            )
 
 
 class BaselinesWidget(Static):
@@ -576,17 +739,50 @@ class DashboardApp(App):
 
     def on_mount(self) -> None:
         self.tailer = EventsTailer(EVENTS_FILE)
+        self._resolver = TokenResolver()
+        self._poller: OrderbookPoller | None = None
+        self._poller_slug: str | None = None
+        self._last_book_poll = 0.0
         self.set_interval(0.5, self._tick)
+
+    def _ensure_poller(self, slug: str | None) -> None:
+        if not slug:
+            self._poller = None
+            self._poller_slug = None
+            return
+        if slug == self._poller_slug and self._poller is not None:
+            return
+        try:
+            tokens = self._resolver.resolve(slug)
+        except Exception:
+            tokens = None
+        self._poller_slug = slug
+        if tokens is None:
+            self._poller = None
+            return
+        self._poller = OrderbookPoller(tokens.yes_token_id)
+
+    def _maybe_poll_book(self) -> OrderbookSnapshot | None:
+        if self._poller is None:
+            return None
+        now = time.time()
+        if now - self._last_book_poll < self._poller.current_interval:
+            return self._poller.last_snapshot
+        self._last_book_poll = now
+        return self._poller.poll_once()
 
     def _tick(self) -> None:
         state = read_json(STATE_FILE)
         self.tailer.update()
+        self._ensure_poller(state.get("slug") if state else None)
+        snap = self._maybe_poll_book()
         self.query_one(HeaderWidget).render_state(state)
         self.query_one(LiveCurvesWidget).render_state(state)
         self.query_one(MainStrategyWidget).render_state(
             state,
             self.tailer.pnl_series.get("refined", []),
         )
+        self.query_one(OrderbookWidget).render_snapshot(snap)
 
 
 def main() -> int:
