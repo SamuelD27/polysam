@@ -98,7 +98,7 @@ fn draw_btc_chart(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let mut datasets = vec![Dataset::default()
         .name("BTC")
-        .marker(symbols::Marker::Braille)
+        .marker(symbols::Marker::HalfBlock)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(theme::CHART_BTC))
         .data(&data)];
@@ -106,7 +106,7 @@ fn draw_btc_chart(frame: &mut Frame, area: Rect, app: &AppState) {
         datasets.push(
             Dataset::default()
                 .name("strike")
-                .marker(symbols::Marker::Braille)
+                .marker(symbols::Marker::HalfBlock)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(theme::CHART_STRIKE))
                 .data(strike_data),
@@ -167,7 +167,7 @@ fn draw_mkt_fair_chart(frame: &mut Frame, area: Rect, app: &AppState) {
         datasets.push(
             Dataset::default()
                 .name("mkt")
-                .marker(symbols::Marker::Braille)
+                .marker(symbols::Marker::HalfBlock)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(theme::CHART_MKT))
                 .data(&mkt),
@@ -177,7 +177,7 @@ fn draw_mkt_fair_chart(frame: &mut Frame, area: Rect, app: &AppState) {
         datasets.push(
             Dataset::default()
                 .name("fair")
-                .marker(symbols::Marker::Braille)
+                .marker(symbols::Marker::HalfBlock)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(theme::CHART_FAIR))
                 .data(&fair),
@@ -261,11 +261,68 @@ mod tests {
     use crate::state_reader::StateSnapshot;
     use ratatui::{backend::TestBackend, Terminal};
 
-    /// Smoke test: verify the chart actually emits braille line glyphs
-    /// (not scatter dots) at a realistic data scale. Prevents regression
-    /// to Marker::Dot on the strike line or main series.
+    /// Dump the full live-curves panel against the live daemon_state/ so
+    /// we can diff what the code actually emits against what the user
+    /// sees on the terminal. Ignored by default because it reads live
+    /// files; run with: cargo test dump_against_live -- --ignored --nocapture
     #[test]
-    fn btc_chart_renders_with_braille_line_glyphs() {
+    #[ignore = "reads live daemon_state/"]
+    fn dump_against_live() {
+        let path = crate::state_reader::resolve_state_dir().join("state.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("no state.json at {:?}", path);
+            return;
+        };
+        let snap: crate::state_reader::StateSnapshot =
+            serde_json::from_slice(&bytes).expect("parse state.json");
+        let mut app = AppState::new();
+        // Populate the deques with plausible history derived from the
+        // snapshot so we see continuous lines rather than a single point.
+        let now = crate::state::now_secs();
+        for i in 0..200usize {
+            let t = now - (200 - i) as f64 * 0.5;
+            if let Some(btc) = snap.btc_price {
+                app.btc_series
+                    .push_back((t, btc + (i as f64 * 0.03).sin() * 5.0));
+            }
+            if let Some(mkt) = snap.market_price_up {
+                app.mkt_series
+                    .push_back((t, (mkt + (i as f64 * 0.05).sin() * 0.02).clamp(0.0, 1.0)));
+            }
+            if let Some(blob) = &snap.refined {
+                if let Some(fair) = blob.fair_price {
+                    app.fair_series.push_back((
+                        t,
+                        (fair + (i as f64 * 0.04).cos() * 0.01).clamp(0.0, 1.0),
+                    ));
+                }
+            }
+        }
+        app.snapshot = Some(snap);
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_live_curves(frame, frame.area(), &app))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        eprintln!("=== LIVE CURVES RENDER (120x32) -- expected braille curves ===");
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            eprintln!("{row}");
+        }
+    }
+
+    /// Regression: chart must render continuous-line glyphs (half blocks
+    /// `▀` / `▄`), not scatter dots. HalfBlock is the visual-weight
+    /// marker choice over Braille -- fewer pixels per cell, but each cell
+    /// is a solid block so the line reads as a stroke rather than a row
+    /// of dot pairs.
+    #[test]
+    fn btc_chart_renders_with_continuous_line_glyphs() {
         let mut app = AppState::new();
         app.snapshot = Some(StateSnapshot {
             strike: Some(77_999.0),
@@ -288,23 +345,16 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        // Braille block chars we'd expect from continuous line segments.
-        // If the chart regresses to Marker::Dot, we see '⠂'/'⠄' etc.
-        // instead of the line-trace glyphs below.
-        let line_glyphs = ['⠉', '⠒', '⠤', '⣀'];
-        let line_hits: usize = line_glyphs
-            .iter()
-            .map(|g| text.matches(*g).count())
-            .sum();
+        // Expect half-block glyphs, densely populated along the sine.
+        let line_hits = text.matches('▀').count() + text.matches('▄').count();
         assert!(
             line_hits > 40,
-            "expected >40 braille line glyphs, got {line_hits}: render was\n{text}"
+            "expected >40 half-block glyphs, got {line_hits}; render was\n{text}"
         );
-        // Scatter-dot marker '⠂' should NOT dominate; allow a handful.
-        let dot_hits = text.matches('⠂').count();
+        // No stray braille scatter dots should survive.
         assert!(
-            dot_hits < 20,
-            "too many scatter dots ({dot_hits}); chart regressed to Marker::Dot?"
+            !text.contains('⠂'),
+            "found braille scatter dot '⠂'; chart may have regressed"
         );
     }
 

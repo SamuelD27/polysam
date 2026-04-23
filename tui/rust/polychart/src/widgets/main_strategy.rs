@@ -280,7 +280,7 @@ fn draw_pnl_chart(frame: &mut Frame, area: Rect, app: &AppState) {
     );
     let datasets = vec![Dataset::default()
         .name("pnl")
-        .marker(symbols::Marker::Braille)
+        .marker(symbols::Marker::HalfBlock)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(colour))
         .data(&visible)];
