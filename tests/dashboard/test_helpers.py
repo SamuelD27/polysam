@@ -57,16 +57,6 @@ def test_fmt_secs():
     assert d.fmt_secs(75) == "1:15"
 
 
-def test_strip_emoji_passes_box_drawing():
-    assert d._strip_emoji("|---|") == "|---|"
-    assert d._strip_emoji("│─┼") == "│─┼"
-
-
-def test_strip_emoji_strips_high_unicode():
-    out = d._strip_emoji("rocket \U0001f680 here")
-    assert "\U0001f680" not in out
-
-
 def test_read_json_missing_file(tmp_path):
     assert d.read_json(tmp_path / "nope.json") is None
 

@@ -145,17 +145,6 @@ def _compute_stats(stats: dict) -> dict:
     }
 
 
-def _strip_emoji(s: str) -> str:
-    """Drop any non-ASCII characters except common box/block drawing.
-
-    plotext occasionally injects unicode markers; this keeps our render ASCII-clean.
-    """
-    return "".join(
-        ch for ch in s
-        if ord(ch) < 128 or ch in "█░▁▂▃▄▅▆▇─│┌┐└┘├┤┬┴┼"
-    )
-
-
 def _side_text(side: str) -> Text:
     if side == "Up":
         return Text("Up  ", style="green")
