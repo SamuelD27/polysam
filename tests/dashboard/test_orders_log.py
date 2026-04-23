@@ -1,14 +1,41 @@
-"""Tests for OrdersLogWidget — fingerprint dedup + ordering."""
+"""Tests for OrdersLogWidget -- fingerprint dedup + ordering."""
+from collections import deque
 from unittest.mock import MagicMock
 
 import dashboard as d
 
 
-def _mk_log():
+def _mk_log(seen_cap: int | None = None):
     w = d.OrdersLogWidget.__new__(d.OrdersLogWidget)
-    w._seen = set()
+    cap = seen_cap if seen_cap is not None else d.OrdersLogWidget.SEEN_CAP
+    w._seen = deque(maxlen=cap)
+    w._seen_set = set()
     w.write = MagicMock()
     return w
+
+
+def test_orders_log_evicts_oldest_fingerprint_at_cap():
+    """Past SEEN_CAP entries, the oldest fingerprint is forgotten and a
+    repeated action becomes loggable again."""
+    w = _mk_log(seen_cap=2)
+    w.ingest([
+        {"ts": 1.0, "kind": "BUY", "strategy": "refined",
+         "side": "Up", "price": 0.10, "size_usdc": 1.0},
+    ])
+    w.ingest([
+        {"ts": 2.0, "kind": "BUY", "strategy": "refined",
+         "side": "Up", "price": 0.20, "size_usdc": 1.0},
+    ])
+    w.ingest([
+        {"ts": 3.0, "kind": "BUY", "strategy": "refined",
+         "side": "Up", "price": 0.30, "size_usdc": 1.0},
+    ])
+    # Cap is 2: ts=1 was evicted; re-ingesting ts=1 must write again.
+    w.ingest([
+        {"ts": 1.0, "kind": "BUY", "strategy": "refined",
+         "side": "Up", "price": 0.10, "size_usdc": 1.0},
+    ])
+    assert w.write.call_count == 4
 
 
 def test_orders_log_dedups_repeated_ingest():

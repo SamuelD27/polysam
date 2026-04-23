@@ -808,12 +808,15 @@ class OrdersLogWidget(RichLog):
 
     DEFAULT_CSS = ""  # rely on dashboard.tcss for colours
 
+    SEEN_CAP = ACTION_CAP * 10  # bound dedup memory at long-lived sessions
+
     def __init__(self, *args, **kwargs) -> None:
         kwargs.setdefault("max_lines", ACTION_CAP)
         kwargs.setdefault("wrap", False)
         kwargs.setdefault("markup", False)
         super().__init__(*args, **kwargs)
-        self._seen: set[int] = set()
+        self._seen: deque[int] = deque(maxlen=self.SEEN_CAP)
+        self._seen_set: set[int] = set()
 
     def ingest(self, actions) -> None:
         for a in actions:
@@ -823,9 +826,12 @@ class OrdersLogWidget(RichLog):
                 a.get("strategy"),
                 round((a.get("price") or 0.0), 4),
             ))
-            if fp in self._seen:
+            if fp in self._seen_set:
                 continue
-            self._seen.add(fp)
+            if len(self._seen) == self._seen.maxlen:
+                self._seen_set.discard(self._seen[0])
+            self._seen.append(fp)
+            self._seen_set.add(fp)
             self.write(_render_action_line(a))
 
 
