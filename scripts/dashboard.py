@@ -13,6 +13,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 # When run as `python3 scripts/dashboard.py`, sys.path[0] is scripts/, so the
@@ -42,6 +43,7 @@ RECENT_TRADES_CAP = 5
 ACTION_CAP = 50
 PRICE_HISTORY_CAP = 300       # ~5 min at 1 Hz state writes
 PNL_SERIES_CAP = 2000         # per-strategy decimation cap
+PNL_VISIBLE_WINDOW = 300      # PnL chart plots only the latest N points
 
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
@@ -88,6 +90,11 @@ def fmt_secs(s: float | None) -> str:
     if s is None:
         return "-"
     return f"{int(s // 60):d}:{int(s % 60):02d}"
+
+
+def _ts_to_hms(ts: list[float]) -> list[str]:
+    """Convert unix timestamps to HH:MM:SS strings for plotext date_form."""
+    return [datetime.fromtimestamp(t).strftime("%H:%M:%S") for t in ts]
 
 
 def _action_from_event(ev: dict) -> dict | None:
@@ -402,7 +409,7 @@ class HeaderWidget(Static):
         conn = state.get("connections") or {}
         t_zero = state.get("t_zero") or 0
         elapsed = time.time() - t_zero if t_zero else 0
-        bar_w = 30
+        bar_w = 40
         filled = int(bar_w * min(elapsed / MARKET_DURATION, 1.0)) if t_zero else 0
         bar = "█" * filled + "░" * (bar_w - filled)
         kill = KILL_FILE.exists()
@@ -494,20 +501,24 @@ class LiveCurvesWidget(Container):
         plt = plot.plt
         plt.clear_figure()
         plt.theme("pro")
+        plt.title("BTC USD")
+        plt.date_form("H:M:S")
         if self._btc:
-            xs = [t for t, _ in self._btc]
+            xs = _ts_to_hms([t for t, _ in self._btc])
             ys = [v for _, v in self._btc]
             plt.plot(xs, ys, color="cyan", marker="braille")
             lo, hi = min(ys), max(ys)
             if lo == hi:
-                plt.ylim(lo - 1.0, hi + 1.0)
+                lo, hi = lo - 1.0, hi + 1.0
             else:
                 # 10% of range with a $0.50 floor so flat windows stay readable
                 pad = (hi - lo) * 0.1 + 0.5
-                plt.ylim(lo - pad, hi + pad)
-        plt.title("BTC USD")
-        plt.xaxes(False, False)
-        plt.yaxes(True, False)
+                lo, hi = lo - pad, hi + pad
+            plt.ylim(lo, hi)
+            # 4 evenly-spaced ticks, integer dollars (sub-dollar spread
+            # collapses to repeated labels -- intentional, slope > level)
+            ticks = [lo + (hi - lo) * i / 3 for i in range(4)]
+            plt.yticks(ticks, [f"${v:,.0f}" for v in ticks])
         plot.refresh()
 
     def _render_mkt_chart(self) -> None:
@@ -515,26 +526,23 @@ class LiveCurvesWidget(Container):
         plt = plot.plt
         plt.clear_figure()
         plt.theme("pro")
+        plt.date_form("H:M:S")
         if self._mkt:
-            xs = [t for t, _ in self._mkt]
+            xs = _ts_to_hms([t for t, _ in self._mkt])
             ys = [v for _, v in self._mkt]
             plt.plot(xs, ys, color="white", marker="braille", label="mkt")
         if self._fair:
-            xs = [t for t, _ in self._fair]
+            xs = _ts_to_hms([t for t, _ in self._fair])
             ys = [v for _, v in self._fair]
-            # Colour the fair line by sign of (fair - mkt) at the latest point.
-            fair_colour = "white"
-            if self._mkt:
-                last_fair = ys[-1]
-                last_mkt = self._mkt[-1][1]
-                fair_colour = ("green" if last_fair > last_mkt
-                               else "red" if last_fair < last_mkt
-                               else "white")
-            plt.plot(xs, ys, color=fair_colour, marker="braille", label="fair")
+            plt.plot(xs, ys, color="yellow", marker="braille", label="fair")
+            plt.title("market (white) vs fair (yellow)")
+        else:
+            # Surface the missing series in the title -- plotext rejects
+            # empty-series legend entries, so we can't stub the legend.
+            plt.title("market (white) vs fair (yellow) -- fair: waiting")
         plt.ylim(0.0, 1.0)
-        plt.title("market / fair up")
-        plt.xaxes(False, False)
-        plt.yaxes(True, False)
+        plt.yticks([0.0, 0.25, 0.5, 0.75, 1.0],
+                   ["0.00", "0.25", "0.50", "0.75", "1.00"])
         plot.refresh()
 
 
@@ -634,18 +642,28 @@ class MainStrategyWidget(Container):
         plt = plot.plt
         plt.clear_figure()
         plt.theme("pro")
+        plt.date_form("H:M:S")
         if pnl_series:
-            xs = [ts for ts, _ in pnl_series]
-            ys = [v for _, v in pnl_series]
+            # Rolling visible window: last PNL_VISIBLE_WINDOW points.
+            # Persistent series stays as-is; visible window is what's plotted.
+            visible = list(pnl_series)[-PNL_VISIBLE_WINDOW:]
+            ts = [t for t, _ in visible]
+            ys = [v for _, v in visible]
+            session_total = pnl_series[-1][1]
             colour = "green" if ys[-1] > 0 else "red" if ys[-1] < 0 else "white"
-            plt.plot(xs, ys, color=colour, marker="braille")
+            plt.plot(_ts_to_hms(ts), ys, color=colour, marker="braille")
             lo, hi = min(ys), max(ys)
             if lo == hi:
                 plt.ylim(lo - 0.5, hi + 0.5)
             else:
-                plt.ylim(lo, hi)
-        plt.xaxes(False, False)
-        plt.yaxes(False, False)
+                pad = (hi - lo) * 0.1
+                plt.ylim(lo - pad, hi + pad)
+            plt.title(
+                f"refined PnL  session ${session_total:+.2f}  "
+                f"(viewing last {len(visible)})"
+            )
+        else:
+            plt.title("refined PnL  (no trades)")
         plot.refresh()
 
     def _render_position(self, pos, mkt) -> None:

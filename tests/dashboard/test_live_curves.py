@@ -69,24 +69,28 @@ def test_live_curves_clears_on_rollover():
     assert len(w._fair) == 1
 
 
-def test_fair_line_colour_when_fair_above_mkt():
+def test_fair_line_renders_yellow():
+    """Fair line is always yellow regardless of fair-vs-mkt sign."""
     w = _mk_widget()
     plot_mock = MagicMock()
     w.query_one = MagicMock(return_value=plot_mock)
     w._mkt.append((1.0, 0.50))
     w._fair.append((1.0, 0.70))
     w._render_mkt_chart()
-    # plt.plot called twice (mkt then fair); fair line should be green
     plot_calls = plot_mock.plt.plot.call_args_list
-    assert len(plot_calls) == 2
-    assert plot_calls[1].kwargs.get("color") == "green"
+    fair_call = next(c for c in plot_calls
+                     if c.kwargs.get("label") == "fair")
+    assert fair_call.kwargs.get("color") == "yellow"
 
 
-def test_fair_line_colour_when_fair_below_mkt():
+def test_fair_waiting_in_title_when_no_data():
+    """When _fair is empty, the chart title surfaces 'fair: waiting'
+    rather than silently dropping the series."""
     w = _mk_widget()
     plot_mock = MagicMock()
     w.query_one = MagicMock(return_value=plot_mock)
-    w._mkt.append((1.0, 0.70))
-    w._fair.append((1.0, 0.50))
+    w._mkt.append((1.0, 0.50))
+    # _fair deliberately empty
     w._render_mkt_chart()
-    assert w.query_one.return_value.plt.plot.call_args_list[1].kwargs.get("color") == "red"
+    title_calls = [str(c.args[0]) for c in plot_mock.plt.title.call_args_list]
+    assert any("fair: waiting" in t for t in title_calls), title_calls
