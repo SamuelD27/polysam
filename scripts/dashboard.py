@@ -158,7 +158,6 @@ class HeaderWidget(Static):
         conn = state.get("connections") or {}
         t_zero = state.get("t_zero") or 0
         elapsed = time.time() - t_zero if t_zero else 0
-        remaining = max(0.0, MARKET_DURATION - elapsed)
         bar_w = 30
         filled = int(bar_w * min(elapsed / MARKET_DURATION, 1.0)) if t_zero else 0
         bar = "█" * filled + "░" * (bar_w - filled)
@@ -166,14 +165,14 @@ class HeaderWidget(Static):
 
         line1 = Text()
         line1.append("BTC ", style="bold #22d3ee")
-        line1.append(f"${state.get('btc_price', 0):>10,.2f}  ", style="bold")
+        line1.append(f"${(state.get('btc_price') or 0):>10,.2f}  ", style="bold")
         line1.append(f"sigma {(state.get('sigma') or 0)*100:.2f}%  ", style="magenta")
         line1.append(f"strike ${state.get('strike') or 0:,.0f}", style="#94a3b8")
 
         line2 = Text()
         line2.append(state.get("slug") or "-", style="yellow")
         line2.append(f"  [{bar}]  ", style="#94a3b8")
-        line2.append(f"t+{int(elapsed)}s / 300s  ", style="#22d3ee")
+        line2.append(f"t+{int(elapsed)}s / {MARKET_DURATION}s  ", style="#22d3ee")
         line2.append("binance ", style="#94a3b8")
         line2.append("●", style="green" if conn.get("binance") else "red")
         line2.append("  rtds ", style="#94a3b8")
