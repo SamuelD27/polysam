@@ -20,6 +20,8 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import requests
+
 try:
     import websockets
 except ImportError:
@@ -61,7 +63,21 @@ EWMA_WARMUP = 10
 
 WS_BINANCE = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 WS_RTDS = "wss://ws-live-data.polymarket.com"
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 SLUG_PREFIX = "btc-updown-5m-"
+
+# RTDS robustness knobs. The library-level ping/pong catches dead peers
+# (Layer 1); the stale-frame watchdog catches server-side delivery stalls
+# that keep the TCP socket alive but deliver no frames (Layer 2).
+RTDS_PING_INTERVAL_S = 15.0
+RTDS_PING_TIMEOUT_S = 10.0
+RTDS_STALE_S = 60.0
+# Grace window around rollover: accept trades whose embedded t_zero is the
+# current cycle OR the cycle that just ended. This absorbs in-flight RTDS
+# events from the prior market without polluting the new cycle's price,
+# because we discard them once `state.market_price_up` is already set for
+# the new cycle (see rtds_feed).
+RTDS_ROLLOVER_GRACE_S = 5.0
 
 STATE_DIR = Path(__file__).parent / "daemon_state"
 STATE_FILE = STATE_DIR / "state.json"
@@ -270,16 +286,11 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
         else "<none>"
     )
 
-    # Paper path: POLYMARKET_MODE=paper, dry_run set, or live-mode client
-    # build failed. In all three cases return PaperExecutor and log why.
-    if dry_run:
-        reason = f"dry-run; POLYMARKET_MODE={mode} ignored"
-        logger.info(
-            "executor=paper (%s) portfolio=%s max_trade_size=$%.2f (%s)",
-            reason, portfolio_str, effective_max, source,
-        )
-        return PaperExecutor(), None, risk
-
+    # Paper path: POLYMARKET_MODE=paper, or live-mode client build failed.
+    # dry_run is now routed through LiveExecutor(dry_run=True) so the live
+    # order-construction code path runs and entry records get order_id +
+    # ack_ts stamped; LiveExecutor's _place_market_order short-circuits
+    # before any network call (see live_executor.py:316).
     if mode != "live":
         logger.info(
             "executor=paper (POLYMARKET_MODE=%s) portfolio=%s max_trade_size=$%.2f (%s)",
@@ -287,7 +298,8 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
         )
         return PaperExecutor(), None, risk
 
-    # mode == "live", not dry_run. If client build failed, fall back to paper.
+    # mode == "live". Fall back to paper only if the client never built —
+    # this is the real safety net, not a dry_run short-circuit.
     if client is None:
         logger.error(
             "LIVE MODE REQUESTED BUT FAILED TO INIT CLIENT: %s",
@@ -309,13 +321,14 @@ def build_executor() -> tuple[Executor, "TokenResolver | None", "RiskManager"]:
     reconciler = Reconciler(funder_address=funder) if funder else None
 
     logger.info(
-        "executor=live funder=%s portfolio=%s max_trade_size=$%.2f (%s) "
+        "executor=live%s funder=%s portfolio=%s max_trade_size=$%.2f (%s) "
         "daily_loss=$%.0f session_loss=$%.0f",
+        " (DRY_RUN: signed orders logged, not posted)" if dry_run else "",
         funder, portfolio_str, effective_max, source,
         risk_cfg.max_daily_loss_usdc, risk_cfg.max_session_loss_usdc,
     )
     return (
-        LiveExecutor(client, resolver, risk, reconciler=reconciler, dry_run=False),
+        LiveExecutor(client, resolver, risk, reconciler=reconciler, dry_run=dry_run),
         resolver,
         risk,
     )
@@ -422,6 +435,9 @@ class DaemonState:
         self.slug = None
         self.market_price_up = None
         self.market_price_ts = 0.0
+        # Wall-clock of the last frame received from RTDS (regardless of
+        # whether it matched our slug). Used by the stale-frame watchdog.
+        self.rtds_last_msg_ts = 0.0
 
         # Base strategy state
         self.base_fair_price = None
@@ -547,6 +563,7 @@ class DaemonState:
             "slug": self.slug,
             "market_price_up": self.market_price_up,
             "market_price_ts": self.market_price_ts,
+            "rtds_last_msg_ts": self.rtds_last_msg_ts,
             "connections": self.connections,
             "base": {
                 "fair_price": self.base_fair_price,
@@ -602,12 +619,107 @@ async def binance_feed(state: DaemonState, ewma: EWMA):
             return
 
 
+def _gamma_fetch_yes_price(slug: str, timeout: float = 3.0) -> float | None:
+    """Synchronous Gamma REST call for a slug's last YES-side price.
+
+    Returns a float in [0, 1] or None on any failure / missing data. Never
+    raises — callers fold None into "no warm-start available".
+    """
+    try:
+        resp = requests.get(
+            GAMMA_MARKETS_URL, params={"slug": slug}, timeout=timeout,
+        )
+        resp.raise_for_status()
+        markets = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.warning("gamma warm-start http failed for %s: %s", slug, e)
+        return None
+    if not markets:
+        return None
+    m = markets[0] if isinstance(markets, list) else markets
+    raw = m.get("outcomePrices", "[]")
+    try:
+        prices = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(prices, list) or not prices:
+        return None
+    try:
+        yes = float(prices[0])
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 <= yes <= 1.0:
+        return None
+    return yes
+
+
+async def warm_start_market_price(state: DaemonState, slug: str) -> None:
+    """Prime state.market_price_up via Gamma REST without blocking the loop.
+
+    Only overwrites if the WS hasn't already populated a price for the
+    current slug. Runs in a thread so the synchronous requests call
+    doesn't stall the event loop.
+    """
+    captured_t_zero = state.t_zero
+    yes = await asyncio.to_thread(_gamma_fetch_yes_price, slug)
+    # Guard against races: market may have rolled again while we were
+    # waiting on the HTTP call.
+    if state.t_zero != captured_t_zero:
+        return
+    if yes is None:
+        return
+    if state.market_price_up is not None:
+        return
+    state.market_price_up = yes
+    state.market_price_ts = time.time()
+    logger.info("RTDS warm-start slug=%s market_price_up=%.4f (gamma)", slug, yes)
+
+
+async def _rtds_stale_watchdog(state: DaemonState, ws) -> None:
+    """Force-close the RTDS socket if no frame has arrived in RTDS_STALE_S.
+
+    The library's ping_interval/ping_timeout handles peer-dead cases. This
+    watchdog handles the distinct "peer is up and acks pings, but their
+    trade-forwarding pipeline has stopped sending us frames" case that
+    sank us on 2026-04-22.
+    """
+    while True:
+        await asyncio.sleep(10.0)
+        last = state.rtds_last_msg_ts
+        if last <= 0.0:
+            continue
+        gap = time.time() - last
+        if gap > RTDS_STALE_S:
+            logger.warning(
+                "RTDS stale %.0fs (no frames, last=%s) — forcing reconnect",
+                gap, time.strftime("%H:%M:%S", time.localtime(last)),
+            )
+            try:
+                await ws.close(code=4000, reason="stale frames")
+            except Exception:  # pylint: disable=broad-except
+                pass
+            return
+
+
 async def rtds_feed(state: DaemonState):
-    """Connect to Polymarket RTDS and update market price."""
+    """Connect to Polymarket RTDS and update market price.
+
+    Robustness:
+      Layer 1 — library-level ping/pong catches dead peers.
+      Layer 2 — stale-frame watchdog catches server-side delivery stalls.
+      Layer 3 — a short t_zero grace window absorbs in-flight trades from
+                the just-ended cycle during the rollover transition.
+    """
     while True:
         try:
-            async with websockets.connect(WS_RTDS) as ws:
+            async with websockets.connect(
+                WS_RTDS,
+                ping_interval=RTDS_PING_INTERVAL_S,
+                ping_timeout=RTDS_PING_TIMEOUT_S,
+                close_timeout=5.0,
+            ) as ws:
                 state.connections["rtds"] = True
+                state.rtds_last_msg_ts = time.time()
                 logger.info("RTDS connected")
 
                 sub = json.dumps({
@@ -619,20 +731,19 @@ async def rtds_feed(state: DaemonState):
                 }, separators=(",", ":"))
                 await ws.send(sub)
 
-                async def ping():
-                    while True:
-                        await ws.send("ping")
-                        await asyncio.sleep(5)
-
-                ping_task = asyncio.create_task(ping())
+                watchdog_task = asyncio.create_task(_rtds_stale_watchdog(state, ws))
                 try:
                     async for raw in ws:
-                        if isinstance(raw, str):
-                            try:
-                                msg = json.loads(raw)
-                            except json.JSONDecodeError:
-                                continue
-                        else:
+                        # Record frame arrival BEFORE any filter: the
+                        # watchdog needs to know the socket is still
+                        # flowing, even if nothing matches our slug.
+                        state.rtds_last_msg_ts = time.time()
+
+                        if not isinstance(raw, str):
+                            continue
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
                             continue
 
                         payload = msg.get("payload")
@@ -643,19 +754,36 @@ async def rtds_feed(state: DaemonState):
                         if not slug.startswith(SLUG_PREFIX):
                             continue
 
-                        # Parse trade slug to check it matches current market
+                        # Accept current cycle OR the cycle that ended in
+                        # the last RTDS_ROLLOVER_GRACE_S so in-flight
+                        # trades from the prior market aren't dropped
+                        # silently during the transition.
                         try:
                             trade_slug_tz = int(slug.split("-")[-1])
-                            if trade_slug_tz != state.t_zero:
-                                continue
                         except (ValueError, TypeError):
                             continue
+                        if trade_slug_tz != state.t_zero:
+                            prev_tz = (
+                                state.t_zero - MARKET_DURATION
+                                if state.t_zero is not None
+                                else None
+                            )
+                            if (
+                                trade_slug_tz != prev_tz
+                                or state.t_zero is None
+                                or (time.time() - state.t_zero) > RTDS_ROLLOVER_GRACE_S
+                                or state.market_price_up is not None
+                            ):
+                                continue
 
                         outcome = payload.get("outcome", "")
                         price = payload.get("price")
                         if price is None:
                             continue
-                        price = float(price)
+                        try:
+                            price = float(price)
+                        except (TypeError, ValueError):
+                            continue
 
                         if outcome in ("Up", "Yes"):
                             state.market_price_up = price
@@ -666,10 +794,9 @@ async def rtds_feed(state: DaemonState):
 
                         state.market_price_ts = time.time()
                 finally:
-                    ping_task.cancel()
-                    # Best-effort: let it observe cancel. Don't await indefinitely.
+                    watchdog_task.cancel()
                     try:
-                        await asyncio.wait_for(ping_task, timeout=1.0)
+                        await asyncio.wait_for(watchdog_task, timeout=1.0)
                     except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                         pass
 
@@ -868,6 +995,11 @@ async def strategy_loop(
                     yes_token_id=market_ctx.yes_token_id if market_ctx else None,
                     no_token_id=market_ctx.no_token_id if market_ctx else None,
                 )
+                # Warm-start market_price_up from Gamma REST so quiet
+                # markets don't block on the first WS trade event. Runs
+                # in a thread and no-ops if the WS wins the race.
+                if state.slug:
+                    asyncio.create_task(warm_start_market_price(state, state.slug))
 
             # Ensure market_ctx is populated once market data is available.
             if market_ctx is None or market_ctx.slug != state.slug:
@@ -909,6 +1041,10 @@ async def strategy_loop(
                                 enh_action, market_ctx, now, source=src,
                             )
                             if result is not None:
+                                # Stamp ACK moment: "response observed" rather
+                                # than the pre-call `now`. Feeds reconcile.py
+                                # §6.3 predicate and latency empirical fit.
+                                result.ack_ts = time.time()
                                 state.enh_position = result.to_position_dict()
                                 if src == "edge":
                                     state.enh_extra["edge_trades"] += 1
@@ -1031,6 +1167,7 @@ async def strategy_loop(
                                 ref_action, market_ctx, now, source="edge",
                             )
                             if result is not None:
+                                result.ack_ts = time.time()
                                 state.refined_position = result.to_position_dict()
                                 state.refined_extra["edge_trades"] += 1
                                 state.refined_extra["last_source"] = "edge"
@@ -1163,6 +1300,7 @@ async def strategy_loop(
                                     base_action, market_ctx, now, source="base",
                                 )
                                 if result is not None:
+                                    result.ack_ts = time.time()
                                     state.base_position = result.to_position_dict()
                                     events.log(
                                         "entry_filled", strategy="base",
@@ -1263,6 +1401,10 @@ async def run():
         ),
         asyncio.create_task(state_persister(state)),
     ]
+    # Warm-start the current market's price once at boot so the first
+    # tick of strategy_loop doesn't wait for the first RTDS trade event.
+    if state.slug:
+        tasks.append(asyncio.create_task(warm_start_market_price(state, state.slug)))
 
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
