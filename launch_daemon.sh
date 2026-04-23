@@ -86,37 +86,49 @@ if [[ "$MODE" == "preflight" ]]; then
     exit $?
 fi
 
-# ── Dashboard picker: DASHBOARD=python|rust (python default) ─────────────
-# Python TUI is the stable default. The Rust TUI (polychart) is opt-in via
-# DASHBOARD=rust until it's verified end-to-end against a live daemon; on
-# opt-in we warn once so the choice stays deliberate. Missing polychart
-# binary falls back to python with a build hint.
+# ── Dashboard picker: DASHBOARD=legacy|textual|rust (legacy default) ─────
+# legacy  = pre-Textual rich.Layout dashboard at tui/python/dashboard_legacy.py
+#           (stable, default, what you had before the Textual rewrite)
+# textual = post-rewrite Textual dashboard at tui/python/dashboard.py
+# rust    = ratatui polychart binary (IN DEVELOPMENT, opt-in only)
 POLYCHART_BIN="$PROJECT_DIR/tui/target/release/polychart"
 pick_dashboard_cmd() {
-    local choice="${DASHBOARD:-python}"
+    local choice="${DASHBOARD:-legacy}"
     case "$choice" in
         rust)
-            echo "[launch] DASHBOARD=rust is IN DEVELOPMENT -- not verified against live daemon. Use DASHBOARD=python to revert." >&2
+            echo "[launch] DASHBOARD=rust is IN DEVELOPMENT -- not verified against live daemon. Use DASHBOARD=legacy to revert." >&2
             if [[ -x "$POLYCHART_BIN" ]]; then
                 echo "[launch] -> starting RUST TUI ($POLYCHART_BIN)" >&2
                 echo "$POLYCHART_BIN"
             else
                 echo "[launch] DASHBOARD=rust but $POLYCHART_BIN missing;" >&2
                 echo "[launch]   build it with:  cd tui && cargo build --release" >&2
-                echo "[launch]   falling back to python dashboard" >&2
-                echo "[launch] -> starting PYTHON TUI (tui/python/dashboard.py)" >&2
-                echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
+                echo "[launch]   falling back to legacy dashboard" >&2
+                echo "[launch] -> starting LEGACY PYTHON TUI (tui/python/dashboard_legacy.py)" >&2
+                echo "python3 $PROJECT_DIR/tui/python/dashboard_legacy.py"
             fi
             ;;
-        python)
-            echo "[launch] -> starting PYTHON TUI (tui/python/dashboard.py)" >&2
+        textual)
+            echo "[launch] -> starting TEXTUAL PYTHON TUI (tui/python/dashboard.py)" >&2
             echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
             ;;
+        legacy)
+            echo "[launch] -> starting LEGACY PYTHON TUI (tui/python/dashboard_legacy.py)" >&2
+            echo "python3 $PROJECT_DIR/tui/python/dashboard_legacy.py"
+            ;;
+        python)
+            # Back-compat alias: old DASHBOARD=python used to mean "the Python TUI"
+            # which at the time meant the Textual one. Now that legacy is the
+            # default, interpret bare `python` as legacy (the new Python default).
+            echo "[launch] DASHBOARD=python is deprecated; use legacy or textual. Treating as legacy." >&2
+            echo "[launch] -> starting LEGACY PYTHON TUI (tui/python/dashboard_legacy.py)" >&2
+            echo "python3 $PROJECT_DIR/tui/python/dashboard_legacy.py"
+            ;;
         *)
-            echo "[launch] DASHBOARD=$choice not recognised (use python|rust);" >&2
-            echo "[launch]   falling back to python" >&2
-            echo "[launch] -> starting PYTHON TUI (tui/python/dashboard.py)" >&2
-            echo "python3 $PROJECT_DIR/tui/python/dashboard.py"
+            echo "[launch] DASHBOARD=$choice not recognised (use legacy|textual|rust);" >&2
+            echo "[launch]   falling back to legacy" >&2
+            echo "[launch] -> starting LEGACY PYTHON TUI (tui/python/dashboard_legacy.py)" >&2
+            echo "python3 $PROJECT_DIR/tui/python/dashboard_legacy.py"
             ;;
     esac
 }

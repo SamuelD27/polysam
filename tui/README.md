@@ -14,12 +14,21 @@ Two implementations live side-by-side:
 
 ## Status
 
-- **`tui/python/dashboard.py`** — STABLE, default, invoked by
-  `launch_daemon.sh` with no env vars.
-- **`tui/rust/polychart`** — IN DEVELOPMENT. Feature-complete but not
-  verified end-to-end against a live daemon. Opt in with
-  `DASHBOARD=rust ./launch_daemon.sh`. Revert with `DASHBOARD=python`
-  or by unsetting the variable.
+Three TUI implementations live here. The launcher picks one via
+`DASHBOARD=...`; unset defaults to the legacy rich TUI.
+
+- **`tui/python/dashboard_legacy.py`** — STABLE, DEFAULT. The original
+  pre-Textual `rich.Layout` dashboard. Full-screen single layout,
+  refreshes at ~2 Hz, sparkline prices, per-strategy panels, unified
+  stream. Invoked when `DASHBOARD` is unset or `DASHBOARD=legacy`.
+
+- **`tui/python/dashboard.py`** — Textual rewrite. Same grid layout as
+  the Rust TUI; plotext line charts, reactive widgets, 64 tests
+  under `tui/tests/`. Opt in with `DASHBOARD=textual`.
+
+- **`tui/rust/polychart`** — IN DEVELOPMENT. Feature-complete ratatui
+  port; not verified end-to-end against a live daemon. Opt in with
+  `DASHBOARD=rust`. Revert with `DASHBOARD=legacy` or by unsetting.
 
 ---
 
