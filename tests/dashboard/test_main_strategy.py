@@ -15,7 +15,7 @@ def _mk_widget():
 
 def test_main_none_state_shows_waiting():
     w = _mk_widget()
-    w.render_state(None, [], [])
+    w.render_state(None, [])
     # _render_headline's Static.update gets called via query_one(...).update
     assert w.query_one.call_count >= 1
 
@@ -25,7 +25,7 @@ def test_main_empty_strategy_blob_does_not_crash():
     w = _mk_widget()
     w.render_state(
         {"slug": "x", "t_zero": 0, "market_price_up": None},
-        [], [],
+        [],
     )
     # Just verify no exception + some updates happened.
     assert w.query_one.call_count >= 1
@@ -55,9 +55,38 @@ def test_main_populated_refined_with_open_position():
             "extra": {"tp_count": 1, "sl_count": 0, "resolution_count": 0},
         },
     }
-    w.render_state(state, [], [(1.0, 0.65)])
+    w.render_state(state, [(1.0, 0.65)])
     # Confirm the PnL chart path was exercised (query_one called for #chart-pnl).
     chart_calls = [
         c for c in w.query_one.call_args_list if "chart-pnl" in str(c.args)
     ]
     assert chart_calls, "pnl chart render was not called"
+
+
+def test_pnl_chart_colour_flat_uses_white():
+    """Final value == 0 selects 'white' colour, not green/red."""
+    w = _mk_widget()
+    plot_mock = MagicMock()
+    w.query_one = MagicMock(return_value=plot_mock)
+    # Drive _render_pnl_chart directly with a flat series.
+    w._render_pnl_chart([(1.0, 0.0), (2.0, 0.0)])
+    # plt.plot(...) should have been called with color="white"
+    plot_calls = plot_mock.plt.plot.call_args_list
+    assert plot_calls, "plt.plot was not called"
+    assert plot_calls[0].kwargs.get("color") == "white"
+
+
+def test_pnl_chart_colour_positive_uses_green():
+    w = _mk_widget()
+    plot_mock = MagicMock()
+    w.query_one = MagicMock(return_value=plot_mock)
+    w._render_pnl_chart([(1.0, 0.0), (2.0, 1.5)])
+    assert plot_mock.plt.plot.call_args_list[0].kwargs.get("color") == "green"
+
+
+def test_pnl_chart_colour_negative_uses_red():
+    w = _mk_widget()
+    plot_mock = MagicMock()
+    w.query_one = MagicMock(return_value=plot_mock)
+    w._render_pnl_chart([(1.0, 0.0), (2.0, -1.5)])
+    assert plot_mock.plt.plot.call_args_list[0].kwargs.get("color") == "red"

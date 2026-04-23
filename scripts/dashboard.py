@@ -182,7 +182,7 @@ class EventsTailer:
                 self.refined_actions.append(action)
             self.unified_actions.append(action)
 
-        # Per-strategy cumulative PnL — only realized events count.
+        # Per-strategy cumulative PnL -- only realized events count.
         t = ev.get("type")
         if t in ("exit_filled", "resolve"):
             strat = ev.get("strategy") or ""
@@ -305,7 +305,6 @@ class MainStrategyWidget(Container):
     def render_state(
         self,
         state: dict | None,
-        actions,
         pnl_series: list[tuple[float, float]],
     ) -> None:
         if state is None:
@@ -482,7 +481,6 @@ class DashboardApp(App):
         self.query_one(HeaderWidget).render_state(state)
         self.query_one(MainStrategyWidget).render_state(
             state,
-            self.tailer.refined_actions,
             self.tailer.pnl_series.get("refined", []),
         )
 
