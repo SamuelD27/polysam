@@ -220,3 +220,8 @@ experiments/analysis/
 experiments/__pycache__/
 experiments/backtest/runs/*.parquet
 experiments/backtest/runs/*.csv
+
+# Rust TUI build output (workspace target dir lives at tui/target/)
+tui/target/
+tui/**/target/
+**/*.rlib

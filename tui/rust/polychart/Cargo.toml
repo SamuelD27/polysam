@@ -1,0 +1,17 @@
+[package]
+name = "polychart"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Rust TUI dashboard for polymarket-hustle daemon_base_v1"
+publish = false
+
+[[bin]]
+name = "polychart"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
