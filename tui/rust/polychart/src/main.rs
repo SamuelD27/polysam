@@ -1,17 +1,18 @@
-//! polychart — Rust ratatui TUI for polymarket-hustle.
+//! polychart -- Rust ratatui TUI for polymarket-hustle.
 //!
-//! The TUI renderer itself lands in later phases (app.rs + ui.rs).
-//! Until then, `--once` prints a single state.json line and exits, and the
-//! default mode prints one line per second so the build + state-reader
-//! wiring is observable without ratatui.
+//! `--once` prints a single state.json line and exits (dev utility).
+//! The default mode launches the ratatui event loop.
 
+mod app;
 mod events;
 mod state;
 mod state_reader;
+mod theme;
+mod ui;
+mod widgets;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{Local, TimeZone};
@@ -57,30 +58,22 @@ fn run_once(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_loop(path: PathBuf) -> Result<()> {
-    loop {
-        match read_state_json(&path) {
-            Ok(snap) => print_line(&snap),
-            Err(e) => eprintln!("read error: {e:#}"),
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-fn main() -> ExitCode {
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let state_dir = resolve_state_dir();
-    let state_path = state_dir.join("state.json");
 
-    let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["--once"] | [] if args.is_empty() && cfg!(test) => run_once(&state_path),
-        ["--once"] => run_once(&state_path),
-        [] => run_loop(state_path),
+    let result: Result<()> = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        [] => app::run().await,
+        ["--once"] => {
+            let state_path: PathBuf = resolve_state_dir().join("state.json");
+            run_once(&state_path)
+        }
         other => {
             eprintln!("polychart: unexpected args: {other:?}");
             return ExitCode::from(2);
         }
     };
+
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
