@@ -16,8 +16,6 @@ from textual.containers import Container
 from textual.widgets import Static, DataTable, RichLog
 
 import json
-import time
-from collections import deque
 
 REPO = Path(__file__).resolve().parent.parent
 STATE_DIR   = REPO / "daemon_state"
@@ -32,7 +30,7 @@ PRICE_HISTORY_CAP = 300       # ~5 min at 1 Hz state writes
 PNL_SERIES_CAP = 2000         # per-strategy decimation cap
 
 
-def read_json(path):
+def read_json(path: Path) -> dict | None:
     """Read a JSON file; return None on missing/invalid."""
     try:
         return json.loads(path.read_text())
@@ -40,7 +38,7 @@ def read_json(path):
         return None
 
 
-def tail_lines(path, n=8):
+def tail_lines(path: Path, n: int = 8) -> list[str]:
     """Return the last n lines of a file as a list of str (decoded)."""
     if not path.exists():
         return []
@@ -60,7 +58,7 @@ def tail_lines(path, n=8):
         return []
 
 
-def pnl_color(v):
+def pnl_color(v: float) -> str:
     """Return a rich style string for a signed pnl number."""
     if v > 0:
         return "bold green"
@@ -69,14 +67,14 @@ def pnl_color(v):
     return "white"
 
 
-def fmt_secs(s):
+def fmt_secs(s: float | None) -> str:
     """Format seconds as M:SS, '-' on None."""
     if s is None:
         return "-"
     return f"{int(s // 60):d}:{int(s % 60):02d}"
 
 
-def _action_from_event(ev):
+def _action_from_event(ev: dict) -> dict | None:
     """Convert a daemon event into a compact action dict for the orders log.
 
     Returns None for events that aren't trade actions.
@@ -118,7 +116,7 @@ def _action_from_event(ev):
     return None
 
 
-def _compute_stats(stats):
+def _compute_stats(stats: dict) -> dict:
     """Derive display-friendly numbers from a strategy stats blob."""
     total = stats.get("total_trades", 0) or 0
     wins = stats.get("wins", 0) or 0
@@ -137,7 +135,7 @@ def _compute_stats(stats):
     }
 
 
-def _strip_emoji(s):
+def _strip_emoji(s: str) -> str:
     """Drop any non-ASCII characters except common box/block drawing.
 
     plotext occasionally injects unicode markers; this keeps our render ASCII-clean.
@@ -199,7 +197,7 @@ class DashboardApp(App):
             yield OrderbookWidget(id="book")
             with Container(id="bottom-right"):
                 yield BaselinesWidget(id="baselines")
-                yield OrdersLogWidget(id="orders-log", max_lines=50)
+                yield OrdersLogWidget(id="orders-log", max_lines=ACTION_CAP)
 
 
 def main() -> int:
