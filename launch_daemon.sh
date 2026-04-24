@@ -23,6 +23,11 @@ STATE_DIR="$PROJECT_DIR/daemon_state"
 STATE_FILE="$STATE_DIR/state.json"
 LOG_FILE="$STATE_DIR/daemon.log"
 PID_FILE="$STATE_DIR/daemon.pid"
+BOOK_FEED_DIR="$STATE_DIR/book_feed"
+SCRAPES_ROOT="$STATE_DIR/scrapes"
+# Minimum free MB in daemon_state partition before we allow a launch.
+# 2 GB covers the spec's 50 MB/h/token estimate for a multi-hour capture.
+MIN_FREE_MB=2048
 
 MODE="${1:-paper}"
 DRYRUN="${2:-}"
@@ -189,6 +194,43 @@ fi
 
 echo "[launch] mode=$MODE dry_run=${POLYMARKET_DRY_RUN:-0}"
 
+# Scraper pre-flight gates — run BEFORE launching daemon so we abort cleanly
+# on a half-started session (no orphan daemon if disk/deps/stale-pid fails).
+# Function is defined later but bash hoists function-lookup to call time.
+preflight_scraper_gates_now() {
+    # Gate 1: no live scraper pid from a prior session.
+    if [[ -d "$SCRAPES_ROOT" ]]; then
+        local pf pid
+        while IFS= read -r pf; do
+            pid=$(cat "$pf" 2>/dev/null || true)
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                echo "[launch] ABORT: existing scraper pid=$pid still running ($pf)" >&2
+                echo "[launch]        kill it first, or remove the stale pidfile." >&2
+                exit 4
+            fi
+        done < <(find "$SCRAPES_ROOT" -name 'scraper.pid' -print 2>/dev/null || true)
+    fi
+    # Gate 2: disk space (2 GB minimum; spec estimates 50 MB/h/token).
+    local free_mb
+    free_mb=$(df -BM --output=avail "$STATE_DIR" | tail -1 | tr -dc '0-9')
+    if [[ -z "$free_mb" ]] || [[ "$free_mb" -lt "$MIN_FREE_MB" ]]; then
+        echo "[launch] ABORT: only ${free_mb:-0} MB free in $STATE_DIR; need >= $MIN_FREE_MB MB" >&2
+        exit 5
+    fi
+    echo "[launch] disk check: ${free_mb} MB free (>= ${MIN_FREE_MB} MB required)"
+    # Gate 3: scraper deps importable in the same python that will run it.
+    python3 -c "import websockets, requests, py_clob_client" 2>/dev/null \
+        || { echo "[launch] ABORT: scraper deps missing (websockets/requests/py_clob_client)" >&2; exit 6; }
+}
+mkdir -p "$SCRAPES_ROOT"
+preflight_scraper_gates_now
+
+# Session bootstrap — generated here (daemon_base_v1 has no session_id concept).
+SESSION_ID=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+LAUNCH_TS_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+LAUNCH_TS_NS=$(date -u +"%s%N")
+echo "[launch] session_id=$SESSION_ID"
+
 if [[ "$MODE" == "live" ]]; then
     ensure_ns
     verify_tunnel
@@ -252,6 +294,157 @@ stop_live_gui() {
 
 start_live_gui
 
+# ── L2 book scraper (auto-launched alongside daemon) ─────────────────────
+# Rationale: every live/dryrun session needs full L2 capture for R2.2
+# book-walked replay. See docs/backtest_implementation_progress.md §R2.2.
+# scrape_book.py hard-codes its output path (FEED_DIR = daemon_state/book_feed),
+# so the session dir gets a symlink pointing at the canonical location plus a
+# session_window_ns field in the manifest for reconcile.py to filter by time.
+SCRAPER_PID=""
+SCRAPE_SESSION_DIR=""
+DAEMON_EXIT_CODE=""
+SCRAPER_EXIT_CODE=""
+
+start_scraper() {
+    SCRAPE_SESSION_DIR="$SCRAPES_ROOT/$SESSION_ID"
+    mkdir -p "$SCRAPE_SESSION_DIR"
+    # Relative symlink keeps the session dir portable across repo moves.
+    if [[ ! -e "$SCRAPE_SESSION_DIR/book_feed" ]]; then
+        ln -s "../../book_feed" "$SCRAPE_SESSION_DIR/book_feed"
+    fi
+
+    local scraper_log="$SCRAPE_SESSION_DIR/scraper.log"
+    local scraper_pidfile="$SCRAPE_SESSION_DIR/scraper.pid"
+
+    if [[ "$MODE" == "live" ]]; then
+        # Same wrapper as the daemon. Public WS isn't auth-gated but we
+        # keep egress consistent and the Gamma token-discovery call stays
+        # inside the tunnel.
+        run_in_ns "$(which python3)" "$PROJECT_DIR/scripts/scrape_book.py" \
+            > "$scraper_log" 2>&1 &
+    else
+        python3 "$PROJECT_DIR/scripts/scrape_book.py" \
+            > "$scraper_log" 2>&1 &
+    fi
+    SCRAPER_PID=$!
+    echo "$SCRAPER_PID" > "$scraper_pidfile"
+    echo "[launch] scraper pid=$SCRAPER_PID  log=$scraper_log"
+
+    # Confirm scraper stays up briefly. Don't abort the daemon if it
+    # dies — capture is degraded, trading is not. Operator decides.
+    sleep 5
+    if ! kill -0 "$SCRAPER_PID" 2>/dev/null \
+       && ! pgrep -f "python.*scripts/scrape_book\.py" >/dev/null 2>&1; then
+        echo "[launch] ERROR scraper failed to stay up for 5s; capture degraded" >&2
+        echo "[launch]       check $scraper_log (daemon continues running)" >&2
+        SCRAPER_PID=""
+    fi
+}
+
+stop_scraper() {
+    # Lifecycle-independent from daemon: if daemon crashed mid-session,
+    # we still call this once to flush gzip tails.
+    if [[ -z "$SCRAPER_PID" ]] && [[ -n "$SCRAPE_SESSION_DIR" ]] \
+       && [[ -f "$SCRAPE_SESSION_DIR/scraper.pid" ]]; then
+        SCRAPER_PID=$(cat "$SCRAPE_SESSION_DIR/scraper.pid" 2>/dev/null || true)
+    fi
+    if [[ -z "$SCRAPER_PID" ]]; then
+        SCRAPER_EXIT_CODE="none"
+        return 0
+    fi
+    if kill -0 "$SCRAPER_PID" 2>/dev/null; then
+        echo "[launch] stopping scraper pid=$SCRAPER_PID"
+        kill "$SCRAPER_PID" 2>/dev/null || true
+        pkill -TERM -f "python.*scripts/scrape_book\.py" 2>/dev/null || true
+
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if ! kill -0 "$SCRAPER_PID" 2>/dev/null \
+               && ! pgrep -f "python.*scripts/scrape_book\.py" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+
+        if kill -0 "$SCRAPER_PID" 2>/dev/null \
+           || pgrep -f "python.*scripts/scrape_book\.py" >/dev/null 2>&1; then
+            echo "[launch] scraper did not exit in 10s; SIGKILL (gzip tail may be short)"
+            kill -9 "$SCRAPER_PID" 2>/dev/null || true
+            pkill -KILL -f "python.*scripts/scrape_book\.py" 2>/dev/null || true
+            SCRAPER_EXIT_CODE="sigkill"
+        else
+            SCRAPER_EXIT_CODE="sigterm"
+        fi
+
+        wait "$SCRAPER_PID" 2>/dev/null || true
+    else
+        SCRAPER_EXIT_CODE="already_dead"
+    fi
+    [[ -n "$SCRAPE_SESSION_DIR" ]] && rm -f "$SCRAPE_SESSION_DIR/scraper.pid"
+}
+
+write_manifest_launch() {
+    local git_sha git_branch
+    git_sha=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    git_branch=$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    local netns_val="null"
+    [[ "$MODE" == "live" ]] && netns_val="\"$NS\""
+    local manifest_mode="$MODE"
+    if [[ "$MODE" == "live" && "${POLYMARKET_DRY_RUN:-0}" == "1" ]]; then
+        manifest_mode="live_dryrun"
+    fi
+    local scraper_pid_val="${SCRAPER_PID:-null}"
+    [[ -z "$scraper_pid_val" ]] && scraper_pid_val="null"
+    local max_size_val="${MAX_TRADE_SIZE_USDC:-null}"
+    [[ "$max_size_val" == "null" ]] || max_size_val="\"$max_size_val\""
+    cat > "$SCRAPE_SESSION_DIR/manifest.json" <<EOF
+{
+  "session_id": "$SESSION_ID",
+  "launch_ts_utc": "$LAUNCH_TS_UTC",
+  "launch_ts_ns": $LAUNCH_TS_NS,
+  "stop_ts_utc": null,
+  "stop_ts_ns": null,
+  "daemon_exit_code": null,
+  "scraper_exit_code": null,
+  "mode": "$manifest_mode",
+  "max_trade_size_usdc": $max_size_val,
+  "daemon_pid": $DAEMON_PID,
+  "scraper_pid": $scraper_pid_val,
+  "tokens_scraped": "auto:gamma-5m-active-window",
+  "netns": $netns_val,
+  "scrape_output_dir": "$SCRAPE_SESSION_DIR",
+  "scrape_canonical_dir": "$BOOK_FEED_DIR",
+  "scrape_output_format": "per-slug gzipped JSONL: {YYYY-MM-DD}/{slug}.jsonl.gz",
+  "events_jsonl_path": "$STATE_DIR/events.jsonl",
+  "daemon_log_path": "$LOG_FILE",
+  "git_sha": "$git_sha",
+  "git_branch": "$git_branch"
+}
+EOF
+    echo "[launch] manifest: $SCRAPE_SESSION_DIR/manifest.json"
+}
+
+update_manifest_stop() {
+    [[ -z "$SCRAPE_SESSION_DIR" ]] && return 0
+    local m="$SCRAPE_SESSION_DIR/manifest.json"
+    [[ ! -f "$m" ]] && return 0
+    local stop_utc stop_ns
+    stop_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    stop_ns=$(date -u +"%s%N")
+    python3 - "$m" "$stop_utc" "$stop_ns" "${DAEMON_EXIT_CODE:-}" "${SCRAPER_EXIT_CODE:-}" <<'PY' || true
+import json, sys
+path, stop_utc, stop_ns, dec, sec = sys.argv[1:6]
+with open(path) as f: m = json.load(f)
+m["stop_ts_utc"] = stop_utc
+m["stop_ts_ns"]  = int(stop_ns)
+m["daemon_exit_code"]  = dec if dec else None
+m["scraper_exit_code"] = sec if sec else None
+with open(path, "w") as f: json.dump(m, f, indent=2)
+PY
+}
+
+start_scraper
+write_manifest_launch
+
 stop_daemon() {
     # Bounded escalation: SIGTERM the known PID + cmdline match,
     # wait up to 6s, then SIGKILL anything still alive. The outer
@@ -276,13 +469,39 @@ stop_daemon() {
             echo "[launch] daemon did not exit in 6s; SIGKILL"
             kill -9 "$DAEMON_PID" 2>/dev/null || true
             pkill -KILL -f "python.*daemon_base_v1\.py" 2>/dev/null || true
+            DAEMON_EXIT_CODE="sigkill"
+        else
+            DAEMON_EXIT_CODE="sigterm"
         fi
 
         wait "$DAEMON_PID" 2>/dev/null || true
+    else
+        DAEMON_EXIT_CODE="already_dead"
     fi
 }
 
-trap 'stop_live_gui; stop_daemon; exit 0' INT TERM
+CLEANUP_DONE=0
+cleanup_session() {
+    # Idempotent — second call returns immediately so the manifest's
+    # stop_ts and exit-code fields keep the values from the first call.
+    # stop_daemon/stop_scraper would otherwise overwrite their
+    # *_EXIT_CODE state variable to "already_dead" on a re-entry,
+    # corrupting what update_manifest_stop later writes.
+    if [[ "$CLEANUP_DONE" == "1" ]]; then
+        return 0
+    fi
+    CLEANUP_DONE=1
+    stop_live_gui
+    stop_daemon
+    stop_scraper
+    update_manifest_stop
+    echo "[launch] daemon stopped"
+}
+
+# EXIT covers normal script end and traps that fall through. HUP covers
+# terminal close. INT/TERM cover Ctrl-C and external `kill` of the
+# launcher pid. SIGKILL is untrappable; nothing can prevent that orphan.
+trap 'cleanup_session' EXIT HUP INT TERM
 
 # ── TUI dashboard in foreground (DASHBOARD=python|rust, python default) ──
 echo "[launch] starting TUI dashboard (Ctrl-C stops dashboard + daemon)"
@@ -290,7 +509,4 @@ sleep 2
 # shellcheck disable=SC2046
 $(pick_dashboard_cmd) || true
 
-# Dashboard exited (Ctrl-C). Stop live GUI + daemon too.
-stop_live_gui
-stop_daemon
-echo "[launch] daemon stopped"
+# Dashboard exited; EXIT trap runs cleanup_session.
