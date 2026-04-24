@@ -108,13 +108,68 @@ with tolerance for unknown fields.
 
 ### Known-issue: `daemon_exit_code` may be `"sigkill"` even on a clean paper session
 
-The launcher's stop_daemon wait window is 6 s; the daemon's
-`SHUTDOWN_TIMEOUT_S` is 5 s plus ≤2 s finally-block overhead. When
-tasks use the full asyncio.wait timeout, total daemon shutdown can
-land at 5-7 s — occasionally past the launcher's 6 s threshold, at
-which point SIGKILL fires and the manifest records `"sigkill"`.
-Inspect `daemon.log` for a `daemon_base_v1 stopped` line near
-`stop_ts_utc`: its presence means the daemon finished finally before
-SIGKILL landed (log line survives the kill), absent means the race
-was lost. Fix is either `SHUTDOWN_TIMEOUT_S` tightening in the daemon
-or a wider launcher wait — pending decision.
+**Resolved by commit `75d7e02 fix(launch): widen stop_daemon wait
+from 6s to 10s`** — the launcher now waits 10 s before SIGKILL,
+which covers daemon's `SHUTDOWN_TIMEOUT_S=5s` + ≤2 s finally
+overhead with 3 s slack. Smoke tests post-`75d7e02` should record
+`daemon_exit_code: "sigterm"`; a `"sigkill"` is now a regression
+flag, not an expected race.
+
+Original write-up retained for context: the launcher's
+stop_daemon wait window was 6 s; the daemon's `SHUTDOWN_TIMEOUT_S`
+is 5 s plus ≤2 s finally-block overhead. When tasks used the full
+asyncio.wait timeout, total daemon shutdown landed at 5–7 s,
+occasionally past the launcher's 6 s threshold, at which point
+SIGKILL fired and the manifest recorded `"sigkill"`. Inspect
+`daemon.log` for a `daemon_base_v1 stopped` line near `stop_ts_utc`:
+its presence means the daemon finished finally before SIGKILL
+landed (log line survives the kill); absent means the race was
+lost.
+
+## 5. Known followups (not yet implemented)
+
+These are deliberate gaps that `status` and `reconcile.py` callers
+should be aware of. Each can be implemented independently when its
+cost becomes worth the bash.
+
+### 5.1 Orphan manifest remediation
+
+`status` correctly reports `"stale session, cleanup needed"` when a
+manifest has `stop_ts_utc=null` but the recorded PIDs are dead — the
+classic crash-without-trap case (SIGKILL of the launcher, OOM, kernel
+panic). The detection is in place; the remediation is not. The same
+manifest will continue to report stale on every subsequent `status`
+invocation forever, because nothing ever rewrites the orphan to a
+finalised state.
+
+Suggested remediation surface (one of):
+
+- **Eager**: `preflight_scraper_gates_now` walks `scrapes/*/manifest.json`,
+  detects the orphan condition, and rewrites
+  `stop_ts_utc=<detection_time>` and `daemon_exit_code="orphaned"` /
+  `scraper_exit_code="orphaned"` before any new launch begins.
+- **Lazy**: `status` itself, on detecting the orphan, performs the
+  same rewrite. Surfaces the cleanup at point-of-use.
+- **Explicit**: a new `./launch_daemon.sh cleanup` subcommand that
+  walks orphans and prompts for confirmation per manifest.
+
+The launcher block at lines 152-186 already KILLs daemon stragglers
+on launch; this is the manifest-side equivalent it never got. Cost
+is ~15 lines of python in the rewrite step plus a `find … -name
+manifest.json` walk.
+
+### 5.2 Global `live_gui.pid` not cleaned at preflight
+
+The schema at §4 has no per-session `live_gui.pid` (only the global
+`$STATE_DIR/live_gui.pid` written by `start_live_gui`). The current
+preflight stale-pid sweep covers `scrapes/*/scraper.pid` and the
+legacy `book_feed/scrape_book.pid` but not the global live_gui pid.
+In practice this is masked because `start_live_gui` overwrites the
+file unconditionally, but the new `status` subcommand reads PIDs
+from the *manifest* (which doesn't include the live_gui pid), so
+the gap is currently invisible.
+
+If a future schema field promotes `live_gui_pid` into `manifest.json`
+(useful for `status` to surface dashboard liveness), the preflight
+sweep should grow a parallel branch for it. Until then, this is a
+known-but-dormant gap.

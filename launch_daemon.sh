@@ -42,6 +42,80 @@ conda activate "$CONDA_ENV"
 cd "$PROJECT_DIR"
 mkdir -p "$STATE_DIR"
 
+# ── Status: one-line summary of the active session ───────────────────────
+# Read-only. No deps beyond python3 stdlib. Runs before the websockets/
+# requests/dotenv check so `status` works even on a half-installed env.
+# "Active" = a manifest under $SCRAPES_ROOT whose stop_ts_utc is null.
+# If a recorded PID is dead, report stale rather than claim live.
+if [[ "$MODE" == "status" ]]; then
+    latest_manifest=""
+    if [[ -d "$SCRAPES_ROOT" ]]; then
+        while IFS= read -r m; do
+            if python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('stop_ts_utc') is None else 1)" "$m" 2>/dev/null; then
+                latest_manifest="$m"
+                break
+            fi
+        done < <(ls -1t "$SCRAPES_ROOT"/*/manifest.json 2>/dev/null)
+    fi
+
+    if [[ -z "$latest_manifest" ]]; then
+        echo "no active session"
+        echo '(`./launch_daemon.sh attach` opens the dashboard against a running daemon)'
+        exit 0
+    fi
+
+    python3 - "$latest_manifest" <<'PY'
+import json, os, sys, time
+m = json.load(open(sys.argv[1]))
+launch_utc = m.get("launch_ts_utc", "") or ""
+launch_s = (m.get("launch_ts_ns") or 0) / 1e9
+mode = m.get("mode", "?")
+daemon_pid = m.get("daemon_pid")
+scraper_pid = m.get("scraper_pid")
+
+def alive(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+# Stale if any recorded PID is dead. Recovery: launcher's preflight
+# stale-pid sweep removes the zombie pidfile on next start.
+if (daemon_pid is not None and not alive(daemon_pid)) \
+        or (scraper_pid is not None and not alive(scraper_pid)):
+    print("stale session, cleanup needed")
+    print("(`./launch_daemon.sh attach` opens the dashboard; "
+          "or run paper/live/dryrun to start fresh)")
+    sys.exit(0)
+
+events_path = m.get("events_jsonl_path", "") or ""
+n_entries = 0
+last_ts = None
+if events_path and os.path.exists(events_path):
+    with open(events_path) as f:
+        for line in f:
+            try:
+                ts = json.loads(line).get("ts", 0)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if ts >= launch_s:
+                n_entries += 1
+                last_ts = ts
+
+last_age = f"{int(time.time() - last_ts)}s" if last_ts else "n/a"
+hhmm = launch_utc[11:16] if len(launch_utc) >= 16 else launch_utc
+scraper_str = f"scraper={scraper_pid}" if scraper_pid else "scraper=none"
+
+print(f"live since {hhmm} UTC, mode={mode}, "
+      f"daemon={daemon_pid}, {scraper_str}, "
+      f"{n_entries} entries, last event {last_age} ago")
+PY
+    exit 0
+fi
+
 # ── Sanity: deps ─────────────────────────────────────────────────────────
 echo "[launch] python: $(which python3)"
 python3 -c "import websockets, requests, dotenv" \
@@ -139,8 +213,10 @@ pick_dashboard_cmd() {
     esac
 }
 
-# ── Status: attach dashboard to a daemon that's already running ──────────
-if [[ "$MODE" == "status" ]]; then
+# ── Attach: run dashboard against an already-running daemon ──────────────
+# (Was `status` before; renamed because the new `status` subcommand above
+# prints a one-line session summary instead of launching a TUI.)
+if [[ "$MODE" == "attach" ]]; then
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo "[launch] attaching to daemon pid=$(cat "$PID_FILE")"
     else
@@ -199,9 +275,12 @@ echo "[launch] mode=$MODE dry_run=${POLYMARKET_DRY_RUN:-0}"
 # on a half-started session (no orphan daemon if disk/deps/stale-pid fails).
 # Function is defined later but bash hoists function-lookup to call time.
 preflight_scraper_gates_now() {
-    # Gate 1: no live scraper pid from a prior session.
+    # Gate 1: scan known scraper PID files. Live → abort. Dead/empty/
+    # malformed → silently `rm -f` so the next launch starts clean.
+    # Daemon.pid cleanup is handled by the block at lines 152-186 of
+    # this script; do not duplicate here (regression risk).
+    local pf pid
     if [[ -d "$SCRAPES_ROOT" ]]; then
-        local pf pid
         while IFS= read -r pf; do
             pid=$(cat "$pf" 2>/dev/null || true)
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -209,7 +288,25 @@ preflight_scraper_gates_now() {
                 echo "[launch]        kill it first, or remove the stale pidfile." >&2
                 exit 4
             fi
+            if [[ -e "$pf" ]]; then
+                echo "[launch] preflight: removing stale $pf (pid=${pid:-empty})"
+                rm -f "$pf"
+            fi
         done < <(find "$SCRAPES_ROOT" -name 'scraper.pid' -print 2>/dev/null || true)
+    fi
+    # Same handling for the legacy global scrape_book.pid that older
+    # versions of scripts/scrape_book.py wrote at module scope. Current
+    # scrape_book.py no longer emits one; this branch is defensive-only
+    # and a no-op when the file is absent.
+    local legacy_pf="$BOOK_FEED_DIR/scrape_book.pid"
+    if [[ -f "$legacy_pf" ]]; then
+        pid=$(cat "$legacy_pf" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "[launch] ABORT: legacy scraper pid=$pid still running ($legacy_pf)" >&2
+            exit 4
+        fi
+        echo "[launch] preflight: removing stale $legacy_pf (pid=${pid:-empty})"
+        rm -f "$legacy_pf"
     fi
     # Gate 2: disk space (2 GB minimum; spec estimates 50 MB/h/token).
     local free_mb
