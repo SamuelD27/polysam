@@ -7,7 +7,8 @@
 #   ./launch_daemon.sh live         # live mode (requires tunnel + keys)
 #   ./launch_daemon.sh live dryrun  # live mode with DRY_RUN=1 (logs orders, no posts)
 #   ./launch_daemon.sh preflight    # run scripts/onboard_check.py inside tunnel, exit
-#   ./launch_daemon.sh status       # attach dashboard to an already-running daemon
+#   ./launch_daemon.sh status       # one-line summary of the active session (no deps required)
+#   ./launch_daemon.sh attach       # attach dashboard to an already-running daemon
 #
 # The Polymarket CLOB geo-blocks Singapore IPs. Live mode runs inside the
 # 'polybot' netns (WireGuard -> ProtonVPN Ireland) set up by
@@ -456,7 +457,7 @@ stop_daemon() {
         kill "$DAEMON_PID" 2>/dev/null || true
         pkill -TERM -f "python.*daemon_base_v1\.py" 2>/dev/null || true
 
-        for _ in 1 2 3 4 5 6; do
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
             if ! kill -0 "$DAEMON_PID" 2>/dev/null \
                && ! pgrep -f "python.*daemon_base_v1\.py" >/dev/null 2>&1; then
                 break
@@ -466,7 +467,7 @@ stop_daemon() {
 
         if kill -0 "$DAEMON_PID" 2>/dev/null \
            || pgrep -f "python.*daemon_base_v1\.py" >/dev/null 2>&1; then
-            echo "[launch] daemon did not exit in 6s; SIGKILL"
+            echo "[launch] daemon did not exit in 10s; SIGKILL"
             kill -9 "$DAEMON_PID" 2>/dev/null || true
             pkill -KILL -f "python.*daemon_base_v1\.py" 2>/dev/null || true
             DAEMON_EXIT_CODE="sigkill"
