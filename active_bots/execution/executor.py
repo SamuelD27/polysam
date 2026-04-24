@@ -12,8 +12,58 @@ leaves the position in place so a later tick can retry).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+# Canonical key set for the per-fill observability payload attached to
+# EntryResult / ExitResult as ``fill_details``. All three executors
+# (Live, Paper, DryRun) MUST populate the exact same set; values may be
+# None where the data source isn't available in that execution mode.
+#
+# The payload is passed through to events.jsonl (entry_filled /
+# exit_filled) as its own kwarg by daemon_base_v1.strategy_loop —
+# deliberately NOT folded into to_position_dict()/to_trade_dict() so
+# state.json stays lean.
+#
+# Fields are grouped:
+#   fill-outcome  — populated from the CLOB response (or strategy
+#                   action for paper / dryrun). Always known at ack.
+#   book-context  — null in this phase. The daemon currently has no
+#                   book WS subscription; reconcile.py will join
+#                   scraper snapshots to fills post-hoc using ack_ts.
+#                   Adding an in-daemon subscription is separate
+#                   architectural work (see live_executor.py module
+#                   docstring).
+FILL_DETAILS_KEYS: tuple[str, ...] = (
+    # fill-outcome (populated when the order returns)
+    "requested_size_shares",
+    "filled_size_shares",
+    "residual_size_shares",
+    "classification",            # "full" | "partial" | "unfilled"
+    "fill_vwap",
+    "fill_levels",               # null: CLOB response has no per-level breakdown
+    "levels_consumed",           # null: requires local book matching
+    # book-context (null in this phase — see module docstring)
+    "best_bid_at_decision",
+    "best_ask_at_decision",
+    "best_bid_at_ack",
+    "best_ask_at_ack",
+    "top_of_book_size_bid_at_ack",
+    "top_of_book_size_ask_at_ack",
+    "book_staleness_ms_at_decision",
+    "book_staleness_ms_at_ack",
+)
+
+
+def empty_fill_details() -> dict[str, Any]:
+    """Return a fresh fill_details dict with every canonical key set to None.
+
+    Callers populate the subset they can; everything else stays None to
+    satisfy the cross-executor parity invariant enforced by
+    tests/execution/test_live_executor.py::
+    test_all_executors_return_identical_fill_details_keys.
+    """
+    return {k: None for k in FILL_DETAILS_KEYS}
 
 
 @dataclass(frozen=True)
@@ -68,6 +118,11 @@ class EntryResult:
     # used by latency.fit_from_events_jsonl (ack_ts - entry_time) once live
     # fills land. None on paper-mode entries emitted pre-R2.1.
     ack_ts: float | None = None
+    # Observability payload attached to events.jsonl entry_filled rows.
+    # Schema is FILL_DETAILS_KEYS; every executor returns the same keys,
+    # null where data isn't available. Deliberately NOT included in
+    # to_position_dict() — state.json stays lean.
+    fill_details: dict[str, Any] = field(default_factory=empty_fill_details)
 
     def to_position_dict(self) -> dict[str, Any]:
         """Dict shape matching legacy state.enh_position / state.base_position."""
@@ -125,6 +180,9 @@ class ExitResult:
     time_zone: str | None = None
     spike_score: float | None = None
     hold_time_s: float | None = None
+    # Observability payload attached to events.jsonl exit_filled rows.
+    # Same schema + rationale as EntryResult.fill_details.
+    fill_details: dict[str, Any] = field(default_factory=empty_fill_details)
 
     def to_trade_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {

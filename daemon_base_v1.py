@@ -1070,6 +1070,7 @@ async def strategy_loop(
                                     "entry_filled",
                                     strategy="enhanced", source=src, position=result.to_position_dict(),
                                     order_id=result.order_id, token_id=result.token_id,
+                                    fill_details=result.fill_details,
                                 )
                                 logger.info(
                                     "ENH ENTRY %s %s @%.3f edge=%.3f $%.2f src=%s tz=%s",
@@ -1112,7 +1113,10 @@ async def strategy_loop(
                                 state.enh_extra["sl_count"] += 1
                             state.enh_extra["last_exit_type"] = result.exit_type
                             state.enh_position = None
-                            events.log("exit_filled", strategy="enhanced", trade=trade)
+                            events.log(
+                                "exit_filled", strategy="enhanced", trade=trade,
+                                fill_details=result.fill_details,
+                            )
                             logger.info(
                                 "ENH %s %s %s PnL=%+.2f hold=%.0fs",
                                 result.exit_type, result.side, result.slug,
@@ -1190,6 +1194,7 @@ async def strategy_loop(
                                     strategy="refined", source="edge",
                                     position=result.to_position_dict(),
                                     order_id=result.order_id, token_id=result.token_id,
+                                    fill_details=result.fill_details,
                                 )
                                 logger.info(
                                     "REFINED ENTRY %s %s @%.3f edge=%.3f $%.2f tz=%s",
@@ -1233,7 +1238,10 @@ async def strategy_loop(
                                 state.refined_extra["sl_count"] += 1
                             state.refined_extra["last_exit_type"] = result.exit_type
                             state.refined_position = None
-                            events.log("exit_filled", strategy="refined", trade=trade)
+                            events.log(
+                                "exit_filled", strategy="refined", trade=trade,
+                                fill_details=result.fill_details,
+                            )
                             logger.info(
                                 "REFINED %s %s %s PnL=%+.2f hold=%.0fs",
                                 result.exit_type, result.side, result.slug,
@@ -1318,6 +1326,7 @@ async def strategy_loop(
                                     events.log(
                                         "entry_filled", strategy="base",
                                         position=result.to_position_dict(),
+                                        fill_details=result.fill_details,
                                     )
                                     logger.info(
                                         "BASE ENTRY %s %s @%.3f fair=%.3f edge=%.3f $%.2f",
