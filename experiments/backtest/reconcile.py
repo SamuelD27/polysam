@@ -33,6 +33,11 @@ import time
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from active_bots.execution.latency import (
+    LatencyProfile,
+    _percentile_sorted as _pct,
+)
+
 
 # ---------------------------------------------------------------------------
 # Session manifest discovery (Task 1)
@@ -160,8 +165,6 @@ def iter_entry_fills(
 # Held-out latency fitting (Task 3)
 # ---------------------------------------------------------------------------
 
-from active_bots.execution.latency import LatencyProfile, fit_from_events_jsonl, NotFitted
-
 _HELD_OUT_MIN_SAMPLES = 30
 
 
@@ -207,17 +210,7 @@ def fit_held_out_latency(
         launch_ns = int(m.get("launch_ts_ns", 0))
         stop_ns = m.get("stop_ts_ns")
         end_ns = int(stop_ns) if stop_ns is not None else int(time.time() * 1e9)
-        try:
-            partial = fit_from_events_jsonl(
-                events_path, t_start_ns=launch_ns, t_end_ns=end_ns,
-            )
-        except NotFitted:
-            continue
-        # fit_from_events_jsonl returns a fitted LatencyProfile, not raw
-        # samples. Re-walk the file to count samples that fed into it
-        # so the manifest reports an honest n_samples for THIS session
-        # union. (fit_from_events_jsonl's NotFitted threshold is 10;
-        # ours is 30 — checked on the union below.)
+        n_this_session = 0
         with events_path.open("r") as f:
             for line in f:
                 try:
@@ -242,13 +235,11 @@ def fit_held_out_latency(
                 if gap < 0:
                     continue
                 all_gaps_ms.append(gap)
-        # Quiet partial usage of fit_from_events_jsonl return — the
-        # union-fit below supersedes it. We still called it to surface
-        # its NotFitted check on per-session minimums.
-        _ = partial
-        used_sessions.append(sid)
-        fit_window_start_ns = min(fit_window_start_ns, launch_ns)
-        fit_window_end_ns = max(fit_window_end_ns, end_ns)
+                n_this_session += 1
+        if n_this_session > 0:
+            used_sessions.append(sid)
+            fit_window_start_ns = min(fit_window_start_ns, launch_ns)
+            fit_window_end_ns = max(fit_window_end_ns, end_ns)
     n = len(all_gaps_ms)
     if n < _HELD_OUT_MIN_SAMPLES:
         return None, {
@@ -259,7 +250,6 @@ def fit_held_out_latency(
             "reason": "below_threshold",
         }
     all_gaps_ms.sort()
-    from active_bots.execution.latency import _percentile_sorted as _pct
     profile = LatencyProfile(
         p50_ms=float(_pct(all_gaps_ms, 0.50)),
         p95_ms=float(_pct(all_gaps_ms, 0.95)),
