@@ -29,9 +29,81 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Iterable
 
+
+# ---------------------------------------------------------------------------
+# Session manifest discovery (Task 1)
+# ---------------------------------------------------------------------------
+
+_LIVE_MODES: tuple[str, ...] = ("live", "live_dryrun")
+
+
+def discover_session(
+    session_id_or_latest: str,
+    *,
+    scrapes_root: Path,
+) -> dict:
+    """Resolve a session_id (or "latest") to its parsed manifest dict.
+
+    "latest" picks the most-recent manifest under ``scrapes_root`` whose
+    ``mode`` is in {"live", "live_dryrun"} (paper sessions are skipped
+    because they emit no predicate-shape rows). Returns the manifest dict
+    augmented with ``manifest_path``, ``launch_ts_ns``, ``stop_ts_ns``,
+    ``effective_stop_ns`` (= stop_ts_ns or now-ns if still running).
+    """
+    if not scrapes_root.exists():
+        raise FileNotFoundError(f"scrapes root not found: {scrapes_root}")
+    if session_id_or_latest == "latest":
+        candidates: list[tuple[int, Path, dict]] = []
+        for child in scrapes_root.iterdir():
+            mp = child / "manifest.json"
+            if not mp.is_file():
+                continue
+            try:
+                m = json.loads(mp.read_text())
+            except (OSError, ValueError):
+                continue
+            if m.get("mode") not in _LIVE_MODES:
+                continue
+            launch_ns = m.get("launch_ts_ns")
+            if launch_ns is None:
+                continue
+            candidates.append((int(launch_ns), mp, m))
+        if not candidates:
+            raise FileNotFoundError(
+                f"no manifest under {scrapes_root} has mode in {_LIVE_MODES}"
+            )
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        _, manifest_path, m = candidates[0]
+    else:
+        manifest_path = scrapes_root / session_id_or_latest / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"manifest not found: {manifest_path}")
+        m = json.loads(manifest_path.read_text())
+        if m.get("mode") not in _LIVE_MODES:
+            raise ValueError(
+                f"session {session_id_or_latest} has mode={m.get('mode')!r}; "
+                f"reconcile only operates on {_LIVE_MODES}"
+            )
+    launch_ns = int(m["launch_ts_ns"])
+    stop_ns = m.get("stop_ts_ns")
+    stop_ns_int = int(stop_ns) if stop_ns is not None else None
+    effective_stop_ns = stop_ns_int if stop_ns_int is not None else int(time.time() * 1e9)
+    return {
+        **m,
+        "manifest_path": str(manifest_path),
+        "launch_ts_ns": launch_ns,
+        "stop_ts_ns": stop_ns_int,
+        "effective_stop_ns": effective_stop_ns,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Existing stub code (Tasks 2+ reuse these helpers)
+# ---------------------------------------------------------------------------
 
 class NoLiveFillsCaptured(RuntimeError):
     """Raised when ``events.jsonl`` contains no rows that satisfy the

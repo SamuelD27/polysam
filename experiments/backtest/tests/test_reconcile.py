@@ -3,9 +3,79 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
+
+
+def _write_manifest(scrapes_root: Path, session_id: str, mode: str,
+                    launch_ns: int, stop_ns: int | None,
+                    events_path: str, feed_dir: str) -> Path:
+    d = scrapes_root / session_id
+    d.mkdir(parents=True, exist_ok=True)
+    m = d / "manifest.json"
+    m.write_text(json.dumps({
+        "session_id": session_id,
+        "launch_ts_ns": launch_ns,
+        "stop_ts_ns": stop_ns,
+        "stop_ts_utc": None if stop_ns is None else "2026-04-26T07:00:00Z",
+        "mode": mode,
+        "events_jsonl_path": events_path,
+        "scrape_canonical_dir": feed_dir,
+    }))
+    return m
+
+
+def test_discover_session_latest_picks_most_recent_live_or_dryrun(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import discover_session
+    scrapes_root = tmp_path / "scrapes"
+    _write_manifest(scrapes_root, "2026-04-24T07-10-19Z", "live_dryrun",
+                    1_777_014_619_000_000_000, 1_777_200_000_000_000_000,
+                    str(tmp_path / "events_old.jsonl"), str(tmp_path / "feed_old"))
+    _write_manifest(scrapes_root, "2026-04-26T07-00-00Z", "live_dryrun",
+                    1_777_180_800_000_000_000, None,
+                    str(tmp_path / "events_new.jsonl"), str(tmp_path / "feed_new"))
+    _write_manifest(scrapes_root, "2026-04-26T08-00-00Z", "paper",
+                    1_777_184_400_000_000_000, None,
+                    str(tmp_path / "events_paper.jsonl"), str(tmp_path / "feed_paper"))
+    sess = discover_session("latest", scrapes_root=scrapes_root)
+    assert sess["session_id"] == "2026-04-26T07-00-00Z"
+    assert sess["mode"] == "live_dryrun"
+
+
+def test_discover_session_explicit_id_loads_named_manifest(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import discover_session
+    scrapes_root = tmp_path / "scrapes"
+    _write_manifest(scrapes_root, "S1", "live_dryrun",
+                    1_777_000_000_000_000_000, 1_777_100_000_000_000_000,
+                    "/x/events.jsonl", "/x/feed")
+    sess = discover_session("S1", scrapes_root=scrapes_root)
+    assert sess["session_id"] == "S1"
+    assert sess["effective_stop_ns"] == 1_777_100_000_000_000_000
+
+
+def test_discover_session_explicit_paper_id_rejected(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import discover_session
+    scrapes_root = tmp_path / "scrapes"
+    _write_manifest(scrapes_root, "P1", "paper",
+                    1_777_000_000_000_000_000, 1_777_100_000_000_000_000,
+                    "/x/events.jsonl", "/x/feed")
+    with pytest.raises(ValueError, match="reconcile only operates on"):
+        discover_session("P1", scrapes_root=scrapes_root)
+
+
+def test_discover_session_running_session_uses_now_for_stop(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import discover_session
+    scrapes_root = tmp_path / "scrapes"
+    _write_manifest(scrapes_root, "S1", "live_dryrun",
+                    1_777_000_000_000_000_000, None,
+                    "/x/events.jsonl", "/x/feed")
+    before = int(time.time() * 1e9)
+    sess = discover_session("S1", scrapes_root=scrapes_root)
+    after = int(time.time() * 1e9)
+    assert sess["stop_ts_ns"] is None
+    assert before <= sess["effective_stop_ns"] <= after
 
 from experiments.backtest.reconcile import (
     NoLiveFillsCaptured,
