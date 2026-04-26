@@ -279,53 +279,78 @@ def _decimal(x: Any) -> Decimal:
     return x if isinstance(x, Decimal) else Decimal(str(x))
 
 
-def _build_book_from_snapshot_record(rec: dict) -> Optional[Book]:
-    """Rebuild a Book from a snapshot record written by scripts/scrape_book.py."""
-    try:
-        bids_raw = rec.get("bids", [])
-        asks_raw = rec.get("asks", [])
-        bids = tuple(
-            Level(_decimal(lvl["price"]), _decimal(lvl["size"]))
-            for lvl in bids_raw
+@dataclasses.dataclass
+class _RollingBookState:
+    """Per-token mutable book state for delta application.
+
+    Holds bids/asks as ``dict[Decimal price -> Decimal size]`` for O(1)
+    delta application. ``to_book()`` serialises into an immutable
+    ``Book`` with sorted Level tuples (bids descending, asks ascending)
+    for emission as a per-event anchor.
+
+    Reset semantics: ``apply_snapshot`` replaces both sides wholesale.
+    ``apply_delta`` mutates a single level in place; ``size == 0``
+    removes the level. ``apply_delta`` called before any snapshot is a
+    no-op (caller is expected to skip emission until baseline lands).
+    """
+
+    tick_size: Decimal
+    bids: dict = dataclasses.field(default_factory=dict)
+    asks: dict = dataclasses.field(default_factory=dict)
+
+    def apply_snapshot(
+        self,
+        bids_raw: list,
+        asks_raw: list,
+        tick_size: Optional[Decimal] = None,
+    ) -> None:
+        if tick_size is not None:
+            self.tick_size = tick_size
+        self.bids = {
+            _decimal(lvl["price"]): _decimal(lvl["size"])
+            for lvl in (bids_raw or [])
+            if _decimal(lvl["size"]) > 0
+        }
+        self.asks = {
+            _decimal(lvl["price"]): _decimal(lvl["size"])
+            for lvl in (asks_raw or [])
+            if _decimal(lvl["size"]) > 0
+        }
+
+    def apply_delta(self, delta: dict) -> None:
+        side = (delta.get("side") or "").upper()
+        if side == "BUY":
+            target = self.bids
+        elif side == "SELL":
+            target = self.asks
+        else:
+            return
+        try:
+            price = _decimal(delta["price"])
+            size = _decimal(delta["size"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if size <= 0:
+            target.pop(price, None)
+        else:
+            target[price] = size
+
+    def to_book(self, token_id: str, ts_ns: int) -> "Optional[Book]":
+        if not self.bids and not self.asks:
+            return None
+        bids_sorted = tuple(
+            Level(p, s) for p, s in sorted(self.bids.items(), key=lambda x: -x[0])
         )
-        asks = tuple(
-            Level(_decimal(lvl["price"]), _decimal(lvl["size"]))
-            for lvl in asks_raw
+        asks_sorted = tuple(
+            Level(p, s) for p, s in sorted(self.asks.items(), key=lambda x: x[0])
         )
         return Book(
-            token_id=rec["asset_id"],
-            side_bids=bids,
-            side_asks=asks,
-            tick_size=_decimal(rec.get("effective_tick") or rec.get("canonical_tick") or "0.01"),
-            ts_ns=int(rec.get("ts_ns", 0)),
+            token_id=token_id,
+            side_bids=bids_sorted,
+            side_asks=asks_sorted,
+            tick_size=self.tick_size,
+            ts_ns=ts_ns,
         )
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def _build_book_from_raw_book_event(rec: dict, canonical_tick: Decimal) -> Optional[Book]:
-    """Rebuild a Book from a raw ``book`` WS event wrapped in a feed record."""
-    raw = rec.get("raw", {})
-    try:
-        bids_raw = raw.get("bids", [])
-        asks_raw = raw.get("asks", [])
-        bids = tuple(
-            Level(_decimal(lvl["price"]), _decimal(lvl["size"]))
-            for lvl in sorted(bids_raw, key=lambda x: -float(x["price"]))
-        )
-        asks = tuple(
-            Level(_decimal(lvl["price"]), _decimal(lvl["size"]))
-            for lvl in sorted(asks_raw, key=lambda x: float(x["price"]))
-        )
-        return Book(
-            token_id=rec.get("asset_id", raw.get("asset_id", "")),
-            side_bids=bids,
-            side_asks=asks,
-            tick_size=canonical_tick,
-            ts_ns=int(rec.get("ts_ns", 0)),
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
 
 
 def load_snapshots_from_feed_dir(
@@ -340,19 +365,23 @@ def load_snapshots_from_feed_dir(
     """Walk daemon_state/book_feed/{date}/{slug}.jsonl.gz and materialize
     Book anchors for the given tokens in [t0_ns - pad, t1_ns + pad].
 
-    Anchor sources: every ``snapshot`` and ``book`` record found in the feed,
-    plus the running ``canonical_tick`` from the most recent record for that
-    token (updated on ``tick_size_change`` events).
+    Anchor sources: every ``snapshot``, ``book``, and ``price_change`` record
+    found in the feed, plus the running ``canonical_tick`` from the most recent
+    record for that token (updated on ``tick_size_change`` events).
+
+    A per-token ``_RollingBookState`` is maintained in memory. ``snapshot`` and
+    ``book`` events replace both sides wholesale; ``price_change`` deltas mutate
+    individual price levels in place (size=0 removes a level). Each of these
+    three event types emits one ``Book`` anchor into the store, lifting anchor
+    density from ~0.2 Hz (snapshot-only) to ~50+ Hz on active markets.
+
+    Hash re-verification is skipped — the scraper already verified
+    ``remote_hashes`` against ``local_hash_after`` at capture time. If state
+    drifts, the next ``snapshot`` re-anchors cleanly.
 
     Returns (store, canonical_tick_by_token). Tick values come from the feed's
-    own ``canonical_tick`` / ``effective_tick`` fields (populated by the
-    scraper from REST get_tick_size); ``tick_size_default`` is the fallback
-    only when the feed does not carry a tick for the token.
-
-    Deltas are intentionally NOT applied here. Anchor density from the WS
-    ``book`` event stream during an active market is typically >1 Hz, which
-    already satisfies the 500 ms spec §1.3 threshold. If finer cadence is
-    needed for adverse-selection work, a delta-application pass is a follow-up.
+    own ``canonical_tick`` / ``effective_tick`` fields; ``tick_size_default`` is
+    the fallback only when the feed does not carry a tick for the token.
     """
     lo_ns = t0_ns - pad_s * 1_000_000_000
     hi_ns = t1_ns + pad_s * 1_000_000_000
@@ -361,6 +390,11 @@ def load_snapshots_from_feed_dir(
 
     store = DictBookStore()
     canonical_tick_by_token: dict[str, Decimal] = {}
+    # Per-token rolling book state for delta application. Resets on
+    # snapshot/book; mutated in place by price_change deltas; skipped
+    # silently if a price_change arrives before the first snapshot
+    # (next snapshot re-anchors).
+    states: dict[str, _RollingBookState] = {}
     extreme_seen = False
 
     if not feed_dir.exists():
@@ -403,15 +437,46 @@ def load_snapshots_from_feed_dir(
                         if t == "tick_size_change":
                             new_tick = rec.get("new_tick_size")
                             if new_tick:
-                                canonical_tick_by_token[aid] = _decimal(new_tick)
+                                try:
+                                    nt = _decimal(new_tick)
+                                except (TypeError, ValueError):
+                                    nt = None
+                                if nt is not None:
+                                    canonical_tick_by_token[aid] = nt
+                                    if aid in states:
+                                        states[aid].tick_size = nt
                             continue
+
+                        tick = canonical_tick_by_token.get(aid, tick_size_default)
+
                         if t == "snapshot":
-                            book = _build_book_from_snapshot_record(rec)
+                            state = states.setdefault(aid, _RollingBookState(tick))
+                            state.apply_snapshot(
+                                rec.get("bids", []),
+                                rec.get("asks", []),
+                                tick_size=tick,
+                            )
+                            book = state.to_book(aid, ts)
                         elif t == "book":
-                            tick = canonical_tick_by_token.get(aid, tick_size_default)
-                            book = _build_book_from_raw_book_event(rec, tick)
+                            raw = rec.get("raw", {}) or {}
+                            state = states.setdefault(aid, _RollingBookState(tick))
+                            state.apply_snapshot(
+                                raw.get("bids", []),
+                                raw.get("asks", []),
+                                tick_size=tick,
+                            )
+                            book = state.to_book(aid, ts)
+                        elif t == "price_change":
+                            state = states.get(aid)
+                            if state is None:
+                                # No baseline yet; next snapshot will re-anchor.
+                                continue
+                            for delta in rec.get("deltas", []) or []:
+                                state.apply_delta(delta)
+                            book = state.to_book(aid, ts)
                         else:
                             continue
+
                         if book is None:
                             continue
                         if book.side_bids and book.side_bids[0].price < Decimal("0.02"):
