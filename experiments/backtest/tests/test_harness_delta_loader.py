@@ -82,6 +82,21 @@ def test_rolling_book_delta_before_snapshot_no_op() -> None:
     assert book is not None or book is None  # tolerant; primary check is no exception
 
 
+def test_rolling_book_empty_snapshot_emits_anchor() -> None:
+    """Empty bids/asks snapshot must still emit a Book — anchors with
+    empty sides are valid 'book is known empty at this ts' signals.
+    Regression guard for the bad1534 fix."""
+    from experiments.backtest.harness import _RollingBookState
+
+    s = _RollingBookState(tick_size=Decimal("0.01"))
+    s.apply_snapshot([], [])
+    book = s.to_book("tok", ts_ns=1234)
+    assert book is not None
+    assert book.ts_ns == 1234
+    assert book.side_bids == ()
+    assert book.side_asks == ()
+
+
 def test_load_snapshots_from_feed_dir_applies_deltas(tmp_path: Path) -> None:
     """Integration: ingest a synthetic gzipped feed file containing one
     snapshot and two price_change records, confirm 3 Book anchors land

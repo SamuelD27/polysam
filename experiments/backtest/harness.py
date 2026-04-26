@@ -290,8 +290,12 @@ class _RollingBookState:
 
     Reset semantics: ``apply_snapshot`` replaces both sides wholesale.
     ``apply_delta`` mutates a single level in place; ``size == 0``
-    removes the level. ``apply_delta`` called before any snapshot is a
-    no-op (caller is expected to skip emission until baseline lands).
+    removes the level. ``apply_delta`` is permissive — calling it
+    before any snapshot inserts a level into an otherwise-empty state.
+    The caller (load_snapshots_from_feed_dir) enforces "skip price_change
+    until baseline lands" via a state.get(aid) guard, not apply_delta
+    itself. ``to_book`` always emits a Book — empty bids/asks indicate
+    "book is known to be empty at this ts" rather than "no anchor".
     """
 
     tick_size: Decimal
@@ -336,8 +340,6 @@ class _RollingBookState:
             target[price] = size
 
     def to_book(self, token_id: str, ts_ns: int) -> "Optional[Book]":
-        if not self.bids and not self.asks:
-            return None
         bids_sorted = tuple(
             Level(p, s) for p, s in sorted(self.bids.items(), key=lambda x: -x[0])
         )
