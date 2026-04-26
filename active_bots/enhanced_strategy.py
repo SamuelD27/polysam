@@ -93,7 +93,7 @@ class TimeBasedStrategy:
         Returns:
             None or dict with keys:
             - {"action": "ENTER", "side", "entry_price", "edge",
-               "size_usdc", "size_shares", "time_zone"}
+               "size_usdc", "size_shares", "time_zone", "fair", "market"}
             - {"action": "RESOLVE", ...}
         """
         now = time.time()
@@ -147,6 +147,18 @@ class TimeBasedStrategy:
                             "size_usdc": size_usdc,
                             "size_shares": size_shares,
                             "time_zone": label,
+                            # Decision-time price refs for R2.2 reconcile.
+                            # PaperExecutor reads these as fair_at_entry /
+                            # market_at_entry on EntryResult, then
+                            # to_position_dict surfaces them into
+                            # events.jsonl. Reconcile.py prefers these
+                            # over its entry_price fallback because
+                            # entry_price is side-adjusted (= the quoted
+                            # taker price) while market is the raw mid
+                            # used to compute decision_mid for the
+                            # ReplayExecutor walk.
+                            "fair": fair,
+                            "market": market_price_up,
                         }
                     break  # only try the first matching zone
 

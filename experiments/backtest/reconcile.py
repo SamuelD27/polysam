@@ -14,6 +14,28 @@
 # Exit decisions fire on state.market_price_up (last-trade) which
 # can lag the real book; the gap between strategy decision and
 # CLOB post is meaningfully larger on exits than on entries.
+#
+# REAL-MODE CAVEAT — decision_mid sourcing:
+# When mode_tag == "live", using ``entry_price`` as the
+# decision_mid fallback is INCORRECT. real CLOB fill prices
+# diverge from the strategy's quoted price, so a fallback gate
+# would conflate replay-modelling-error with strategy-quote-vs-
+# fill-gap and produce a false-confident green. The honest
+# decision_mid for live captures must come from either:
+#   (1) the explicit ``market_at_entry`` / ``fair_at_entry`` fields
+#       (stamped in EnhancedStrategy.on_tick's ENTER action dict
+#       since the same commit that added this caveat — present on
+#       every NEW capture going forward), OR
+#   (2) reconstruction from the book_feed snapshot at t_signal_ns
+#       (out of scope for entries-only; consider if the SELL session
+#       finds case (1) insufficient for some live trades).
+# As a structural guard, ``reconcile()`` adds a third refusal
+# header — INSUFFICIENT-DECISION-CONTEXT — whenever any record
+# in a live-mode run sourced decision_mid from the entry_price
+# fallback. The 50h dryrun capture predates the strategy
+# stamping above and uses the fallback for all rows; that's
+# fine because mode_tag=="live_dryrun" already triggers the
+# PLUMBING-VALIDATION ONLY refusal.
 
 """Golden-trace validation against real live fills (spec §6.3).
 
@@ -289,6 +311,15 @@ def fit_held_out_latency(
             "reason": "below_threshold",
         }
     all_gaps_ms.sort()
+    # Linear-interpolation _pct is deliberate here and MUST NOT be
+    # harmonised with evaluate_gate's ceil-rank p95. Held-out
+    # calibration is a smoothing operation: we want the empirical
+    # latency profile to reflect a continuous distribution estimate
+    # so ReplayExecutor's lognormal sampler (which itself smooths)
+    # has a coherent target. evaluate_gate's p95 is a hard
+    # acceptance threshold — interpolation would dilute tail extremes
+    # and let a noisy 5% slip past gate=10 bps. Different semantics,
+    # different methods; do not unify them.
     profile = LatencyProfile(
         p50_ms=float(_pct(all_gaps_ms, 0.50)),
         p95_ms=float(_pct(all_gaps_ms, 0.95)),
@@ -664,11 +695,17 @@ def reconcile(
     for e in entries:
         pos = e.get("position") or {}
         slug = pos.get("slug")
-        if slug not in markets:
-            continue
-        cid = markets[slug]["condition_id"]
-        ms = _side_to_market_side(pos.get("side", ""))
-        tok = token_by_condition_side.get((cid, ms))
+        tok = None
+        if slug in markets:
+            cid = markets[slug]["condition_id"]
+            ms = _side_to_market_side(pos.get("side", ""))
+            tok = token_by_condition_side.get((cid, ms))
+        # Fallback: position dict carries token_id directly when the
+        # event came from LiveExecutor / DryRunExecutor (R2.1+). Use
+        # this when the markets DB cache is stale relative to the
+        # captured-session window.
+        if not tok:
+            tok = pos.get("token_id")
         if tok:
             wanted_tokens.add(tok)
     store, _ = load_snapshots_from_feed_dir(
@@ -687,6 +724,11 @@ def reconcile(
     rows_by_partition: dict = {
         "pre_2026-02-01": 0, "post_2026-02-01": 0,
     }
+    # Per-record tracking: did decision_mid come from the entry_price
+    # fallback (legacy capture, no market_at_entry / fair_at_entry)?
+    # Aggregated session-wide for the third refusal header — see the
+    # REAL-MODE CAVEAT block at the top of this file.
+    n_decision_mid_from_fallback = 0
     for pass_name, profile in profiles_to_run:
         executor = ReplayExecutor(
             books=store, latency_profile=profile,
@@ -694,13 +736,25 @@ def reconcile(
             staleness_soft_ms=200, rng=random.Random(0),
         )
         for entry in entries:
-            pos = entry["position"]
-            slug = pos.get("slug")
-            if slug not in markets:
-                continue
-            cid = markets[slug]["condition_id"]
-            ms = _side_to_market_side(pos.get("side", ""))
-            token_id = token_by_condition_side.get((cid, ms))
+            pos = entry.get("position") or {}
+            slug = pos.get("slug") or ""
+            cid = ""
+            token_id = None
+            # Try markets-DB join first.
+            if slug in markets:
+                cid = markets[slug]["condition_id"]
+                ms = _side_to_market_side(pos.get("side", ""))
+                token_id = token_by_condition_side.get((cid, ms))
+            # Fallback: events from LiveExecutor / DryRunExecutor
+            # (R2.1+) stamp token_id on the position dict directly.
+            # Use this when the markets DB cache lags the captured-
+            # session window. Without this fallback, a 10-h stale DB
+            # silently drops 100% of refined entries (validation run
+            # 2026-04-26 documented this).
+            if not token_id:
+                token_id = pos.get("token_id")
+                if token_id and not cid:
+                    cid = slug  # stable identifier when no markets row
             if not token_id:
                 continue
             t_zero = pos.get("t_zero")
@@ -709,9 +763,22 @@ def reconcile(
                 (t_zero_ns + 300 * 1_000_000_000)
                 if t_zero_ns is not None else None
             )
+            # Decision-mid resolution. Preferred: explicit fields stamped
+            # by EnhancedStrategy.on_tick (post-Option-B commit). Fallback:
+            # entry_price (= the strategy's quoted taker price = market_up
+            # adjusted for side). Fallback is the dryrun-baseline path —
+            # honest in dryrun mode where live_fill_px also equals
+            # entry_price, NOT honest in real-LIVE_MODE; the third
+            # refusal header trips when the fallback is used in live mode.
             decision_mid_raw = pos.get("market_at_entry") or pos.get("fair_at_entry")
+            decision_mid_from_fallback = False
+            if not decision_mid_raw:
+                decision_mid_raw = pos.get("entry_price")
+                decision_mid_from_fallback = True
             if not decision_mid_raw or float(decision_mid_raw) <= 0:
                 continue
+            if decision_mid_from_fallback:
+                n_decision_mid_from_fallback += 1
             shares = Decimal(str(pos.get("size_shares", 0)))
             if shares <= 0:
                 continue
@@ -743,9 +810,26 @@ def reconcile(
     }
     refusals = refusal_headers(
         staleness_policy="strict",
-        mode_tag="live" if session_mode == "live" else "live_dryrun",
+        mode_tag=session_mode,  # discover_session validated session_mode ∈ _LIVE_MODES
         scope="entries_only",
     )
+    # Third refusal: when the run was real-LIVE_MODE AND any record
+    # sourced decision_mid from the entry_price fallback (i.e., the
+    # capture predates the EnhancedStrategy fair/market stamping),
+    # block the gate from being interpreted as statistically meaningful.
+    # Without this guard a future operator could read a green gate on
+    # legacy real-mode capture and wrongly conclude the replay matches
+    # live, when in fact decision_mid was the strategy's quoted price
+    # rather than the model's view of the book mid. See REAL-MODE
+    # CAVEAT at the top of this file.
+    if session_mode == "live" and n_decision_mid_from_fallback > 0:
+        refusals.append(
+            "INSUFFICIENT-DECISION-CONTEXT — capture predates strategy "
+            "instrumentation; decision_mid sourced from quoted price, "
+            f"not book state ({n_decision_mid_from_fallback} of "
+            f"{len(records)} records). Re-capture with current strategy "
+            "code or reconstruct from book_feed before evaluating gate."
+        )
     write_parquet(records, out)
     write_manifest(
         out,
