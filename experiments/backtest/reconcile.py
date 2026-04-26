@@ -1,3 +1,20 @@
+# TODO(R2.2-followup): SELL-side extension — entries-only does not
+# validate the R2.2 hypothesis. The slippage analysis on N=39 (see
+# docs/SESSION_2026-04-22_STRATEGY_TUNING.md) found exit-side
+# book-walk asymmetry of 2.36× (TP 4.15c vs SL 9.80c, concentrated
+# in adaptive_sl with entry_px >= 0.55). The hypothesis under test
+# is exit-side, not entry-side; entry-side measurement here is
+# plumbing validation only. SELL extension MUST land before any
+# real LIVE_MODE capture session — see docs/reconcile_design.md
+# "Purpose" section and docs/book_walked_replay_backtester_spec.md
+# §6.3.
+#
+# Followup also reconsiders whether book_staleness_ms needs to
+# split into book_staleness_at_decision and book_staleness_at_fill.
+# Exit decisions fire on state.market_price_up (last-trade) which
+# can lag the real book; the gap between strategy decision and
+# CLOB post is meaningfully larger on exits than on entries.
+
 """Golden-trace validation against real live fills (spec §6.3).
 
 This module is a **stub** until the first live-mode daemon session captures
@@ -30,16 +47,32 @@ import argparse
 import dataclasses
 import json
 import math
+import random
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from active_bots.execution.fees import CATEGORIES
 from active_bots.execution.latency import (
     LatencyProfile,
+    SG_WG_PRIOR,
     _percentile_sorted as _pct,
 )
-from active_bots.execution.replay_executor import ExecutionRecord
+from active_bots.execution.replay_executor import (
+    DictBookStore,
+    ExecutionRecord,
+    OrderRequest,
+    ReplayExecutor,
+)
+from experiments.backtest.harness import (
+    load_markets,
+    load_snapshots_from_feed_dir,
+    _side_to_market_side,
+    _side_up_down_to_book_side,
+)
+from experiments.backtest.report import refusal_headers
 from experiments.backtest.schema import (
     GoldenTraceRecord,
     PARTITION_BOUNDARY_NS,
@@ -573,68 +606,226 @@ def count_live_fills(events_path: Path) -> int:
 
 
 def reconcile(
-    events_path: Path,
     *,
+    session_id: str,
+    scrapes_root: Path,
+    scrapes_db: Path,
+    latency_fit_from: list[str],
+    asset_prefix: str,
     out: Path,
-    min_live_fills: int = 100,
-) -> Path:
-    """Produce golden_trace.parquet per spec §6.3. Currently STUBBED: will
-    raise ``NoLiveFillsCaptured`` on any paper-mode events.jsonl because the
-    downstream diff-bps math requires real live fills to compare against.
+    tick_size: Decimal = Decimal("0.01"),
+    fee_category: str = "crypto",
+) -> int:
+    """End-to-end golden-trace reconciliation. Returns process exit code."""
+    sess = discover_session(session_id, scrapes_root=scrapes_root)
+    events_path = Path(sess["events_jsonl_path"])
+    feed_dir = Path(sess["scrape_canonical_dir"])
+    t0_ns = int(sess["launch_ts_ns"])
+    t1_ns = int(sess["effective_stop_ns"])
+    session_mode = sess["mode"]
+    real_session_id = sess["session_id"]
 
-    Target minimum for a defensible first run is ``min_live_fills`` = 100
-    per Lo 2002 / §6.4 MinTRL considerations.
-    """
-    n_live = count_live_fills(events_path)
-    if n_live < min_live_fills:
-        raise NoLiveFillsCaptured(
-            f"Found {n_live} live fills in {events_path}; need >= {min_live_fills}.\n"
-            f"\n"
-            f"Golden-trace predicate (spec §6.3):\n"
-            f"  SELECT * FROM events {PREDICATE_SQL};\n"
-            f"\n"
-            f"Current events.jsonl is paper-mode — order_id / ack_ts / "
-            f"fill_price are null on every row. To capture live fills:\n"
-            f"\n"
-            f"  MAX_TRADE_SIZE_USDC=1 LIVE_MODE=1 bash launch_daemon.sh\n"
-            f"\n"
-            f"Run concurrent with scripts/scrape_book.py for ~3 h on 2 BTC 5m\n"
-            f"markets, targeting ~{min_live_fills} fills to hit the Lo 2002 /\n"
-            f"§6.4 MinTRL floor. Re-run this command after that window.\n"
-        )
-    # TODO: per-fill replay + diff_bps + acceptance gate. Unreachable until
-    # live fills are captured; implement in a follow-up commit.
-    raise NotImplementedError(
-        f"Found {n_live} live fills — reconcile.py body pending (§6.3). "
-        "This is the next commit after the first live-capture session."
-    )
-
-
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="experiments.backtest.reconcile")
-    p.add_argument("--events", required=True, type=Path)
-    p.add_argument(
-        "--out", required=True, type=Path,
-        help="Target golden_trace.parquet path.",
-    )
-    p.add_argument(
-        "--min-live-fills", type=int, default=100,
-        help="Minimum live-fill count to proceed past the gate (spec §6.4).",
-    )
-    args = p.parse_args(argv)
-    try:
-        reconcile(
-            events_path=args.events,
-            out=args.out,
-            min_live_fills=args.min_live_fills,
-        )
-    except NoLiveFillsCaptured as e:
-        print(str(e), file=sys.stderr)
+    if not events_path.exists():
+        print(f"events.jsonl not found at {events_path}", file=sys.stderr)
         return 2
-    except NotImplementedError as e:
-        print(str(e), file=sys.stderr)
+
+    entries = list(iter_entry_fills(
+        events_path, t0_ns=t0_ns, t1_ns=t1_ns,
+        asset_prefix=asset_prefix, strategy_filter=("refined",),
+    ))
+    if not entries:
+        print(
+            f"No qualifying entry_filled rows in {events_path} "
+            f"(predicate: {PREDICATE_SQL}, strategy=refined, "
+            f"asset_prefix={asset_prefix})",
+            file=sys.stderr,
+        )
         return 3
+
+    # Held-out latency fit. If the user passes --latency-fit-from
+    # including this same session_id, drop it — fitting on self
+    # contaminates the gate.
+    held_out_ids = [s for s in latency_fit_from if s != real_session_id]
+    empirical_profile, fit_source = fit_held_out_latency(
+        held_out_ids, scrapes_root=scrapes_root,
+    )
+
+    # Markets + book_feed loading reuses harness.py verbatim.
+    markets = load_markets(scrapes_db)
+    wanted_tokens: set[str] = set()
+    token_by_condition_side: dict[tuple[str, str], str] = {}
+    for slug, meta in markets.items():
+        cid = meta["condition_id"]
+        if not cid:
+            continue
+        if meta["yes_token_id"]:
+            token_by_condition_side[(cid, "yes")] = meta["yes_token_id"]
+        if meta["no_token_id"]:
+            token_by_condition_side[(cid, "no")] = meta["no_token_id"]
+    for e in entries:
+        pos = e.get("position") or {}
+        slug = pos.get("slug")
+        if slug not in markets:
+            continue
+        cid = markets[slug]["condition_id"]
+        ms = _side_to_market_side(pos.get("side", ""))
+        tok = token_by_condition_side.get((cid, ms))
+        if tok:
+            wanted_tokens.add(tok)
+    store, _ = load_snapshots_from_feed_dir(
+        feed_dir=feed_dir, wanted_tokens=wanted_tokens,
+        t0_ns=t0_ns, t1_ns=t1_ns, tick_size_default=tick_size,
+    )
+
+    category = CATEGORIES[fee_category]
+    profiles_to_run: list = []  # list of (pass_name, LatencyProfile)
+    if empirical_profile is not None:
+        profiles_to_run.append(("empirical", empirical_profile))
+    profiles_to_run.append(("prior", SG_WG_PRIOR))
+
+    records: list = []
+    rows_by_pass: dict = {"empirical": 0, "prior": 0}
+    rows_by_partition: dict = {
+        "pre_2026-02-01": 0, "post_2026-02-01": 0,
+    }
+    for pass_name, profile in profiles_to_run:
+        executor = ReplayExecutor(
+            books=store, latency_profile=profile,
+            mode="freeze_depleted", staleness_hard_ms=500,
+            staleness_soft_ms=200, rng=random.Random(0),
+        )
+        for entry in entries:
+            pos = entry["position"]
+            slug = pos.get("slug")
+            if slug not in markets:
+                continue
+            cid = markets[slug]["condition_id"]
+            ms = _side_to_market_side(pos.get("side", ""))
+            token_id = token_by_condition_side.get((cid, ms))
+            if not token_id:
+                continue
+            t_zero = pos.get("t_zero")
+            t_zero_ns = int(float(t_zero) * 1e9) if t_zero is not None else None
+            t_end_ns = (
+                (t_zero_ns + 300 * 1_000_000_000)
+                if t_zero_ns is not None else None
+            )
+            decision_mid_raw = pos.get("market_at_entry") or pos.get("fair_at_entry")
+            if not decision_mid_raw or float(decision_mid_raw) <= 0:
+                continue
+            shares = Decimal(str(pos.get("size_shares", 0)))
+            if shares <= 0:
+                continue
+            order = OrderRequest(
+                token_id=token_id,
+                side=_side_up_down_to_book_side(pos.get("side", "")),
+                requested_shares=shares,
+                worst_price_limit=Decimal("0.99"),
+                decision_mid=Decimal(str(decision_mid_raw)),
+                category=category, tick_size=tick_size,
+                market_id=cid, strategy_id=str(entry.get("strategy", "")),
+                trade_id=f"{slug}:{pos.get('side')}:{pos.get('entry_time')}",
+                parent_order_id="", backtest_run_id=real_session_id,
+                t_zero_ns=t_zero_ns, t_end_ns=t_end_ns,
+                edge_at_signal=float(pos.get("edge") or 0.0),
+            )
+            decision_ts_ns = int(float(pos.get("entry_time", entry["ts"])) * 1e9)
+            exec_record = executor.post_fak(order, decision_ts_ns=decision_ts_ns)
+            rec = build_record(entry, exec_record, pass_name, session_mode)
+            records.append(rec)
+            rows_by_pass[pass_name] = rows_by_pass.get(pass_name, 0) + 1
+            rows_by_partition[rec.partition] = (
+                rows_by_partition.get(rec.partition, 0) + 1
+            )
+
+    gate_results = {
+        partition: evaluate_gate(records, partition=partition)
+        for partition in ("pre_2026-02-01", "post_2026-02-01")
+    }
+    refusals = refusal_headers(
+        staleness_policy="strict",
+        mode_tag="live" if session_mode == "live" else "live_dryrun",
+        scope="entries_only",
+    )
+    write_parquet(records, out)
+    write_manifest(
+        out,
+        session_id=real_session_id, session_mode=session_mode,
+        asset_prefix=asset_prefix, strategy_filter=("refined",),
+        latency_fit_source=fit_source,
+        rows_emitted_total=len(records),
+        rows_emitted_by_partition=rows_by_partition,
+        rows_emitted_by_pass=rows_by_pass,
+        gate=gate_results, refusals=refusals,
+    )
+    _print_summary(real_session_id, session_mode, len(records),
+                   rows_by_pass, gate_results, refusals)
+
+    post_status = gate_results["post_2026-02-01"]["status"]
+    if post_status == "FAIL":
+        return 5
     return 0
+
+
+def _print_summary(
+    session_id: str, session_mode: str, n_total: int,
+    rows_by_pass: dict, gate: dict, refusals: list,
+) -> None:
+    print(f"\n=== golden-trace reconcile (session {session_id}, mode {session_mode}) ===")
+    print(f"rows: total={n_total} empirical={rows_by_pass.get('empirical', 0)} "
+          f"prior={rows_by_pass.get('prior', 0)}")
+    for part in ("post_2026-02-01", "pre_2026-02-01"):
+        g = gate[part]
+        if g["status"] == "n/a":
+            print(f"gate ({part}): n/a (no in-window rows)")
+        else:
+            print(
+                f"gate ({part}, in-window, empirical pass): "
+                f"n_rows={g['n_rows']} "
+                f"median_|diff_bps|={g['median_abs_diff_bps']:.2f} "
+                f"p95_|diff_bps|={g['p95_abs_diff_bps']:.2f} → {g['status']}"
+            )
+    if refusals:
+        print("refusals:")
+        for r in refusals:
+            print(f"  - {r}")
+
+
+def main(argv: list | None = None) -> int:
+    REPO = Path(__file__).resolve().parents[2]
+    p = argparse.ArgumentParser(prog="experiments.backtest.reconcile")
+    p.add_argument("--session", required=True,
+                   help="session_id from daemon_state/scrapes/, or 'latest'")
+    p.add_argument("--scrapes", required=True, type=Path,
+                   help="markets sqlite db (slug → token_id resolver)")
+    p.add_argument("--scrapes-root", type=Path,
+                   default=REPO / "daemon_state" / "scrapes",
+                   help="root of session manifest tree")
+    p.add_argument("--latency-fit-from", nargs="*", default=[],
+                   help="session_ids to fit empirical latency from "
+                        "(MUST exclude --session; held-out only)")
+    p.add_argument("--asset-prefix", default="btc")
+    p.add_argument("--out", type=Path, default=None,
+                   help="output parquet path; default "
+                        "experiments/backtest/runs/golden_<session_id>.parquet")
+    args = p.parse_args(argv)
+    out = args.out
+    if out is None:
+        # Resolve <session_id> to its real value (handles 'latest').
+        try:
+            sess_for_path = discover_session(
+                args.session, scrapes_root=args.scrapes_root,
+            )
+            real_id = sess_for_path["session_id"]
+        except (FileNotFoundError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        out = REPO / "experiments" / "backtest" / "runs" / f"golden_{real_id}.parquet"
+    return reconcile(
+        session_id=args.session, scrapes_root=args.scrapes_root,
+        scrapes_db=args.scrapes, latency_fit_from=args.latency_fit_from,
+        asset_prefix=args.asset_prefix, out=out,
+    )
 
 
 if __name__ == "__main__":

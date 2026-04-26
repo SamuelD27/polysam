@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from experiments.backtest.reconcile import (
-    NoLiveFillsCaptured,
     count_live_fills,
     reconcile,
 )
@@ -230,50 +229,6 @@ def test_count_live_fills_accepts_entry_price_alias_for_live_fills(tmp_path: Pat
     )
     assert count_live_fills(events) == 1
 
-
-def test_reconcile_raises_no_live_fills_on_paper(tmp_path: Path) -> None:
-    events = tmp_path / "events.jsonl"
-    _write_events(
-        events,
-        [
-            {
-                "ts": 1.0,
-                "type": "entry_filled",
-                "position": {"order_id": None, "ack_ts": None},
-            },
-        ],
-    )
-    out = tmp_path / "golden.parquet"
-    with pytest.raises(NoLiveFillsCaptured) as exc:
-        reconcile(events_path=events, out=out, min_live_fills=100)
-    msg = str(exc.value)
-    # Exact predicate must be echoed so the operator sees the gate.
-    assert "ack_ts NOT NULL" in msg
-    assert "order_id NOT NULL" in msg
-    assert "fill_price NOT NULL" in msg
-
-
-def test_reconcile_under_min_fills_still_raises(tmp_path: Path) -> None:
-    events = tmp_path / "events.jsonl"
-    _write_events(
-        events,
-        [
-            {
-                "ts": 1.0,
-                "type": "entry_filled",
-                "position": {
-                    "order_id": "0x1",
-                    "ack_ts": 1.00012,
-                    "fill_price": 0.48,
-                },
-            },
-        ],
-    )
-    out = tmp_path / "golden.parquet"
-    # 1 live fill, default min=100 -> should still raise.
-    with pytest.raises(NoLiveFillsCaptured) as exc:
-        reconcile(events_path=events, out=out)
-    assert "Found 1 live fills" in str(exc.value)
 
 
 def test_fit_held_out_latency_returns_profile_with_30plus_samples(tmp_path: Path) -> None:
@@ -664,22 +619,95 @@ def test_write_manifest_emits_required_top_level_keys(tmp_path: Path) -> None:
     assert "refusals" in m
 
 
-def test_reconcile_raises_not_implemented_when_gate_met(tmp_path: Path) -> None:
+def test_reconcile_end_to_end_dryrun_emits_refusals(tmp_path: Path) -> None:
+    """Synthetic session: 5 entries, no held-out fit available →
+    empirical pass skipped, gate n/a, both refusals emitted."""
+    from experiments.backtest.reconcile import reconcile
+    import sqlite3
+
+    scrapes_root = tmp_path / "scrapes"
+    feed_dir = tmp_path / "feed"
+    feed_dir.mkdir()
     events = tmp_path / "events.jsonl"
-    rows = [
-        {
-            "ts": float(i),
-            "type": "entry_filled",
+    rows = []
+    for i in range(5):
+        ts = 1_777_180_800.0 + i  # post 2026-02-01
+        rows.append({
+            "ts": ts, "type": "entry_filled", "strategy": "refined",
+            "order_id": f"dry-run-{int(ts*1000)}",
             "position": {
-                "order_id": f"0x{i}",
-                "ack_ts": i + 0.001,
-                "fill_price": 0.5,
+                "slug": "btc-updown-5m-1777180800",
+                "side": "Up",
+                "entry_price": 0.50,
+                "size_shares": 20.0,
+                "ack_ts": ts + 0.150,
+                "entry_time": ts,
+                "edge": 0.05,
+                "fair_at_entry": 0.55,
+                "market_at_entry": 0.50,
+                "t_zero": int(ts) - 60,
+                "token_id": "TOK_YES",
             },
-        }
-        for i in range(5)
-    ]
-    _write_events(events, rows)
+        })
+    events.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    _write_manifest(
+        scrapes_root, "TARGET", "live_dryrun",
+        int(1_777_180_800.0 * 1e9), int(1_777_181_000.0 * 1e9),
+        str(events), str(feed_dir),
+    )
+
+    # Empty markets sqlite (we only need the table to exist for harness
+    # loaders; without book snapshots, replay rows will be book_stale —
+    # OK for plumbing test).
+    db = tmp_path / "markets.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE markets (slug TEXT PRIMARY KEY, yes_token_id TEXT, "
+        "no_token_id TEXT, condition_id TEXT, end_date TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO markets VALUES (?, ?, ?, ?, ?)",
+        ("btc-updown-5m-1777180800", "TOK_YES", "TOK_NO", "0xCID", ""),
+    )
+    conn.commit()
+    conn.close()
+
     out = tmp_path / "golden.parquet"
-    # With gate lowered to 5, we have enough — reconcile body is unimplemented.
-    with pytest.raises(NotImplementedError):
-        reconcile(events_path=events, out=out, min_live_fills=5)
+    exit_code = reconcile(
+        session_id="TARGET", scrapes_root=scrapes_root,
+        scrapes_db=db, latency_fit_from=[], asset_prefix="btc",
+        out=out,
+    )
+    assert exit_code == 0   # no empirical pass → gate n/a → exit 0
+    sidecar = json.loads((tmp_path / "golden.parquet.manifest.json").read_text())
+    assert sidecar["session_mode"] == "live_dryrun"
+    refusals = sidecar["refusals"]
+    assert any("PLUMBING-VALIDATION ONLY" in r for r in refusals)
+    assert any("ENTRIES-SIDE HAIRCUT ONLY" in r for r in refusals)
+    assert sidecar["gate"]["post_2026-02-01"]["status"] == "n/a"
+
+
+def test_reconcile_returns_3_on_zero_qualifying_rows(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import reconcile
+    import sqlite3
+
+    scrapes_root = tmp_path / "scrapes"
+    events = tmp_path / "events.jsonl"
+    events.write_text("")  # empty
+    feed_dir = tmp_path / "feed"
+    feed_dir.mkdir()
+    _write_manifest(scrapes_root, "EMPTY", "live_dryrun",
+                    1_777_000_000_000_000_000, 1_777_100_000_000_000_000,
+                    str(events), str(feed_dir))
+    db = tmp_path / "markets.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE markets (slug TEXT PRIMARY KEY, "
+                 "yes_token_id TEXT, no_token_id TEXT, "
+                 "condition_id TEXT, end_date TEXT)")
+    conn.commit(); conn.close()
+    out = tmp_path / "golden.parquet"
+    code = reconcile(
+        session_id="EMPTY", scrapes_root=scrapes_root, scrapes_db=db,
+        latency_fit_from=[], asset_prefix="btc", out=out,
+    )
+    assert code == 3
