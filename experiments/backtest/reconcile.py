@@ -27,6 +27,7 @@ refuses to produce a misleading empty/zero-row parquet.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import sys
@@ -424,6 +425,76 @@ def evaluate_gate(records: list, *, partition: str) -> dict:
         "median_abs_diff_bps": float(median),
         "p95_abs_diff_bps": float(p95),
     }
+
+
+# ---------------------------------------------------------------------------
+# Parquet + manifest writers (Task 6)
+# ---------------------------------------------------------------------------
+
+def write_parquet(records: list, out: Path) -> None:
+    """Flatten GoldenTraceRecord rows (recursing into the embedded
+    ExecutionRecord via dataclasses.asdict) and write parquet.
+
+    Empty record list still produces a parquet with the canonical
+    schema so downstream tooling does not trip on a missing file.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not records:
+        # Flatten an instantiable zero-record to derive the schema.
+        # Cheaper than building a synthetic; same result.
+        pq.write_table(pa.table({}), out)
+        return
+    flat_rows = [_flatten_record(r) for r in records]
+    fields = list(flat_rows[0].keys())
+    table_data = {k: [r[k] for r in flat_rows] for k in fields}
+    pq.write_table(pa.table(table_data), out)
+
+
+def _flatten_record(rec) -> dict:
+    """Flatten one GoldenTraceRecord — replay embed expands into
+    sibling columns; non-replay fields keep their names."""
+    d = dataclasses.asdict(rec)
+    replay = d.pop("replay", None) or {}
+    out = dict(replay)  # ExecutionRecord cols first (matches harness order)
+    out.update(d)       # then overlay/derivations/context/gate cols
+    return out
+
+
+def write_manifest(
+    out_parquet: Path,
+    *,
+    session_id: str,
+    session_mode: str,
+    asset_prefix: str,
+    strategy_filter: tuple,
+    latency_fit_source: dict,
+    rows_emitted_total: int,
+    rows_emitted_by_partition: dict,
+    rows_emitted_by_pass: dict,
+    gate: dict,
+    refusals: list,
+) -> Path:
+    """Write the manifest sidecar at out_parquet.with_suffix('.parquet.manifest.json')."""
+    manifest = {
+        "kind": "golden_trace",
+        "session_id": session_id,
+        "session_mode": session_mode,
+        "asset_prefix": asset_prefix,
+        "strategy_filter": list(strategy_filter),
+        "scope": "entries_only",
+        "latency_fit_source": latency_fit_source,
+        "rows_emitted_total": rows_emitted_total,
+        "rows_emitted_by_partition": rows_emitted_by_partition,
+        "rows_emitted_by_pass": rows_emitted_by_pass,
+        "gate": gate,
+        "refusals": refusals,
+    }
+    sidecar = out_parquet.with_suffix(out_parquet.suffix + ".manifest.json")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(json.dumps(manifest, indent=2) + "\n")
+    return sidecar
 
 
 # ---------------------------------------------------------------------------

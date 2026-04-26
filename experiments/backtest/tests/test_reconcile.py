@@ -570,6 +570,100 @@ def test_evaluate_gate_na_with_eligible_but_all_nan_reports_count() -> None:
     assert out["p95_abs_diff_bps"] is None
 
 
+def test_write_parquet_round_trip_includes_projection_keys(tmp_path: Path) -> None:
+    """Written parquet must contain every PROJECTION_KEYS_6_3 column
+    plus the live overlay columns."""
+    from experiments.backtest.reconcile import write_parquet
+    from experiments.backtest.schema import (
+        GoldenTraceRecord, PROJECTION_KEYS_6_3,
+    )
+    from active_bots.execution.replay_executor import ExecutionRecord
+
+    rec_inner = ExecutionRecord(
+        trade_id="t", parent_order_id="", strategy_id="refined",
+        backtest_run_id="r", t_signal_ns=int(1000.0 * 1e9),
+        t_send_ns=0, t_ack_ns=0, t_first_fill_ns=0, t_last_fill_ns=0,
+        token_id="tok", market_id="cid", side="BUY", tick_size=0.01,
+        decision_mid=0.50, best_bid=0.49, best_ask=0.51, spread=0.02,
+        top_of_book_size_bid=10.0, top_of_book_size_ask=10.0,
+        cumulative_depth_5bps=0.0, cumulative_depth_20bps=0.0,
+        book_staleness_ms=120, market_age_s=200.0, market_remaining_s=100.0,
+        requested_qty_shares=20.0, requested_notional_usdc=10.0,
+        worst_price_limit=0.99, filled_qty=20.0, residual_qty=0.0,
+        fill_vwap=0.51, levels_consumed=1, classification="full",
+        sampled_latency_ms=150.0, latency_source="empirical",
+        p_bucket_used="base", half_spread_cost=20.0, book_walk_cost=0.0,
+        latency_drift_cost=0.0, adverse_selection_1s=float("nan"),
+        adverse_selection_5s=float("nan"), adverse_selection_30s=float("nan"),
+        fees_cost=5.0, opportunity_cost_unfilled=float("nan"),
+        total_IS=25.0, edge_at_signal=0.05, edge_at_fill=float("nan"),
+        realised_pnl_at_close=float("nan"), paper_pnl_flat_0_5=float("nan"),
+        diff_paper_minus_realised=float("nan"), thin_book_flag=False,
+        price_extreme_flag=False, vol_regime="unk",
+        tunnel_age_bucket="unk", time_in_market_bucket="mid_late",
+        mode="freeze_depleted",
+    )
+    rec = GoldenTraceRecord(
+        replay=rec_inner, live_order_id="0xA",
+        live_ack_ts_ns=int(1000.150 * 1e9), live_fill_px=0.55,
+        live_filled_qty=20.0, live_latency_measured_ms=150.0,
+        mode_tag="live_dryrun", t_decision_ns=int(1000.0 * 1e9),
+        diff_bps=800.0, attribution_delta=975.0, book_top_at_decision=0.51,
+        strategy_name="refined", edge_at_decision=0.05,
+        fair_price_at_decision=0.50, time_remaining_at_decision_s=100,
+        in_gate_window=True, partition="post_2026-02-01",
+    )
+    out = tmp_path / "golden.parquet"
+    write_parquet([rec], out)
+    import pyarrow.parquet as pq
+    cols = set(pq.read_table(out).column_names)
+    # Every projection key must be present after flatten
+    for k in PROJECTION_KEYS_6_3:
+        assert k in cols, f"missing projection col: {k}"
+    # Overlay + derivations
+    assert "live_order_id" in cols
+    assert "live_ack_ts_ns" in cols
+    assert "live_fill_px" in cols
+    assert "mode_tag" in cols
+    assert "diff_bps" in cols
+    assert "in_gate_window" in cols
+    assert "partition" in cols
+    # R3 trade context
+    assert "strategy_name" in cols
+    assert "edge_at_decision" in cols
+
+
+def test_write_manifest_emits_required_top_level_keys(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import write_manifest
+    out_parquet = tmp_path / "golden.parquet"
+    out_parquet.touch()
+    write_manifest(
+        out_parquet,
+        session_id="S1",
+        session_mode="live_dryrun",
+        asset_prefix="btc",
+        strategy_filter=("refined",),
+        latency_fit_source={"sessions": [], "n_samples": 0,
+                            "fit_window_start_ns": 0, "fit_window_end_ns": 0,
+                            "reason": "no_sessions_provided"},
+        rows_emitted_total=0,
+        rows_emitted_by_partition={"pre_2026-02-01": 0, "post_2026-02-01": 0},
+        rows_emitted_by_pass={"empirical": 0, "prior": 0},
+        gate={"pre_2026-02-01": {"status": "n/a"},
+              "post_2026-02-01": {"status": "n/a"}},
+        refusals=["..."],
+    )
+    m = json.loads((tmp_path / "golden.parquet.manifest.json").read_text())
+    assert m["kind"] == "golden_trace"
+    assert m["session_id"] == "S1"
+    assert m["session_mode"] == "live_dryrun"
+    assert m["scope"] == "entries_only"
+    assert m["strategy_filter"] == ["refined"]
+    assert "latency_fit_source" in m
+    assert "gate" in m
+    assert "refusals" in m
+
+
 def test_reconcile_raises_not_implemented_when_gate_met(tmp_path: Path) -> None:
     events = tmp_path / "events.jsonl"
     rows = [
