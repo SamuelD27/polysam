@@ -297,6 +297,14 @@ def build_record(
 
     Field semantics per docs/reconcile_design.md "Pipeline" section.
     BUY-taker only this commit; SELL sign-flip in the followup.
+
+    Note on ``pass_name``: kept in the signature for caller-side
+    legibility (the dual-pass loop labels its iterations) but
+    deliberately NOT read inside the body — ``in_gate_window`` reads
+    ``exec_record.latency_source`` instead, which is the authoritative
+    ground truth stamped by ReplayExecutor on the record itself.
+    Caller's pass_name and the record's latency_source can diverge if
+    ReplayExecutor falls back; the record always wins.
     """
     pos = entry.get("position") or {}
     live_fill_px = float(pos.get("entry_price", 0.0))
@@ -329,6 +337,11 @@ def build_record(
 
     market_age_s = float(exec_record.market_age_s)
     if math.isnan(market_age_s):
+        # Sentinel: NaN market_age_s upstream (typically book_stale or
+        # unfilled rows from ReplayExecutor). Downstream consumers
+        # (gate evaluator, R3 regime decomposition) MUST filter
+        # time_remaining_at_decision_s == -1 before using it as a
+        # numeric input.
         time_remaining_s = -1
     else:
         time_remaining_s = max(0, int(_MARKET_DURATION_S - market_age_s))
