@@ -338,6 +338,157 @@ def test_fit_held_out_latency_no_sessions_returns_none(tmp_path: Path) -> None:
     assert fit_source["reason"] == "no_sessions_provided"
 
 
+def test_build_record_diff_bps_buy_taker_sign(tmp_path: Path) -> None:
+    """live > replay → positive diff_bps (live overpaid). bps of decision_mid."""
+    from experiments.backtest.reconcile import build_record
+    from experiments.backtest.schema import GoldenTraceRecord
+    from active_bots.execution.replay_executor import ExecutionRecord
+
+    entry = {
+        "ts": 1000.0, "strategy": "refined", "order_id": "0xA",
+        "position": {
+            "slug": "btc-updown-5m-1", "side": "Up", "entry_price": 0.55,
+            "size_shares": 20.0, "ack_ts": 1000.150, "entry_time": 1000.000,
+            "edge": 0.05, "fair_at_entry": 0.50, "market_at_entry": 0.50,
+            "t_zero": 800,
+        },
+    }
+    rec = ExecutionRecord(  # build a minimal stub
+        trade_id="t", parent_order_id="", strategy_id="refined",
+        backtest_run_id="r", t_signal_ns=int(1000.0 * 1e9),
+        t_send_ns=0, t_ack_ns=0, t_first_fill_ns=0, t_last_fill_ns=0,
+        token_id="", market_id="", side="BUY", tick_size=0.01,
+        decision_mid=0.50, best_bid=0.49, best_ask=0.51, spread=0.02,
+        top_of_book_size_bid=10.0, top_of_book_size_ask=10.0,
+        cumulative_depth_5bps=0.0, cumulative_depth_20bps=0.0,
+        book_staleness_ms=120, market_age_s=200.0, market_remaining_s=100.0,
+        requested_qty_shares=20.0, requested_notional_usdc=10.0,
+        worst_price_limit=0.99, filled_qty=20.0, residual_qty=0.0,
+        fill_vwap=0.51, levels_consumed=1, classification="full",
+        sampled_latency_ms=150.0, latency_source="empirical",
+        p_bucket_used="base", half_spread_cost=20.0, book_walk_cost=0.0,
+        latency_drift_cost=0.0, adverse_selection_1s=float("nan"),
+        adverse_selection_5s=float("nan"), adverse_selection_30s=float("nan"),
+        fees_cost=5.0, opportunity_cost_unfilled=float("nan"),
+        total_IS=25.0, edge_at_signal=0.05, edge_at_fill=float("nan"),
+        realised_pnl_at_close=float("nan"), paper_pnl_flat_0_5=float("nan"),
+        diff_paper_minus_realised=float("nan"), thin_book_flag=False,
+        price_extreme_flag=False, vol_regime="unk",
+        tunnel_age_bucket="unk", time_in_market_bucket="mid_late",
+        mode="freeze_depleted",
+    )
+    out = build_record(entry, rec, pass_name="empirical", mode_tag="live_dryrun")
+    assert isinstance(out, GoldenTraceRecord)
+    # live=0.55, replay=0.51, decision_mid=0.50 → (0.55-0.51)/0.50*1e4 = 800 bps
+    assert abs(out.diff_bps - 800.0) < 1e-6
+    # attribution_delta = (live - decision_mid)/dm*1e4 - total_IS = 1000 - 25 = 975
+    assert abs(out.attribution_delta - 975.0) < 1e-6
+    assert out.book_top_at_decision == 0.51   # best_ask for BUY taker
+    assert out.t_decision_ns == int(1000.0 * 1e9)
+    assert out.in_gate_window is True          # staleness 120 < 200, source empirical
+    assert out.partition == "pre_2026-02-01"   # ack_ts 1000.150 s = epoch 1970, pre-2026
+    assert out.live_fill_px == 0.55
+    assert out.live_filled_qty == 20.0
+    # ack_ts 1000.150 - entry_time 1000.000 = 0.150 s → 150 ms
+    assert abs(out.live_latency_measured_ms - 150.0) < 1e-3
+    assert out.live_ack_ts_ns == int(1000.150 * 1e9)
+    assert out.mode_tag == "live_dryrun"
+    assert out.strategy_name == "refined"
+    assert out.edge_at_decision == 0.05
+    assert out.fair_price_at_decision == 0.50
+    # T+300 - market_age 200 = 100 s remaining
+    assert out.time_remaining_at_decision_s == 100
+
+
+def test_build_record_in_gate_window_predicate(tmp_path: Path) -> None:
+    """Empirical pass + staleness < 200 → in_gate_window True; prior pass → False."""
+    from experiments.backtest.reconcile import build_record
+    from active_bots.execution.replay_executor import ExecutionRecord
+
+    def make(staleness_ms: int, source: str) -> ExecutionRecord:
+        return ExecutionRecord(
+            trade_id="t", parent_order_id="", strategy_id="refined",
+            backtest_run_id="r", t_signal_ns=int(1000.0 * 1e9),
+            t_send_ns=0, t_ack_ns=0, t_first_fill_ns=0, t_last_fill_ns=0,
+            token_id="", market_id="", side="BUY", tick_size=0.01,
+            decision_mid=0.50, best_bid=0.49, best_ask=0.51, spread=0.02,
+            top_of_book_size_bid=10.0, top_of_book_size_ask=10.0,
+            cumulative_depth_5bps=0.0, cumulative_depth_20bps=0.0,
+            book_staleness_ms=staleness_ms, market_age_s=200.0,
+            market_remaining_s=100.0, requested_qty_shares=20.0,
+            requested_notional_usdc=10.0, worst_price_limit=0.99,
+            filled_qty=20.0, residual_qty=0.0, fill_vwap=0.51,
+            levels_consumed=1, classification="full",
+            sampled_latency_ms=150.0, latency_source=source,
+            p_bucket_used="base", half_spread_cost=20.0, book_walk_cost=0.0,
+            latency_drift_cost=0.0, adverse_selection_1s=float("nan"),
+            adverse_selection_5s=float("nan"), adverse_selection_30s=float("nan"),
+            fees_cost=5.0, opportunity_cost_unfilled=float("nan"),
+            total_IS=25.0, edge_at_signal=0.05, edge_at_fill=float("nan"),
+            realised_pnl_at_close=float("nan"), paper_pnl_flat_0_5=float("nan"),
+            diff_paper_minus_realised=float("nan"), thin_book_flag=False,
+            price_extreme_flag=False, vol_regime="unk",
+            tunnel_age_bucket="unk", time_in_market_bucket="mid_late",
+            mode="freeze_depleted",
+        )
+    entry = {"ts": 1000.0, "strategy": "refined", "order_id": "0xA",
+             "position": {"slug": "btc-updown-5m-1", "side": "Up",
+                          "entry_price": 0.51, "size_shares": 20.0,
+                          "ack_ts": 1000.15, "entry_time": 1000.0, "edge": 0.05,
+                          "fair_at_entry": 0.5, "market_at_entry": 0.5,
+                          "t_zero": 800}}
+    assert build_record(entry, make(150, "empirical"), "empirical", "live").in_gate_window is True
+    assert build_record(entry, make(150, "prior"),     "prior",     "live").in_gate_window is False
+    assert build_record(entry, make(250, "empirical"), "empirical", "live").in_gate_window is False
+
+
+def test_build_record_partition_split_at_2026_02_01(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import build_record
+    from experiments.backtest.schema import PARTITION_BOUNDARY_NS
+    from active_bots.execution.replay_executor import ExecutionRecord
+
+    def make_rec(t_signal_ns: int) -> ExecutionRecord:
+        return ExecutionRecord(
+            trade_id="t", parent_order_id="", strategy_id="refined",
+            backtest_run_id="r", t_signal_ns=t_signal_ns,
+            t_send_ns=0, t_ack_ns=0, t_first_fill_ns=0, t_last_fill_ns=0,
+            token_id="", market_id="", side="BUY", tick_size=0.01,
+            decision_mid=0.50, best_bid=0.49, best_ask=0.51, spread=0.02,
+            top_of_book_size_bid=10.0, top_of_book_size_ask=10.0,
+            cumulative_depth_5bps=0.0, cumulative_depth_20bps=0.0,
+            book_staleness_ms=120, market_age_s=200.0, market_remaining_s=100.0,
+            requested_qty_shares=20.0, requested_notional_usdc=10.0,
+            worst_price_limit=0.99, filled_qty=20.0, residual_qty=0.0,
+            fill_vwap=0.51, levels_consumed=1, classification="full",
+            sampled_latency_ms=150.0, latency_source="empirical",
+            p_bucket_used="base", half_spread_cost=20.0, book_walk_cost=0.0,
+            latency_drift_cost=0.0, adverse_selection_1s=float("nan"),
+            adverse_selection_5s=float("nan"), adverse_selection_30s=float("nan"),
+            fees_cost=5.0, opportunity_cost_unfilled=float("nan"),
+            total_IS=25.0, edge_at_signal=0.05, edge_at_fill=float("nan"),
+            realised_pnl_at_close=float("nan"), paper_pnl_flat_0_5=float("nan"),
+            diff_paper_minus_realised=float("nan"), thin_book_flag=False,
+            price_extreme_flag=False, vol_regime="unk",
+            tunnel_age_bucket="unk", time_in_market_bucket="mid_late",
+            mode="freeze_depleted",
+        )
+    pre_ack = (PARTITION_BOUNDARY_NS - 86_400_000_000_000) / 1e9   # 1 day before
+    post_ack = (PARTITION_BOUNDARY_NS + 86_400_000_000_000) / 1e9  # 1 day after
+    entry_pre = {"ts": pre_ack, "strategy": "refined", "order_id": "0xA",
+                 "position": {"slug": "btc-x", "side": "Up", "entry_price": 0.51,
+                              "size_shares": 20.0, "ack_ts": pre_ack,
+                              "entry_time": pre_ack - 0.150,
+                              "edge": 0.05, "fair_at_entry": 0.5,
+                              "market_at_entry": 0.5, "t_zero": 0}}
+    entry_post = {**entry_pre, "ts": post_ack,
+                  "position": {**entry_pre["position"], "ack_ts": post_ack,
+                               "entry_time": post_ack - 0.150}}
+    assert build_record(entry_pre, make_rec(int(pre_ack * 1e9)),
+                        "empirical", "live").partition == "pre_2026-02-01"
+    assert build_record(entry_post, make_rec(int(post_ack * 1e9)),
+                        "empirical", "live").partition == "post_2026-02-01"
+
+
 def test_reconcile_raises_not_implemented_when_gate_met(tmp_path: Path) -> None:
     events = tmp_path / "events.jsonl"
     rows = [

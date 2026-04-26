@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -36,6 +37,11 @@ from typing import Iterable, Iterator
 from active_bots.execution.latency import (
     LatencyProfile,
     _percentile_sorted as _pct,
+)
+from active_bots.execution.replay_executor import ExecutionRecord
+from experiments.backtest.schema import (
+    GoldenTraceRecord,
+    PARTITION_BOUNDARY_NS,
 )
 
 
@@ -269,6 +275,83 @@ def fit_held_out_latency(
             "p999_ms": profile.p999_ms,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-row derivations (Task 4)
+# ---------------------------------------------------------------------------
+
+_GATE_STALENESS_MAX_MS = 200
+_MARKET_DURATION_S = 300
+
+
+def build_record(
+    entry: dict,
+    exec_record: ExecutionRecord,
+    pass_name: str,
+    mode_tag: str,
+) -> GoldenTraceRecord:
+    """Compose one GoldenTraceRecord from an entry_filled event row, the
+    ReplayExecutor output for that row's decision moment, the latency-
+    pass label ("empirical" or "prior"), and the session mode_tag.
+
+    Field semantics per docs/reconcile_design.md "Pipeline" section.
+    BUY-taker only this commit; SELL sign-flip in the followup.
+    """
+    pos = entry.get("position") or {}
+    live_fill_px = float(pos.get("entry_price", 0.0))
+    live_filled_qty = float(pos.get("size_shares", 0.0))
+    ack_ts_s = float(pos.get("ack_ts", entry.get("ts", 0.0)))
+    decision_ts_s = float(pos.get("entry_time", entry.get("ts", 0.0)))
+    live_ack_ts_ns = int(ack_ts_s * 1e9)
+    live_latency_ms = (ack_ts_s - decision_ts_s) * 1000.0
+
+    decision_mid = float(exec_record.decision_mid)
+    if decision_mid > 0:
+        diff_bps = (live_fill_px - exec_record.fill_vwap) / decision_mid * 10_000.0
+    else:
+        diff_bps = float("nan")
+    if decision_mid > 0:
+        from_decision_bps = (live_fill_px - decision_mid) / decision_mid * 10_000.0
+        attribution_delta = from_decision_bps - exec_record.total_IS
+    else:
+        attribution_delta = float("nan")
+    book_top = exec_record.best_ask  # BUY taker; SELL flip in followup
+
+    in_gate_window = (
+        exec_record.book_staleness_ms < _GATE_STALENESS_MAX_MS
+        and exec_record.latency_source == "empirical"
+    )
+    partition = (
+        "post_2026-02-01" if live_ack_ts_ns >= PARTITION_BOUNDARY_NS
+        else "pre_2026-02-01"
+    )
+
+    market_age_s = float(exec_record.market_age_s)
+    if math.isnan(market_age_s):
+        time_remaining_s = -1
+    else:
+        time_remaining_s = max(0, int(_MARKET_DURATION_S - market_age_s))
+
+    return GoldenTraceRecord(
+        replay=exec_record,
+        live_order_id=str(entry.get("order_id", "")),
+        live_ack_ts_ns=live_ack_ts_ns,
+        live_fill_px=live_fill_px,
+        live_filled_qty=live_filled_qty,
+        live_latency_measured_ms=live_latency_ms,
+        mode_tag=mode_tag,
+        t_decision_ns=exec_record.t_signal_ns,
+        diff_bps=diff_bps,
+        attribution_delta=attribution_delta,
+        book_top_at_decision=float(book_top),
+        strategy_name=str(entry.get("strategy", "")),
+        edge_at_decision=float(pos.get("edge", 0.0)),
+        fair_price_at_decision=float(pos.get("fair_at_entry") or 0.0),
+        time_remaining_at_decision_s=time_remaining_s,
+        in_gate_window=in_gate_window,
+        partition=partition,
+    )
 
 
 # ---------------------------------------------------------------------------
