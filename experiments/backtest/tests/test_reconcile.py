@@ -276,6 +276,68 @@ def test_reconcile_under_min_fills_still_raises(tmp_path: Path) -> None:
     assert "Found 1 live fills" in str(exc.value)
 
 
+def test_fit_held_out_latency_returns_profile_with_30plus_samples(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import fit_held_out_latency
+    scrapes_root = tmp_path / "scrapes"
+    events = tmp_path / "events_held_out.jsonl"
+    rows = []
+    for i in range(40):
+        rows.append({
+            "ts": 1000.0 + i,
+            "type": "entry_filled",
+            "strategy": "refined",
+            "order_id": f"0x{i}",
+            "position": {
+                "slug": "btc-updown-5m-1",
+                "entry_time": 1000.0 + i,
+                "ack_ts": 1000.0 + i + 0.150,  # 150 ms gap
+                "entry_price": 0.42,
+            },
+        })
+    events.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    _write_manifest(scrapes_root, "HOLDOUT", "live_dryrun",
+                    int(1000.0 * 1e9), int(2000.0 * 1e9),
+                    str(events), str(tmp_path / "feed_unused"))
+    profile, fit_source = fit_held_out_latency(["HOLDOUT"], scrapes_root=scrapes_root)
+    assert profile is not None
+    assert profile.source == "empirical"
+    # 150 ms constant → all quantiles ≈ 150
+    assert 145 < profile.p50_ms < 155
+    assert fit_source["n_samples"] == 40
+    assert fit_source["sessions"] == ["HOLDOUT"]
+
+
+def test_fit_held_out_latency_returns_none_below_threshold(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import fit_held_out_latency
+    scrapes_root = tmp_path / "scrapes"
+    events = tmp_path / "events_thin.jsonl"
+    rows = [{
+        "ts": 1000.0 + i, "type": "entry_filled", "strategy": "refined",
+        "order_id": f"0x{i}", "position": {
+            "slug": "btc-updown-5m-1", "entry_time": 1000.0 + i,
+            "ack_ts": 1000.0 + i + 0.150, "entry_price": 0.42,
+        },
+    } for i in range(10)]  # only 10 rows
+    events.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    _write_manifest(scrapes_root, "THIN", "live_dryrun",
+                    int(1000.0 * 1e9), int(2000.0 * 1e9),
+                    str(events), str(tmp_path / "feed_unused"))
+    profile, fit_source = fit_held_out_latency(["THIN"], scrapes_root=scrapes_root)
+    assert profile is None
+    assert fit_source["n_samples"] == 10
+    assert fit_source["reason"] == "below_threshold"
+
+
+def test_fit_held_out_latency_no_sessions_returns_none(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import fit_held_out_latency
+    scrapes_root = tmp_path / "scrapes"
+    scrapes_root.mkdir()
+    profile, fit_source = fit_held_out_latency([], scrapes_root=scrapes_root)
+    assert profile is None
+    assert fit_source["n_samples"] == 0
+    assert fit_source["reason"] == "no_sessions_provided"
+
+
 def test_reconcile_raises_not_implemented_when_gate_met(tmp_path: Path) -> None:
     events = tmp_path / "events.jsonl"
     rows = [

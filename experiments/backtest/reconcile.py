@@ -157,6 +157,131 @@ def iter_entry_fills(
 
 
 # ---------------------------------------------------------------------------
+# Held-out latency fitting (Task 3)
+# ---------------------------------------------------------------------------
+
+from active_bots.execution.latency import LatencyProfile, fit_from_events_jsonl, NotFitted
+
+_HELD_OUT_MIN_SAMPLES = 30
+
+
+def fit_held_out_latency(
+    held_out_session_ids: list[str],
+    *,
+    scrapes_root: Path,
+) -> tuple[LatencyProfile | None, dict]:
+    """Fit an empirical latency profile from sessions OTHER than the one
+    being reconciled. Returns (profile_or_None, fit_source_dict).
+
+    fit_source_dict has keys: ``sessions``, ``n_samples``,
+    ``fit_window_start_ns``, ``fit_window_end_ns``, ``profile`` (or
+    ``reason`` if profile is None).
+
+    Returning None (with reason "below_threshold" or
+    "no_sessions_provided") tells the caller to skip the empirical
+    pass — gate will emit "n/a (no empirical pass)".
+    """
+    if not held_out_session_ids:
+        return None, {
+            "sessions": [],
+            "n_samples": 0,
+            "fit_window_start_ns": 0,
+            "fit_window_end_ns": 0,
+            "reason": "no_sessions_provided",
+        }
+    all_gaps_ms: list[float] = []
+    fit_window_start_ns = 2**63 - 1
+    fit_window_end_ns = 0
+    used_sessions: list[str] = []
+    for sid in held_out_session_ids:
+        manifest_path = scrapes_root / sid / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            m = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            continue
+        events_path = Path(m.get("events_jsonl_path", ""))
+        if not events_path.is_file():
+            continue
+        launch_ns = int(m.get("launch_ts_ns", 0))
+        stop_ns = m.get("stop_ts_ns")
+        end_ns = int(stop_ns) if stop_ns is not None else int(time.time() * 1e9)
+        try:
+            partial = fit_from_events_jsonl(
+                events_path, t_start_ns=launch_ns, t_end_ns=end_ns,
+            )
+        except NotFitted:
+            continue
+        # fit_from_events_jsonl returns a fitted LatencyProfile, not raw
+        # samples. Re-walk the file to count samples that fed into it
+        # so the manifest reports an honest n_samples for THIS session
+        # union. (fit_from_events_jsonl's NotFitted threshold is 10;
+        # ours is 30 — checked on the union below.)
+        with events_path.open("r") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                ts = row.get("ts")
+                if ts is None:
+                    continue
+                ts_ns = int(float(ts) * 1e9)
+                if ts_ns < launch_ns or ts_ns > end_ns:
+                    continue
+                pos = row.get("position") or row.get("trade") or {}
+                ack = pos.get("ack_ts") if isinstance(pos, dict) else None
+                dec = pos.get("entry_time") if isinstance(pos, dict) else None
+                if ack is None or dec is None:
+                    continue
+                try:
+                    gap = (float(ack) - float(dec)) * 1000.0
+                except (TypeError, ValueError):
+                    continue
+                if gap < 0:
+                    continue
+                all_gaps_ms.append(gap)
+        # Quiet partial usage of fit_from_events_jsonl return — the
+        # union-fit below supersedes it. We still called it to surface
+        # its NotFitted check on per-session minimums.
+        _ = partial
+        used_sessions.append(sid)
+        fit_window_start_ns = min(fit_window_start_ns, launch_ns)
+        fit_window_end_ns = max(fit_window_end_ns, end_ns)
+    n = len(all_gaps_ms)
+    if n < _HELD_OUT_MIN_SAMPLES:
+        return None, {
+            "sessions": used_sessions,
+            "n_samples": n,
+            "fit_window_start_ns": fit_window_start_ns if used_sessions else 0,
+            "fit_window_end_ns": fit_window_end_ns if used_sessions else 0,
+            "reason": "below_threshold",
+        }
+    all_gaps_ms.sort()
+    from active_bots.execution.latency import _percentile_sorted as _pct
+    profile = LatencyProfile(
+        p50_ms=float(_pct(all_gaps_ms, 0.50)),
+        p95_ms=float(_pct(all_gaps_ms, 0.95)),
+        p99_ms=float(_pct(all_gaps_ms, 0.99)),
+        p999_ms=float(_pct(all_gaps_ms, 0.999)),
+        source="empirical",
+    )
+    return profile, {
+        "sessions": used_sessions,
+        "n_samples": n,
+        "fit_window_start_ns": fit_window_start_ns,
+        "fit_window_end_ns": fit_window_end_ns,
+        "profile": {
+            "p50_ms": profile.p50_ms,
+            "p95_ms": profile.p95_ms,
+            "p99_ms": profile.p99_ms,
+            "p999_ms": profile.p999_ms,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Existing stub code (Tasks 2+ reuse these helpers)
 # ---------------------------------------------------------------------------
 
