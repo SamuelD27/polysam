@@ -559,6 +559,17 @@ def test_evaluate_gate_partition_isolation() -> None:
     assert out["n_rows"] == 100
 
 
+def test_evaluate_gate_na_with_eligible_but_all_nan_reports_count() -> None:
+    """All eligible rows have NaN diff_bps → status n/a but n_rows reflects count."""
+    from experiments.backtest.reconcile import evaluate_gate
+    rows = [_mock_record_for_gate(float("nan"), True, "full")] * 7
+    out = evaluate_gate(rows, partition="post_2026-02-01")
+    assert out["status"] == "n/a"
+    assert out["n_rows"] == 7   # not 0 — eligible count, just no usable diff_bps
+    assert out["median_abs_diff_bps"] is None
+    assert out["p95_abs_diff_bps"] is None
+
+
 def test_reconcile_raises_not_implemented_when_gate_met(tmp_path: Path) -> None:
     events = tmp_path / "events.jsonl"
     rows = [

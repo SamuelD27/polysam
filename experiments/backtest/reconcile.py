@@ -400,9 +400,14 @@ def evaluate_gate(records: list, *, partition: str) -> dict:
     abs_vals = sorted(abs(r.diff_bps) for r in eligible
                       if not math.isnan(r.diff_bps))
     if not abs_vals:
+        # Eligible rows exist but all have NaN diff_bps (e.g., when
+        # build_record produced NaN due to fill_px==0 or missing
+        # decision_mid). Report the eligible count honestly so
+        # downstream readers can see "we filtered N rows but couldn't
+        # gate them" vs. "no rows passed the filter".
         return {
             "status": "n/a",
-            "n_rows": 0,
+            "n_rows": len(eligible),
             "median_abs_diff_bps": None,
             "p95_abs_diff_bps": None,
         }
