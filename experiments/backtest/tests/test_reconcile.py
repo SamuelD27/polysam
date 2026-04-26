@@ -8,6 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from experiments.backtest.reconcile import (
+    NoLiveFillsCaptured,
+    count_live_fills,
+    reconcile,
+)
+
 
 def _write_manifest(scrapes_root: Path, session_id: str, mode: str,
                     launch_ns: int, stop_ns: int | None,
@@ -76,12 +82,6 @@ def test_discover_session_running_session_uses_now_for_stop(tmp_path: Path) -> N
     after = int(time.time() * 1e9)
     assert sess["stop_ts_ns"] is None
     assert before <= sess["effective_stop_ns"] <= after
-
-from experiments.backtest.reconcile import (
-    NoLiveFillsCaptured,
-    count_live_fills,
-    reconcile,
-)
 
 
 def _write_events(path: Path, rows: list[dict]) -> None:
