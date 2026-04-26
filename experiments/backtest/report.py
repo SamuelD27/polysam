@@ -153,6 +153,44 @@ def _mintrl_estimate(
     return 1.0 + factor * (z_alpha / denom) ** 2
 
 
+def refusal_headers(
+    *,
+    staleness_policy: str = "strict",
+    mode_tag: str = "live",
+    scope: str = "entries_and_exits",
+) -> list[str]:
+    """Single-source refusal-header generator.
+
+    Returns the list of refusal strings to print at the top of any
+    report, and to record in any output manifest's ``refusals``
+    array. Each condition that holds adds one string. Order is
+    fixed: staleness, mode, scope.
+
+    Conditions:
+      staleness_policy != "strict"      → suppress paper-vs-realistic ROI
+      mode_tag         != "live"         → "PLUMBING-VALIDATION ONLY"
+      scope            != "entries_and_exits" → "ENTRIES-SIDE HAIRCUT ONLY"
+                                                (extend when other partial
+                                                 scopes land)
+    """
+    out: list[str] = []
+    if staleness_policy != "strict":
+        out.append(
+            f"Headline suppressed: parquet staleness_policy=`{staleness_policy}`. "
+            f"Re-run without --allow-stale once you have <500 ms book cadence."
+        )
+    if mode_tag != "live":
+        out.append(
+            f"PLUMBING-VALIDATION ONLY — paper-vs-live haircut not measured "
+            f"(mode_tag={mode_tag})"
+        )
+    if scope == "entries_only":
+        out.append(
+            "ENTRIES-SIDE HAIRCUT ONLY — exit-side haircut not yet measured"
+        )
+    return out
+
+
 def _manifest_for(parquet_path: Path) -> dict | None:
     candidate = parquet_path.with_suffix(parquet_path.suffix + ".manifest.json")
     if not candidate.exists():
@@ -339,18 +377,17 @@ def report(parquet_path: Path) -> str:
         "α=0.05 (Z=1.645). Not annualised."
     )
 
-    # Headline — suppressed on non-strict runs.
+    # Headline — suppressed when any refusal condition holds.
     lines.append("")
     lines.append("## Headline")
     lines.append("")
-    if not strict:
-        lines.append(
-            f"_Headline suppressed: parquet staleness_policy=`{policy}`. "
-            f"Schema validation, row counts, attribution-sum invariant, "
-            f"regime breakdown, and MinTRL above are still meaningful "
-            f"for plumbing smoke checks._"
-        )
-    elif paired_paper:
+    for header in refusal_headers(
+        staleness_policy=policy,
+        mode_tag=manifest.get("session_mode", "live") if manifest else "live",
+        scope=manifest.get("scope", "entries_and_exits") if manifest else "entries_and_exits",
+    ):
+        lines.append(f"_{header}_")
+    if strict and paired_paper:
         gross = sum(paired_notional)
         paper_roi = sum(paired_paper) / gross
         realised_roi = sum(paired_realised) / gross
@@ -363,7 +400,7 @@ def report(parquet_path: Path) -> str:
             f"{_fmt_bps(med_ld)} latency, {_fmt_bps(med_fee)} fees."
         )
         lines.append(headline)
-    else:
+    elif strict:
         lines.append("No paired entry/exit rows; cannot compute haircut yet.")
     return "\n".join(lines)
 
