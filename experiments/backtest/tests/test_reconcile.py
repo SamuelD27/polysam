@@ -489,6 +489,76 @@ def test_build_record_partition_split_at_2026_02_01(tmp_path: Path) -> None:
                         "empirical", "live").partition == "post_2026-02-01"
 
 
+def _mock_record_for_gate(diff_bps: float, in_window: bool, classification: str,
+                          partition: str = "post_2026-02-01"):
+    """Lightweight fake exposing only the fields evaluate_gate reads."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _R:
+        diff_bps: float
+        in_gate_window: bool
+        partition: str
+        replay: object
+    @dataclass
+    class _Inner:
+        classification: str
+    return _R(diff_bps=diff_bps, in_gate_window=in_window,
+              partition=partition, replay=_Inner(classification=classification))
+
+
+def test_evaluate_gate_pass_when_within_thresholds() -> None:
+    from experiments.backtest.reconcile import evaluate_gate
+    rows = [
+        _mock_record_for_gate(0.5, True, "full"),
+        _mock_record_for_gate(-1.0, True, "full"),
+        _mock_record_for_gate(8.0, True, "partial"),  # p95 contributor
+    ] * 50  # 150 rows total
+    out = evaluate_gate(rows, partition="post_2026-02-01")
+    assert out["status"] == "PASS"
+    assert out["n_rows"] == 150
+    assert abs(out["median_abs_diff_bps"] - 1.0) < 1e-6  # median of |0.5|,|-1|,|8|
+    assert out["p95_abs_diff_bps"] <= 8.0
+
+
+def test_evaluate_gate_fail_when_p95_exceeds() -> None:
+    from experiments.backtest.reconcile import evaluate_gate
+    rows = [_mock_record_for_gate(0.5, True, "full")] * 95
+    rows += [_mock_record_for_gate(15.0, True, "full")] * 5  # 5% at 15 bps
+    out = evaluate_gate(rows, partition="post_2026-02-01")
+    assert out["status"] == "FAIL"
+    assert out["p95_abs_diff_bps"] >= 10.0
+
+
+def test_evaluate_gate_fail_when_median_exceeds() -> None:
+    from experiments.backtest.reconcile import evaluate_gate
+    rows = [_mock_record_for_gate(3.0, True, "full")] * 100
+    out = evaluate_gate(rows, partition="post_2026-02-01")
+    assert out["status"] == "FAIL"
+    assert abs(out["median_abs_diff_bps"] - 3.0) < 1e-6
+
+
+def test_evaluate_gate_na_when_no_in_window_rows() -> None:
+    from experiments.backtest.reconcile import evaluate_gate
+    rows = [_mock_record_for_gate(0.5, False, "full"),
+            _mock_record_for_gate(0.5, True, "unfilled")]  # excluded class
+    out = evaluate_gate(rows, partition="post_2026-02-01")
+    assert out["status"] == "n/a"
+    assert out["n_rows"] == 0
+
+
+def test_evaluate_gate_partition_isolation() -> None:
+    """Records in OTHER partitions must NOT influence this gate."""
+    from experiments.backtest.reconcile import evaluate_gate
+    rows_post = [_mock_record_for_gate(0.5, True, "full",
+                                       partition="post_2026-02-01")] * 100
+    rows_pre = [_mock_record_for_gate(50.0, True, "full",
+                                      partition="pre_2026-02-01")] * 100
+    out = evaluate_gate(rows_post + rows_pre, partition="post_2026-02-01")
+    assert out["status"] == "PASS"
+    assert out["n_rows"] == 100
+
+
 def test_reconcile_raises_not_implemented_when_gate_met(tmp_path: Path) -> None:
     events = tmp_path / "events.jsonl"
     rows = [

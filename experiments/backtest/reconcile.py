@@ -368,6 +368,60 @@ def build_record(
 
 
 # ---------------------------------------------------------------------------
+# Per-partition acceptance gate (Task 5)
+# ---------------------------------------------------------------------------
+
+def evaluate_gate(records: list, *, partition: str) -> dict:
+    """Score the §6.3 acceptance gate on records of the given partition.
+
+    Filters in two stages:
+      * record.partition == partition
+      * record.in_gate_window AND record.replay.classification in
+        {"full", "partial"}
+
+    Returns a dict with keys: status ("PASS"|"FAIL"|"n/a"),
+    n_rows, median_abs_diff_bps, p95_abs_diff_bps. status="n/a" when
+    n_rows == 0 (no in-window rows for this partition).
+    """
+    eligible = [
+        r for r in records
+        if getattr(r, "partition", None) == partition
+        and getattr(r, "in_gate_window", False)
+        and getattr(getattr(r, "replay", None), "classification", "")
+            in ("full", "partial")
+    ]
+    if not eligible:
+        return {
+            "status": "n/a",
+            "n_rows": 0,
+            "median_abs_diff_bps": None,
+            "p95_abs_diff_bps": None,
+        }
+    abs_vals = sorted(abs(r.diff_bps) for r in eligible
+                      if not math.isnan(r.diff_bps))
+    if not abs_vals:
+        return {
+            "status": "n/a",
+            "n_rows": 0,
+            "median_abs_diff_bps": None,
+            "p95_abs_diff_bps": None,
+        }
+    median = _pct(abs_vals, 0.50)
+    # p95 uses the "higher" (ceiling) method so that 5 rows out of 100 at an
+    # extreme value correctly land above the threshold — linear interpolation
+    # would dilute the tail signal at this sample size (spec §6.3 intent).
+    p95_idx = min(len(abs_vals) - 1, math.ceil(0.95 * (len(abs_vals) - 1)))
+    p95 = abs_vals[p95_idx]
+    status = "PASS" if (median < 2.0 and p95 < 10.0) else "FAIL"
+    return {
+        "status": status,
+        "n_rows": len(eligible),
+        "median_abs_diff_bps": float(median),
+        "p95_abs_diff_bps": float(p95),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Existing stub code (Tasks 2+ reuse these helpers)
 # ---------------------------------------------------------------------------
 
