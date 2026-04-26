@@ -15,6 +15,45 @@ from experiments.backtest.reconcile import (
 )
 
 
+def test_iter_entry_fills_filters_by_strategy_window_predicate(tmp_path: Path) -> None:
+    from experiments.backtest.reconcile import iter_entry_fills
+    events = tmp_path / "events.jsonl"
+    rows = [
+        # In window, refined, predicate met → KEEP
+        {"ts": 1.0, "type": "entry_filled", "strategy": "refined",
+         "order_id": "0xA", "position": {"slug": "btc-updown-5m-1", "ack_ts": 1.001,
+                                          "entry_price": 0.42, "size_shares": 24.0,
+                                          "edge": 0.07}},
+        # Out of window → DROP
+        {"ts": 99.0, "type": "entry_filled", "strategy": "refined",
+         "order_id": "0xB", "position": {"slug": "btc-updown-5m-2", "ack_ts": 99.001,
+                                          "entry_price": 0.50, "size_shares": 20.0}},
+        # Wrong strategy → DROP
+        {"ts": 1.5, "type": "entry_filled", "strategy": "enhanced",
+         "order_id": "0xC", "position": {"slug": "btc-updown-5m-3", "ack_ts": 1.501,
+                                          "entry_price": 0.50, "size_shares": 20.0}},
+        # Predicate fails (no order_id) → DROP
+        {"ts": 1.7, "type": "entry_filled", "strategy": "refined",
+         "position": {"slug": "btc-updown-5m-4", "ack_ts": 1.701,
+                      "entry_price": 0.50, "size_shares": 20.0}},
+        # Wrong asset prefix → DROP
+        {"ts": 1.8, "type": "entry_filled", "strategy": "refined",
+         "order_id": "0xE", "position": {"slug": "eth-updown-5m-1", "ack_ts": 1.801,
+                                          "entry_price": 0.50, "size_shares": 20.0}},
+        # Wrong type → DROP
+        {"ts": 1.9, "type": "exit_filled", "strategy": "refined",
+         "order_id": "0xF", "trade": {"slug": "btc-updown-5m-5", "ack_ts": 1.901,
+                                       "exit_price": 0.55, "size_shares": 20.0}},
+    ]
+    events.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    out = list(iter_entry_fills(events, t0_ns=int(0.5 * 1e9),
+                                 t1_ns=int(2.0 * 1e9),
+                                 asset_prefix="btc",
+                                 strategy_filter=("refined",)))
+    assert len(out) == 1
+    assert out[0]["order_id"] == "0xA"
+
+
 def _write_manifest(scrapes_root: Path, session_id: str, mode: str,
                     launch_ns: int, stop_ns: int | None,
                     events_path: str, feed_dir: str) -> Path:

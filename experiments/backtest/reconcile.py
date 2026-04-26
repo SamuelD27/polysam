@@ -102,6 +102,61 @@ def discover_session(
 
 
 # ---------------------------------------------------------------------------
+# Entry fill iterator (Task 2)
+# ---------------------------------------------------------------------------
+
+def iter_entry_fills(
+    events_path: Path,
+    *,
+    t0_ns: int,
+    t1_ns: int,
+    asset_prefix: str = "btc",
+    strategy_filter: tuple[str, ...] = ("refined",),
+) -> Iterable[dict]:
+    """Yield entry_filled events that satisfy ALL of:
+
+      * type == "entry_filled"
+      * strategy in strategy_filter
+      * t0_ns <= ts_ns <= t1_ns
+      * position.slug starts with asset_prefix
+      * predicate met: order_id + ack_ts + entry_price all non-null
+        somewhere in the row (top-level or nested in position)
+
+    Rows are not loaded into memory all at once — caller may consume
+    lazily. JSON-decode failures are skipped silently (same policy as
+    harness.py:load_events).
+    """
+    if not events_path.exists():
+        return
+    with events_path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("type") != "entry_filled":
+                continue
+            if row.get("strategy") not in strategy_filter:
+                continue
+            ts = row.get("ts")
+            if ts is None:
+                continue
+            ts_ns = int(float(ts) * 1e9)
+            if ts_ns < t0_ns or ts_ns > t1_ns:
+                continue
+            pos = row.get("position") or {}
+            slug = str(pos.get("slug", ""))
+            if not slug.startswith(asset_prefix):
+                continue
+            if not _matches_live_predicate(row):
+                continue
+            yield row
+
+
+# ---------------------------------------------------------------------------
 # Existing stub code (Tasks 2+ reuse these helpers)
 # ---------------------------------------------------------------------------
 
