@@ -31,7 +31,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ def iter_entry_fills(
     t1_ns: int,
     asset_prefix: str = "btc",
     strategy_filter: tuple[str, ...] = ("refined",),
-) -> Iterable[dict]:
+) -> Iterator[dict]:
     """Yield entry_filled events that satisfy ALL of:
 
       * type == "entry_filled"
