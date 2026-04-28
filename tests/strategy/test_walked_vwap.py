@@ -109,3 +109,34 @@ def test_walked_vwap_partial():
     assert res.classification == "partial"
     assert res.filled_shares == pytest.approx(5.0)
     assert res.residual_shares == pytest.approx(5.0)
+
+
+def test_post_fee_effective_vwap_at_peak():
+    """At p=0.50, fee = (180/10000) * 0.5 * 0.5 * shares * 1.0 = 45 bps * shares."""
+    s = WalkedVWAPStrategy()
+    # 100 shares at fill_VWAP=0.50: fee = 0.0045 * 100 = $0.45
+    eff = s._effective_vwap_after_fees(fill_vwap=0.50, filled_shares=100.0)
+    # effective per-share = 0.50 + 0.45/100 = 0.5045
+    assert eff == pytest.approx(0.5045)
+
+
+def test_post_fee_effective_vwap_at_tail():
+    """At p=0.10, fee = (180/10000) * 0.1 * 0.9 * shares * 1.0 = 16.2 bps * shares."""
+    s = WalkedVWAPStrategy()
+    # 100 shares at fill_VWAP=0.10: fee = 0.00162 * 100 = $0.162
+    eff = s._effective_vwap_after_fees(fill_vwap=0.10, filled_shares=100.0)
+    # effective per-share = 0.10 + 0.162/100 = 0.10162
+    assert eff == pytest.approx(0.10162)
+
+
+def test_post_fee_effective_vwap_zero_shares():
+    s = WalkedVWAPStrategy()
+    eff = s._effective_vwap_after_fees(fill_vwap=0.5, filled_shares=0.0)
+    assert eff == 0.5  # no fee on zero shares; preserve fill_vwap
+
+
+def test_post_fee_effective_vwap_at_extremes():
+    """p=0 or p=1 → no fee per fees.py rules."""
+    s = WalkedVWAPStrategy()
+    assert s._effective_vwap_after_fees(0.0, 100.0) == 0.0
+    assert s._effective_vwap_after_fees(1.0, 100.0) == 1.0

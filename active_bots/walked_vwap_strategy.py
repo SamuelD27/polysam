@@ -15,9 +15,11 @@ experiments/backtest/replay_executor.py.
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from typing import Any
 
 from .refined_strategy import RefinedStrategy
+from .execution.fees import CATEGORIES, fee_usdc
 from .execution.live_book_state import (
     LiveBookState,
     MarketBooks,
@@ -84,3 +86,24 @@ class WalkedVWAPStrategy(RefinedStrategy):
         if book is None or not book.has_baseline:
             return WalkResult("unfilled", 0.0, requested_shares, None, 0)
         return walk_for_vwap(book.asks, requested_shares)
+
+    def _effective_vwap_after_fees(
+        self,
+        fill_vwap: float,
+        filled_shares: float,
+    ) -> float:
+        """Per-share entry cost including the Polymarket bell-curve taker fee.
+
+        Effective price = fill_vwap + fee_usdc / filled_shares (signed for the
+        BUY side: paying more per share). Symmetric around p=0.50; zero at the
+        extremes per fees.py.
+        """
+        if filled_shares <= 0:
+            return fill_vwap
+        category = CATEGORIES.get(FEE_CATEGORY, CATEGORIES["crypto"])
+        fee = fee_usdc(
+            p=Decimal(str(fill_vwap)),
+            shares=Decimal(str(filled_shares)),
+            category=category,
+        )
+        return fill_vwap + float(fee) / filled_shares
