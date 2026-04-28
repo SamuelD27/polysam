@@ -14,17 +14,18 @@ LiveCurvesWidget   { border: round #475569; padding: 0 1; }
 MainStrategyWidget { border: round #06b6d4; padding: 0 1; }
 OrderbookWidget    { border: round #475569; padding: 0 1; }
 
-#bottom-right { layout: grid; grid-size: 1 2; grid-rows: 4 1fr; }
-BaselinesWidget { border: round #475569; padding: 0 1; height: 4; }
+#bottom-right { layout: grid; grid-size: 1 2; grid-rows: 5 1fr; }
+BaselinesWidget { border: round #475569; padding: 0 1; height: 5; }
 OrdersLogWidget { border: round #475569; padding: 0 1; }
 
 #hero-prices { height: 3; content-align: center middle; text-style: bold; }
 #chart-btc, #chart-mkt { height: 1fr; }
 
-#refined-headline, #refined-secondary { height: 2; }
+#walked-headline, #walked-secondary { height: 2; }
+#walked-rejects   { height: 1; }
 #chart-pnl        { height: 5; }
-#refined-position { height: 3; }
-#refined-trades   { height: 1fr; }
+#walked-position  { height: 3; }
+#walked-trades    { height: 1fr; }
 
 #book-hdr   { height: 2; }
 #book-table { height: 1fr; }

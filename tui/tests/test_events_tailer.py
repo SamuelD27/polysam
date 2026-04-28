@@ -29,6 +29,29 @@ def test_tailer_picks_up_initial_events(tmp_path):
     assert len(t.unified_actions) == 1
 
 
+def test_tailer_routes_walked_vwap_events(tmp_path):
+    """Events with strategy='walked_vwap' must populate walked_actions."""
+    p = tmp_path / "events.jsonl"
+    _write(p, [
+        {"ts": 1, "type": "entry_filled", "strategy": "walked_vwap",
+         "position": {"side": "Up", "entry_price": 0.4, "size_usdc": 10}},
+        {"ts": 2, "type": "exit_filled", "strategy": "walked_vwap",
+         "trade": {"side": "Up", "exit_price": 0.55, "size_usdc": 10,
+                   "pnl": 1.5, "exit_type": "TP"}},
+    ])
+    t = d.EventsTailer(p)
+    t.update()
+    assert len(t.walked_actions) == 2
+    # walked_vwap events must NOT leak into the other per-strategy deques.
+    assert len(t.base_actions) == 0
+    assert len(t.enh_actions) == 0
+    assert len(t.refined_actions) == 0
+    # PnL series keyed by strategy field handles walked_vwap automatically.
+    assert list(t.pnl_series["walked_vwap"]) == [(2.0, 1.5)]
+    # Both events still flow into the unified stream.
+    assert len(t.unified_actions) == 2
+
+
 def test_tailer_picks_up_appended_events(tmp_path):
     p = tmp_path / "events.jsonl"
     _write(p, [

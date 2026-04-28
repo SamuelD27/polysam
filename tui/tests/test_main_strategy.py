@@ -21,7 +21,7 @@ def test_main_none_state_shows_waiting():
 
 
 def test_main_empty_strategy_blob_does_not_crash():
-    """state.refined missing entirely -- every field is None / 0."""
+    """state.walked_vwap missing entirely -- every field is None / 0."""
     w = _mk_widget()
     w.render_state(
         {"slug": "x", "t_zero": 0, "market_price_up": None},
@@ -31,13 +31,13 @@ def test_main_empty_strategy_blob_does_not_crash():
     assert w.query_one.call_count >= 1
 
 
-def test_main_populated_refined_with_open_position():
+def test_main_populated_walked_vwap_with_open_position():
     w = _mk_widget()
     state = {
         "slug": "btc-updown-5m-x",
         "t_zero": 1776912300,
         "market_price_up": 0.65,
-        "refined": {
+        "walked_vwap": {
             "fair_price": 0.72,
             "open_position": {
                 "side": "Up", "entry_price": 0.60, "size_usdc": 10.0,
@@ -61,6 +61,45 @@ def test_main_populated_refined_with_open_position():
         c for c in w.query_one.call_args_list if "chart-pnl" in str(c.args)
     ]
     assert chart_calls, "pnl chart render was not called"
+
+
+def test_render_rejects_renders_count_and_top_reasons():
+    """Reject summary: count + top 3 reasons + last_walked_edge colouring."""
+    w = _mk_widget()
+    static_mock = MagicMock()
+    w.query_one = MagicMock(return_value=static_mock)
+    w._render_rejects({
+        "reject_count": 7,
+        "reject_reasons": {
+            "vwap_no_quote": 4,
+            "abs_edge_too_small": 2,
+            "stale_book": 1,
+            "tiny_extra": 0,
+        },
+        "last_walked_edge": -0.0123,
+    })
+    # The Static was updated with a Text containing rejects + reasons + edge.
+    static_mock.update.assert_called()
+    rendered = str(static_mock.update.call_args.args[0])
+    assert "rejects: 7" in rendered
+    assert "vwap_no_quote=4" in rendered
+    assert "abs_edge_too_small=2" in rendered
+    assert "stale_book=1" in rendered
+    # Only top 3 should appear -- "tiny_extra" is the 4th and must be excluded.
+    assert "tiny_extra" not in rendered
+    assert "last walked_edge" in rendered
+    assert "-0.0123" in rendered
+
+
+def test_render_rejects_handles_empty_extra():
+    """Empty extra: rejects: 0, no reasons, no last_walked_edge segment."""
+    w = _mk_widget()
+    static_mock = MagicMock()
+    w.query_one = MagicMock(return_value=static_mock)
+    w._render_rejects({})
+    rendered = str(static_mock.update.call_args.args[0])
+    assert "rejects: 0" in rendered
+    assert "last walked_edge" not in rendered
 
 
 def test_pnl_chart_colour_flat_uses_white():

@@ -322,6 +322,7 @@ class EventsTailer:
         self.base_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.enh_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.refined_actions: deque[dict] = deque(maxlen=ACTION_CAP)
+        self.walked_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.unified_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.pnl_series: dict[str, list[tuple[float, float]]] = {}
         self._cum: dict[str, float] = {}
@@ -337,6 +338,8 @@ class EventsTailer:
                 self.enh_actions.append(action)
             elif strat == "refined":
                 self.refined_actions.append(action)
+            elif strat == "walked_vwap":
+                self.walked_actions.append(action)
             self.unified_actions.append(action)
 
         # Per-strategy cumulative PnL -- only realized events count.
@@ -475,7 +478,7 @@ class LiveCurvesWidget(Container):
         mkt = state.get("market_price_up")
         if isinstance(mkt, (int, float)):
             self._mkt.append((now, float(mkt)))
-        fair = (state.get("refined") or {}).get("fair_price")
+        fair = (state.get("walked_vwap") or {}).get("fair_price")
         if isinstance(fair, (int, float)):
             self._fair.append((now, float(fair)))
 
@@ -551,15 +554,16 @@ class MainStrategyWidget(Container):
     TRADES_COLUMNS = ("t", "side", "in->out", "size", "pnl", "ROI", "why", "hold")
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="refined-headline")
-        yield Static("", id="refined-secondary")
+        yield Static("", id="walked-headline")
+        yield Static("", id="walked-secondary")
+        yield Static("", id="walked-rejects")
         yield PlotextPlot(id="chart-pnl")
-        yield Static("no position", id="refined-position")
-        yield DataTable(id="refined-trades", zebra_stripes=False,
+        yield Static("no position", id="walked-position")
+        yield DataTable(id="walked-trades", zebra_stripes=False,
                         cursor_type="none")
 
     def on_mount(self) -> None:
-        tbl = self.query_one("#refined-trades", DataTable)
+        tbl = self.query_one("#walked-trades", DataTable)
         for col in self.TRADES_COLUMNS:
             tbl.add_column(col, key=col)
 
@@ -569,12 +573,12 @@ class MainStrategyWidget(Container):
         pnl_series: list[tuple[float, float]],
     ) -> None:
         if state is None:
-            self.query_one("#refined-headline", Static).update(
+            self.query_one("#walked-headline", Static).update(
                 "[dim]waiting for state.json[/]"
             )
             return
 
-        blob = state.get("refined") or {}
+        blob = state.get("walked_vwap") or {}
         stats = _compute_stats(blob.get("stats") or {})
         extra = blob.get("extra") or {}
         fair = blob.get("fair_price")
@@ -582,6 +586,7 @@ class MainStrategyWidget(Container):
 
         self._render_headline(state, stats)
         self._render_secondary(fair, mkt, extra)
+        self._render_rejects(extra)
         self._render_pnl_chart(pnl_series)
         self._render_position(blob.get("open_position"), mkt)
         self._render_trades(blob.get("closed_trades") or [])
@@ -600,6 +605,8 @@ class MainStrategyWidget(Container):
             )
         else:
             line1.append(f"Market: {slug}", style="bold")
+        line1.append("   ")
+        line1.append("walked_vwap (candidate)", style="bold #06b6d4")
 
         line2 = Text()
         line2.append(f"PnL {stats['total_pnl']:+.2f}  ",
@@ -614,7 +621,7 @@ class MainStrategyWidget(Container):
         st_style = "green" if st == "W" else "red" if st == "L" else "#94a3b8"
         line2.append(f"streak {stats['streak']} {st or '-'}", style=st_style)
 
-        self.query_one("#refined-headline", Static).update(
+        self.query_one("#walked-headline", Static).update(
             Text("\n").join([line1, line2])
         )
 
@@ -636,7 +643,23 @@ class MainStrategyWidget(Container):
             f"{extra.get('sl_count',0)}/{extra.get('resolution_count',0)}",
             style="white",
         )
-        self.query_one("#refined-secondary", Static).update(sec)
+        self.query_one("#walked-secondary", Static).update(sec)
+
+    def _render_rejects(self, extra: dict) -> None:
+        ct = int(extra.get("reject_count") or 0)
+        reasons = extra.get("reject_reasons") or {}
+        top3 = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
+        line = Text()
+        line.append(f"rejects: {ct}  ", style="dim" if ct == 0 else "yellow")
+        for r, n in top3:
+            line.append(f"{r}={n}  ", style="dim")
+        last_we = extra.get("last_walked_edge")
+        if isinstance(last_we, (int, float)):
+            line.append(
+                f"  last walked_edge {last_we:+.4f}",
+                style="green" if last_we > 0 else "red",
+            )
+        self.query_one("#walked-rejects", Static).update(line)
 
     def _render_pnl_chart(self, pnl_series) -> None:
         plot = self.query_one("#chart-pnl", PlotextPlot)
@@ -660,16 +683,16 @@ class MainStrategyWidget(Container):
                 pad = (hi - lo) * 0.1
                 plt.ylim(lo - pad, hi + pad)
             plt.title(
-                f"refined PnL  session ${session_total:+.2f}  "
+                f"walked_vwap PnL  session ${session_total:+.2f}  "
                 f"(viewing last {len(visible)})"
             )
         else:
-            plt.title("refined PnL  (no trades)")
+            plt.title("walked_vwap PnL  (no trades)")
         plot.refresh()
 
     def _render_position(self, pos, mkt) -> None:
         if not pos:
-            self.query_one("#refined-position", Static).update(
+            self.query_one("#walked-position", Static).update(
                 Text("no position", style="dim")
             )
             return
@@ -687,10 +710,10 @@ class MainStrategyWidget(Container):
             favor = realizable - entry
             t.append(f"  realizable {realizable:.3f}  favor {favor:+.3f}",
                      style=pnl_color(favor))
-        self.query_one("#refined-position", Static).update(t)
+        self.query_one("#walked-position", Static).update(t)
 
     def _render_trades(self, closed_trades) -> None:
-        tbl = self.query_one("#refined-trades", DataTable)
+        tbl = self.query_one("#walked-trades", DataTable)
         tbl.clear()
         trades = closed_trades[-RECENT_TRADES_CAP:]
         for tr in reversed(trades):
@@ -790,14 +813,18 @@ class OrderbookWidget(Container):
 
 
 class BaselinesWidget(Static):
-    """Two-line paper-benchmark banner: BASE + ENHANCED stats."""
+    """Three-line paper-benchmark banner: BASE + ENHANCED + REFINED stats."""
 
     def render_state(self, state: dict | None) -> None:
         if state is None:
             self.update("[dim]baselines: waiting[/]")
             return
         lines: list[Text] = []
-        for key, label in (("base", "BASE    "), ("enhanced", "ENHANCED")):
+        for key, label in (
+            ("base", "BASE    "),
+            ("enhanced", "ENHANCED"),
+            ("refined", "REFINED "),
+        ):
             blob = state.get(key) or {}
             stats = _compute_stats(blob.get("stats") or {})
             line = Text()
@@ -929,11 +956,11 @@ class DashboardApp(App):
         self.query_one(LiveCurvesWidget).render_state(state)
         self.query_one(MainStrategyWidget).render_state(
             state,
-            self.tailer.pnl_series.get("refined", []),
+            self.tailer.pnl_series.get("walked_vwap", []),
         )
         self.query_one(OrderbookWidget).render_snapshot(snap)
         self.query_one(BaselinesWidget).render_state(state)
-        self.query_one(OrdersLogWidget).ingest(self.tailer.refined_actions)
+        self.query_one(OrdersLogWidget).ingest(self.tailer.walked_actions)
 
 
 def main() -> int:

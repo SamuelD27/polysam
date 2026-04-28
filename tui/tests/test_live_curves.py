@@ -29,7 +29,7 @@ def test_live_curves_appends_to_deques():
         "t_zero": 1000,
         "btc_price": 50000.0,
         "market_price_up": 0.55,
-        "refined": {"fair_price": 0.62},
+        "walked_vwap": {"fair_price": 0.62},
     })
     assert len(w._btc) == 1 and w._btc[0][1] == 50000.0
     assert len(w._mkt) == 1 and w._mkt[0][1] == 0.55
@@ -55,15 +55,15 @@ def test_live_curves_clears_on_rollover():
     w = _mk_widget()
     w.render_state({"t_zero": 1000, "btc_price": 50000.0,
                     "market_price_up": 0.5,
-                    "refined": {"fair_price": 0.6}})
+                    "walked_vwap": {"fair_price": 0.6}})
     w.render_state({"t_zero": 1000, "btc_price": 50001.0,
                     "market_price_up": 0.51,
-                    "refined": {"fair_price": 0.61}})
+                    "walked_vwap": {"fair_price": 0.61}})
     assert len(w._btc) == 2
     # Market rollover -- t_zero changes
     w.render_state({"t_zero": 2000, "btc_price": 50002.0,
                     "market_price_up": 0.52,
-                    "refined": {"fair_price": 0.62}})
+                    "walked_vwap": {"fair_price": 0.62}})
     assert len(w._btc) == 1, "deques must reset on rollover"
     assert len(w._mkt) == 1
     assert len(w._fair) == 1
