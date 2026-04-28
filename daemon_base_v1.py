@@ -911,8 +911,12 @@ def _dispatch_book_message(msg: dict, token_index: dict, ts_ms: int) -> None:
 async def clob_book_feed(state: DaemonState):
     """Subscribe to YES+NO books for the current+next slugs.
 
-    Re-subscribes on rollover. State is fed via _dispatch_book_message into
-    state.token_index; the strategy_loop reads via state.books_by_slug.
+    Re-subscribes on (a) WS reconnect and (b) market rollover during an
+    active WS session. The inner consume loop polls state.t_zero every 1s
+    via asyncio.wait_for so a rollover triggers a graceful close +
+    resubscribe within ~1s of t_zero changing, even if the WS is silent.
+    State is fed via _dispatch_book_message into state.token_index; the
+    strategy_loop reads via state.books_by_slug.
     """
     subscribed_slug: int | None = None  # t_zero we last subscribed to
     while True:
@@ -952,7 +956,14 @@ async def clob_book_feed(state: DaemonState):
                     separators=(",", ":"),
                 )
                 await ws.send(sub)
-                async for raw in ws:
+                # Poll t_zero every 1s. SHUTDOWN_TIMEOUT_S is 5s so a 1s
+                # recv timeout keeps shutdown / rollover detection latency
+                # well inside the launcher's stop budget.
+                while state.t_zero == subscribed_slug:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
                     try:
                         payload = json.loads(raw)
                     except (TypeError, ValueError):
@@ -962,6 +973,13 @@ async def clob_book_feed(state: DaemonState):
                     for m in msgs:
                         if isinstance(m, dict):
                             _dispatch_book_message(m, state.token_index, ts_ms)
+                # t_zero rolled — fall out of `async with`; ws closes
+                # gracefully and the outer loop resubscribes for the new
+                # market without going through the disconnect/2s-sleep path.
+                logger.info(
+                    "CLOB book: t_zero rolled %s -> %s, closing WS to resubscribe",
+                    subscribed_slug, state.t_zero,
+                )
         except (websockets.ConnectionClosed, OSError) as e:
             state.connections["clob_book"] = False
             logger.warning("CLOB book WS disconnected: %s; reconnecting in 2s", e)
