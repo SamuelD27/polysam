@@ -31,6 +31,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 from active_bots.enhanced_strategy import EnhancedStrategy
 from active_bots.refined_strategy import RefinedStrategy
+from active_bots.walked_vwap_strategy import WalkedVWAPStrategy
 from active_bots.execution import Executor, MarketCtx
 from active_bots.execution.event_logger import EventLogger
 from active_bots.execution.live_book_state import LiveBookState, MarketBooks
@@ -532,6 +533,36 @@ class DaemonState:
             "edge_trades": 0,
         }
 
+        # Walked-VWAP strategy state (new candidate; gates entries on book)
+        self.walked_fair_price = None
+        self.walked_position = None
+        self.walked_trades = []
+        self.walked_stats = {
+            "total_pnl": 0.0,
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "max_drawdown": 0.0,
+            "current_drawdown": 0.0,
+            "high_water_mark": 0.0,
+            "current_streak": 0,
+            "streak_type": None,
+            "start_time": time.time(),
+            "total_risked": 0.0,
+        }
+        self.walked_extra = {
+            "last_exit_type": None,
+            "last_time_zone": None,
+            "last_source": None,
+            "tp_count": 0,
+            "sl_count": 0,
+            "resolution_count": 0,
+            "edge_trades": 0,
+            "reject_count": 0,
+            "reject_reasons": {},  # reason -> count
+            "last_walked_edge": None,
+        }
+
         self.connections = {"binance": False, "rtds": False}
 
         # Per-slug book registry — populated by clob_book_feed.
@@ -567,6 +598,7 @@ class DaemonState:
             self.base_fair_price = None
             self.enh_fair_price = None
             self.refined_fair_price = None
+            self.walked_fair_price = None
             return old_t_zero is not None
         return False
 
@@ -578,6 +610,7 @@ class DaemonState:
         self.base_fair_price = fair
         self.enh_fair_price = fair
         self.refined_fair_price = fair
+        self.walked_fair_price = fair
 
     def to_dict(self) -> dict:
         return {
@@ -610,6 +643,13 @@ class DaemonState:
                 "closed_trades": self.refined_trades,
                 "stats": self.refined_stats,
                 "extra": self.refined_extra,
+            },
+            "walked_vwap": {
+                "fair_price": self.walked_fair_price,
+                "open_position": self.walked_position,
+                "closed_trades": self.walked_trades,
+                "stats": self.walked_stats,
+                "extra": self.walked_extra,
             },
             "last_update": time.time(),
         }
@@ -1032,6 +1072,7 @@ async def strategy_loop(
     )
     enh = EnhancedStrategy(max_risk=max_risk)
     refined = RefinedStrategy(max_risk=max_risk)
+    walked = WalkedVWAPStrategy(max_risk=max_risk)
     market_ctx: MarketCtx | None = None
 
     def refresh_market_ctx() -> MarketCtx | None:
@@ -1142,9 +1183,38 @@ async def strategy_loop(
                         )
                     state.refined_position = None
 
+                if state.walked_position is not None:
+                    if state.btc_price > 0 and prev_ctx is not None:
+                        result = executor.resolve(
+                            state.walked_position, prev_ctx, now,
+                            btc_price=state.btc_price,
+                        )
+                        if result is not None:
+                            trade = result.to_trade_dict()
+                            update_stats(state.walked_stats, trade)
+                            risk.record_trade(trade["pnl"], trade.get("resolved_time"))
+                            state.walked_trades.append(trade)
+                            if len(state.walked_trades) > MAX_CLOSED_TRADES:
+                                state.walked_trades = state.walked_trades[-MAX_CLOSED_TRADES:]
+                            state.walked_extra["resolution_count"] += 1
+                            state.walked_extra["last_exit_type"] = "RESOLUTION"
+                            outcome = "WIN" if trade["won"] else "LOSS"
+                            events.log("resolve", strategy="walked_vwap", trade=trade, trigger="rollover")
+                            logger.info(
+                                "WALKED_VWAP RESOLVED [%s] %s %s PnL=%+.2f",
+                                outcome, trade["side"], trade["slug"], trade["pnl"],
+                            )
+                    else:
+                        logger.warning(
+                            "Cannot resolve walked_vwap position %s -- no BTC price or ctx",
+                            state.walked_position.get("slug"),
+                        )
+                    state.walked_position = None
+
                 # Reset strategies for new market
                 enh.reset(t_zero=state.t_zero, strike=state.strike)
                 refined.reset(t_zero=state.t_zero, strike=state.strike)
+                walked.reset(t_zero=state.t_zero, strike=state.strike)
                 market_ctx = refresh_market_ctx()
                 events.log(
                     "market_rollover",
@@ -1352,6 +1422,89 @@ async def strategy_loop(
                                     slug=state.slug,
                                 )
 
+            # ── Walked-VWAP strategy tick ──
+            if (
+                state.sigma and state.btc_price > 0
+                and state.walked_position is None
+                and market_ctx is not None
+            ):
+                market_up = state.market_price_up
+                if market_up is not None:
+                    books = state.books_by_slug.get(state.slug)
+                    walked_action = walked.on_tick(
+                        state.btc_price, market_up, state.sigma, state.t_zero,
+                        market_price_ts=state.market_price_ts,
+                        books=books,
+                    )
+                    if walked_action is not None:
+                        action_type = walked_action.get("action")
+
+                        if action_type == "ENTER":
+                            tz = walked_action.get("time_zone")
+                            events.log(
+                                "entry_signal",
+                                strategy="walked_vwap", source="edge",
+                                side=walked_action.get("side"),
+                                entry_price=walked_action.get("entry_price"),
+                                edge=walked_action.get("edge"),
+                                size_usdc=walked_action.get("size_usdc"),
+                                time_zone=tz, offset=offset, slug=state.slug,
+                                walked_VWAP=walked_action.get("walked_VWAP"),
+                                effective_VWAP=walked_action.get("effective_VWAP"),
+                                walked_edge=walked_action.get("walked_edge"),
+                                book_top_size_take=walked_action.get("book_top_size_take"),
+                                book_top_size_make=walked_action.get("book_top_size_make"),
+                                spread_at_entry=walked_action.get("spread_at_entry"),
+                                book_staleness_at_entry_ms=walked_action.get(
+                                    "book_staleness_at_entry_ms"
+                                ),
+                            )
+                            state.walked_extra["last_walked_edge"] = walked_action.get("walked_edge")
+                            result = executor.enter(
+                                walked_action, market_ctx, now, source="edge",
+                            )
+                            if result is not None:
+                                result.ack_ts = time.time()
+                                state.walked_position = result.to_position_dict()
+                                state.walked_extra["edge_trades"] += 1
+                                state.walked_extra["last_source"] = "edge"
+                                state.walked_extra["last_time_zone"] = tz
+                                events.log(
+                                    "entry_filled",
+                                    strategy="walked_vwap", source="edge",
+                                    position=result.to_position_dict(),
+                                    order_id=result.order_id, token_id=result.token_id,
+                                    fill_details=result.fill_details,
+                                )
+                                logger.info(
+                                    "WALKED_VWAP ENTRY %s %s @%.3f edge=%.3f $%.2f tz=%s",
+                                    result.side, result.slug, result.entry_price,
+                                    result.edge, result.size_usdc, tz,
+                                )
+                            else:
+                                events.log(
+                                    "entry_rejected",
+                                    strategy="walked_vwap", source="edge",
+                                    side=walked_action.get("side"),
+                                    slug=state.slug,
+                                    reason="executor_rejected",
+                                )
+
+                        elif action_type == "WALKED_VWAP_REJECT":
+                            reason = walked_action.get("reject_reason", "unknown")
+                            state.walked_extra["reject_count"] += 1
+                            counts = state.walked_extra["reject_reasons"]
+                            counts[reason] = counts.get(reason, 0) + 1
+                            state.walked_extra["last_walked_edge"] = walked_action.get("walked_edge")
+                            events.log(
+                                "entry_rejected",
+                                strategy="walked_vwap", source="edge",
+                                slug=state.slug,
+                                reason=reason,
+                                **{k: v for k, v in walked_action.items()
+                                   if k not in ("action", "reject_reason")},
+                            )
+
             # ── Refined: check profit grabber / resolution ──
             if (
                 state.refined_position is not None and state.sigma
@@ -1419,6 +1572,68 @@ async def strategy_loop(
                                 outcome, trade["side"], trade["slug"], trade["pnl"],
                             )
                         state.refined_position = None
+
+            # ── Walked-VWAP: TP/SL/RESOLVE ──
+            if (
+                state.walked_position is not None and state.sigma
+                and state.btc_price > 0 and market_ctx is not None
+            ):
+                books = state.books_by_slug.get(state.slug)
+                walked_action = walked.on_tick(
+                    state.btc_price, state.market_price_up or 0.5, state.sigma,
+                    state.t_zero, market_price_ts=state.market_price_ts,
+                    books=books,
+                )
+                if walked_action is not None:
+                    action_type = walked_action.get("action")
+                    if action_type in ("EXIT_TP", "EXIT_SL"):
+                        result = executor.exit(
+                            state.walked_position, walked_action, market_ctx, now,
+                            btc_price=state.btc_price,
+                        )
+                        if result is not None:
+                            trade = result.to_trade_dict()
+                            update_stats(state.walked_stats, trade)
+                            risk.record_trade(trade["pnl"], trade.get("resolved_time"))
+                            state.walked_trades.append(trade)
+                            if len(state.walked_trades) > MAX_CLOSED_TRADES:
+                                state.walked_trades = state.walked_trades[-MAX_CLOSED_TRADES:]
+                            if result.exit_type == "TP":
+                                state.walked_extra["tp_count"] += 1
+                            else:
+                                state.walked_extra["sl_count"] += 1
+                            state.walked_extra["last_exit_type"] = result.exit_type
+                            state.walked_position = None
+                            events.log(
+                                "exit_filled", strategy="walked_vwap", trade=trade,
+                                fill_details=result.fill_details,
+                            )
+                            logger.info(
+                                "WALKED_VWAP %s %s %s PnL=%+.2f hold=%.0fs",
+                                result.exit_type, result.side, result.slug,
+                                result.pnl, result.hold_time_s or 0,
+                            )
+                    elif action_type == "RESOLVE":
+                        result = executor.resolve(
+                            state.walked_position, market_ctx, now,
+                            btc_price=state.btc_price,
+                        )
+                        if result is not None:
+                            trade = result.to_trade_dict()
+                            update_stats(state.walked_stats, trade)
+                            risk.record_trade(trade["pnl"], trade.get("resolved_time"))
+                            state.walked_trades.append(trade)
+                            if len(state.walked_trades) > MAX_CLOSED_TRADES:
+                                state.walked_trades = state.walked_trades[-MAX_CLOSED_TRADES:]
+                            state.walked_extra["resolution_count"] += 1
+                            state.walked_extra["last_exit_type"] = "RESOLUTION"
+                            outcome = "WIN" if trade["won"] else "LOSS"
+                            events.log("resolve", strategy="walked_vwap", trade=trade)
+                            logger.info(
+                                "WALKED_VWAP RESOLVED [%s] %s %s PnL=%+.2f",
+                                outcome, trade["side"], trade["slug"], trade["pnl"],
+                            )
+                        state.walked_position = None
 
             # ── Base strategy: simple edge entry at T+120..T+150 ──
             if ENTRY_OFFSET <= offset <= ENTRY_CUTOFF and state.base_position is None:
