@@ -225,3 +225,6 @@ experiments/backtest/runs/*.csv
 tui/target/
 tui/**/target/
 **/*.rlib
+
+# Git worktrees (parallel-execution scratch dirs)
+.worktrees/
