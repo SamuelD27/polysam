@@ -303,3 +303,42 @@ def test_gate_rejects_nan_walked_vwap(monkeypatch):
     assert out["action"] == "WALKED_VWAP_REJECT"
     # Reuses empty_book reason — no new vocabulary
     assert out["reject_reason"] == "empty_book"
+
+
+def test_partial_fill_off_rejects(monkeypatch):
+    """PARTIAL_OK=False: book can't fill full size → reject."""
+    monkeypatch.setattr("active_bots.walked_vwap_strategy.WALKED_VWAP_PARTIAL_OK", False)
+    monkeypatch.setattr("active_bots.walked_vwap_strategy.MIN_TOP_OF_BOOK_SHARES_RATIO", 0.0)
+    s, mb = _make_strategy_with_books(
+        yes_asks=[{"price": "0.30", "size": "5"}],  # 5 shares avail, want 16.67
+    )
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "WALKED_VWAP_REJECT"
+    assert out["reject_reason"] == "partial_fill_disallowed"
+
+
+def test_partial_fill_on_downsizes(monkeypatch):
+    """PARTIAL_OK=True: fill what we can, downsize entry."""
+    monkeypatch.setattr("active_bots.walked_vwap_strategy.WALKED_VWAP_PARTIAL_OK", True)
+    monkeypatch.setattr("active_bots.walked_vwap_strategy.MIN_TOP_OF_BOOK_SHARES_RATIO", 0.0)
+    s, mb = _make_strategy_with_books(
+        yes_asks=[{"price": "0.30", "size": "5"}],
+    )
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "ENTER"
+    assert out["size_shares"] == pytest.approx(5.0)
+    assert out["walked_VWAP"] == pytest.approx(0.30)
