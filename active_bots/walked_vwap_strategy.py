@@ -18,7 +18,12 @@ import os
 from typing import Any
 
 from .refined_strategy import RefinedStrategy
-from .execution.live_book_state import MarketBooks
+from .execution.live_book_state import (
+    LiveBookState,
+    MarketBooks,
+    WalkResult,
+    walk_for_vwap,
+)
 
 # Defaults — env overridable per project convention.
 MARKET_PRICE_MAX_STALENESS_S = float(
@@ -62,3 +67,20 @@ class WalkedVWAPStrategy(RefinedStrategy):
             return action
         # B4 implements the actual gate; for now, no-op pass-through.
         return action
+
+    def _walked_vwap_for_entry(
+        self,
+        side: str,
+        requested_shares: float,
+        books: MarketBooks,
+    ) -> WalkResult:
+        """Walk the appropriate token's asks for an entry of side ('Up'|'Down')."""
+        if side == "Up":
+            book = books.yes
+        elif side == "Down":
+            book = books.no
+        else:
+            return WalkResult("unfilled", 0.0, requested_shares, None, 0)
+        if book is None or not book.has_baseline:
+            return WalkResult("unfilled", 0.0, requested_shares, None, 0)
+        return walk_for_vwap(book.asks, requested_shares)

@@ -55,3 +55,57 @@ def test_books_kwarg_accepted():
     )
     # Empty books at p=0.50 with no fair-price edge: returns None (no entry signal upstream).
     assert out is None
+
+
+def test_walked_vwap_for_action_up():
+    """side=Up → consumes books.yes.asks."""
+    s = WalkedVWAPStrategy()
+    yes = LiveBookState(tick_size=0.01)
+    yes.apply_snapshot(
+        bids=[{"price": "0.40", "size": "10"}],
+        asks=[{"price": "0.42", "size": "8"}, {"price": "0.43", "size": "20"}],
+        ts_ms=1000,
+    )
+    no = LiveBookState(tick_size=0.01)
+    mb = MarketBooks(yes=yes, no=no)
+    res = s._walked_vwap_for_entry(
+        side="Up", requested_shares=10.0, books=mb,
+    )
+    # 8 @ 0.42 + 2 @ 0.43 = 10 shares; VWAP = 0.422
+    assert res.classification == "full"
+    assert res.vwap == pytest.approx(0.422)
+
+
+def test_walked_vwap_for_action_down():
+    """side=Down → consumes books.no.asks."""
+    s = WalkedVWAPStrategy()
+    yes = LiveBookState(tick_size=0.01)
+    no = LiveBookState(tick_size=0.01)
+    no.apply_snapshot(
+        bids=[{"price": "0.55", "size": "10"}],
+        asks=[{"price": "0.58", "size": "5"}, {"price": "0.59", "size": "20"}],
+        ts_ms=1000,
+    )
+    mb = MarketBooks(yes=yes, no=no)
+    res = s._walked_vwap_for_entry(
+        side="Down", requested_shares=10.0, books=mb,
+    )
+    # 5 @ 0.58 + 5 @ 0.59 = 10 shares; VWAP = (5*0.58 + 5*0.59)/10 = 0.585
+    assert res.classification == "full"
+    assert res.vwap == pytest.approx(0.585)
+
+
+def test_walked_vwap_partial():
+    s = WalkedVWAPStrategy()
+    yes = LiveBookState(tick_size=0.01)
+    yes.apply_snapshot(
+        bids=[],
+        asks=[{"price": "0.42", "size": "5"}],
+        ts_ms=1000,
+    )
+    no = LiveBookState(tick_size=0.01)
+    mb = MarketBooks(yes=yes, no=no)
+    res = s._walked_vwap_for_entry(side="Up", requested_shares=10.0, books=mb)
+    assert res.classification == "partial"
+    assert res.filled_shares == pytest.approx(5.0)
+    assert res.residual_shares == pytest.approx(5.0)
