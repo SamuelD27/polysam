@@ -140,3 +140,166 @@ def test_post_fee_effective_vwap_at_extremes():
     s = WalkedVWAPStrategy()
     assert s._effective_vwap_after_fees(0.0, 100.0) == 0.0
     assert s._effective_vwap_after_fees(1.0, 100.0) == 1.0
+
+
+def _make_strategy_with_books(
+    *,
+    yes_asks=None, yes_bids=None,
+    no_asks=None, no_bids=None,
+    yes_ts_ms=1000, no_ts_ms=1000,
+):
+    yes = LiveBookState(tick_size=0.01)
+    yes.apply_snapshot(
+        bids=yes_bids or [], asks=yes_asks or [], ts_ms=yes_ts_ms,
+    )
+    no = LiveBookState(tick_size=0.01)
+    no.apply_snapshot(
+        bids=no_bids or [], asks=no_asks or [], ts_ms=no_ts_ms,
+    )
+    return WalkedVWAPStrategy(), MarketBooks(yes=yes, no=no)
+
+
+def _refined_would_enter_action():
+    """Synthetic ENTER action shape RefinedStrategy returns."""
+    return {
+        "action": "ENTER",
+        "side": "Up",
+        "entry_price": 0.30,
+        "edge": 0.20,
+        "size_usdc": 5.0,
+        "size_shares": 16.6667,  # $5 at $0.30
+        "fair": 0.50,
+        "market": 0.30,
+        "time_zone": "sweet_spot",
+    }
+
+
+def test_gate_rejects_stale_market_price(monkeypatch):
+    s, mb = _make_strategy_with_books(
+        yes_asks=[{"price": "0.30", "size": "100"}],
+    )
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time() - 60,  # stale by 60s, threshold 30s
+        books=mb,
+    )
+    assert out is not None
+    assert out["action"] == "WALKED_VWAP_REJECT"
+    assert out["reject_reason"] == "stale_market_price"
+
+
+def test_gate_rejects_no_book_subscription(monkeypatch):
+    s = WalkedVWAPStrategy()
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=None,
+    )
+    assert out["action"] == "WALKED_VWAP_REJECT"
+    assert out["reject_reason"] == "no_book_subscription"
+
+
+def test_gate_rejects_empty_book(monkeypatch):
+    s, mb = _make_strategy_with_books(yes_asks=[])  # YES asks empty
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "WALKED_VWAP_REJECT"
+    assert out["reject_reason"] == "empty_book"
+
+
+def test_gate_rejects_insufficient_top_of_book(monkeypatch):
+    # Top of book has 5 shares; we want 16.67 → reject because
+    # MIN_TOP_OF_BOOK_SHARES_RATIO=1.0 means top must >= requested.
+    s, mb = _make_strategy_with_books(
+        yes_asks=[{"price": "0.30", "size": "5"}],
+    )
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "WALKED_VWAP_REJECT"
+    assert out["reject_reason"] == "insufficient_top_of_book"
+
+
+def test_gate_rejects_insufficient_walked_edge(monkeypatch):
+    # Big book at 0.49 (just below fair=0.50). Walked VWAP ≈ 0.49,
+    # post-fee ≈ 0.4945, walked_edge = 0.50 - 0.4945 = 0.0055 < 0.02 → reject.
+    s, mb = _make_strategy_with_books(
+        yes_asks=[{"price": "0.49", "size": "100"}],
+    )
+    action = _refined_would_enter_action()
+    action.update({"entry_price": 0.49, "fair": 0.50, "size_shares": 50.0})
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: action)
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.49, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "WALKED_VWAP_REJECT"
+    assert out["reject_reason"] == "insufficient_walked_edge"
+
+
+def test_gate_passes_when_all_checks_satisfy(monkeypatch):
+    # Big book at 0.30, fair=0.50, walked edge ≈ 0.20 minus tiny fees → passes.
+    s, mb = _make_strategy_with_books(
+        yes_asks=[{"price": "0.30", "size": "1000"}],
+    )
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "ENTER"
+    assert "walked_VWAP" in out
+    assert out["walked_VWAP"] == pytest.approx(0.30)
+    assert "walked_edge" in out
+    assert out["walked_edge"] > 0.02
+    assert "book_top_size_take" in out
+    assert out["book_top_size_take"] == pytest.approx(1000.0)
+    assert "spread_at_entry" in out
+    assert "book_staleness_at_entry_ms" in out
+
+
+def test_gate_rejects_nan_walked_vwap(monkeypatch):
+    """Reviewer-mandated: WS feeding NaN must reject, not silently pass."""
+    s = WalkedVWAPStrategy()
+    yes = LiveBookState(tick_size=0.01)
+    # Manually corrupt the asks list to simulate NaN-poisoned WS data
+    yes.apply_snapshot(
+        bids=[], asks=[{"price": "0.30", "size": "1000"}], ts_ms=1000,
+    )
+    yes.asks = [(float("nan"), 1000.0)]
+    no = LiveBookState(tick_size=0.01)
+    mb = MarketBooks(yes=yes, no=no)
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out is not None
+    assert out["action"] == "WALKED_VWAP_REJECT"
+    # Reuses empty_book reason — no new vocabulary
+    assert out["reject_reason"] == "empty_book"
