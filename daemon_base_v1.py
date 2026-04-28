@@ -33,6 +33,7 @@ from active_bots.enhanced_strategy import EnhancedStrategy
 from active_bots.refined_strategy import RefinedStrategy
 from active_bots.execution import Executor, MarketCtx
 from active_bots.execution.event_logger import EventLogger
+from active_bots.execution.live_book_state import LiveBookState, MarketBooks
 from active_bots.execution.paper_executor import PaperExecutor
 from active_bots.execution.risk_manager import RiskConfig, RiskManager
 
@@ -63,6 +64,10 @@ EWMA_WARMUP = 10
 
 WS_BINANCE = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 WS_RTDS = "wss://ws-live-data.polymarket.com"
+WS_CLOB_BOOK = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BOOK_WS_PING_INTERVAL_S = 15.0
+BOOK_WS_PING_TIMEOUT_S = 10.0
+BOOK_WS_STALE_S = 30.0
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 SLUG_PREFIX = "btc-updown-5m-"
 
@@ -529,6 +534,14 @@ class DaemonState:
 
         self.connections = {"binance": False, "rtds": False}
 
+        # Per-slug book registry — populated by clob_book_feed.
+        # books_by_slug[slug] = MarketBooks(yes=..., no=...)
+        self.books_by_slug: dict[str, "MarketBooks"] = {}
+        # Per-asset_id metadata for the WS dispatcher
+        # token_index[asset_id] = {"slug": str, "side": "yes"|"no", "book": LiveBookState}
+        self.token_index: dict[str, dict] = {}
+        self.connections["clob_book"] = False
+
     def current_offset(self) -> float:
         if not self.t_zero:
             return None
@@ -819,6 +832,137 @@ async def rtds_feed(state: DaemonState):
             await asyncio.sleep(1)
         except asyncio.CancelledError:
             return
+
+
+# ── CLOB book feed (walked-VWAP gate input) ────────────────────────────
+
+def _dispatch_book_message(msg: dict, token_index: dict, ts_ms: int) -> None:
+    """Apply one CLOB WS message to the per-asset token_index."""
+    et = msg.get("event_type", "")
+    if et in ("book", "snapshot"):
+        aid = msg.get("asset_id")
+        slot = token_index.get(aid)
+        if not slot:
+            return
+        slot["book"].apply_snapshot(
+            bids=msg.get("bids", []),
+            asks=msg.get("asks", []),
+            ts_ms=ts_ms,
+        )
+    elif et == "price_change":
+        for delta in msg.get("price_changes", []):
+            aid = delta.get("asset_id")
+            slot = token_index.get(aid)
+            if not slot:
+                continue
+            slot["book"].apply_delta(delta, ts_ms=ts_ms)
+    elif et == "tick_size_change":
+        aid = msg.get("asset_id")
+        slot = token_index.get(aid)
+        if not slot:
+            return
+        try:
+            slot["book"].tick_size = float(msg.get("new_tick_size") or 0)
+        except (TypeError, ValueError):
+            pass
+    # last_trade_price / best_bid_ask / etc. — ignored for the gate
+
+
+async def clob_book_feed(state: DaemonState):
+    """Subscribe to YES+NO books for the current+next slugs.
+
+    Re-subscribes on rollover. State is fed via _dispatch_book_message into
+    state.token_index; the strategy_loop reads via state.books_by_slug.
+    """
+    subscribed_slug: int | None = None  # t_zero we last subscribed to
+    while True:
+        try:
+            # Wait until t_zero + market_ctx is set up.
+            if state.t_zero is None or state.slug is None:
+                await asyncio.sleep(1.0)
+                continue
+            # If t_zero rolled, rebuild token_index with fresh slugs.
+            if state.t_zero != subscribed_slug:
+                subscribed_slug = state.t_zero
+                # Rebuild token_index from token_resolver lookups for current+next.
+                new_index, new_books = await asyncio.to_thread(
+                    _resolve_books_for_window, state,
+                )
+                state.token_index = new_index
+                state.books_by_slug = new_books
+                logger.info(
+                    "CLOB book: subscribing to %d tokens for slugs %s",
+                    len(new_index), list(new_books.keys()),
+                )
+            asset_ids = list(state.token_index.keys())
+            if not asset_ids:
+                await asyncio.sleep(1.0)
+                continue
+            async with websockets.connect(
+                WS_CLOB_BOOK,
+                ping_interval=BOOK_WS_PING_INTERVAL_S,
+                ping_timeout=BOOK_WS_PING_TIMEOUT_S,
+                close_timeout=5.0,
+            ) as ws:
+                state.connections["clob_book"] = True
+                logger.info("CLOB book WS connected")
+                sub = json.dumps(
+                    {"assets_ids": asset_ids, "type": "market",
+                     "custom_feature_enabled": True},
+                    separators=(",", ":"),
+                )
+                await ws.send(sub)
+                async for raw in ws:
+                    try:
+                        payload = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    msgs = payload if isinstance(payload, list) else [payload]
+                    ts_ms = int(time.time() * 1000)
+                    for m in msgs:
+                        if isinstance(m, dict):
+                            _dispatch_book_message(m, state.token_index, ts_ms)
+        except (websockets.ConnectionClosed, OSError) as e:
+            state.connections["clob_book"] = False
+            logger.warning("CLOB book WS disconnected: %s; reconnecting in 2s", e)
+            # Drop state so a fresh REST/WS reprime is implicit.
+            for slot in state.token_index.values():
+                slot["book"].has_baseline = False
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            return
+
+
+def _resolve_books_for_window(state: DaemonState):
+    """Build a token_index + books_by_slug for current+next 5-min slugs.
+
+    Mirrors scripts/scrape_book.py's discovery shape but reuses the daemon's
+    existing TokenResolver — no Gamma re-fetch — for the slugs we already
+    know. Returns ({asset_id: {slug,side,book}}, {slug: MarketBooks}).
+    """
+    # Lazy import to avoid coupling the dispatcher tests to the resolver.
+    from active_bots.execution.token_resolver import TokenResolver
+    resolver = TokenResolver()
+    slugs = []
+    if state.slug:
+        slugs.append(state.slug)
+    next_t0 = (state.t_zero or 0) + MARKET_DURATION
+    next_slug = SLUG_PREFIX + str(int(next_t0))
+    slugs.append(next_slug)
+    token_index: dict[str, dict] = {}
+    books_by_slug: dict[str, MarketBooks] = {}
+    for slug in slugs:
+        tokens = resolver.resolve(slug)
+        if tokens is None:
+            continue
+        yes = LiveBookState(tick_size=float(tokens.tick_size or 0.01))
+        no = LiveBookState(tick_size=float(tokens.tick_size or 0.01))
+        books_by_slug[slug] = MarketBooks(yes=yes, no=no)
+        if tokens.yes_token_id:
+            token_index[tokens.yes_token_id] = {"slug": slug, "side": "yes", "book": yes}
+        if tokens.no_token_id:
+            token_index[tokens.no_token_id] = {"slug": slug, "side": "no", "book": no}
+    return token_index, books_by_slug
 
 
 # ── Position sizing / resolution (base strategy) ─────────────────────────
@@ -1418,6 +1562,7 @@ async def run():
     tasks = [
         asyncio.create_task(binance_feed(state, ewma)),
         asyncio.create_task(rtds_feed(state)),
+        asyncio.create_task(clob_book_feed(state)),
         asyncio.create_task(
             strategy_loop(state, executor, resolver, risk, events, max_risk=effective_max)
         ),
