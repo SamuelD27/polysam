@@ -86,6 +86,7 @@ INDEX_HTML = """<!doctype html>
   .big-price-down { color:var(--red); }
   .big-price-label { font-size:0.75rem; color:var(--dim); text-transform:lowercase; letter-spacing:0.08em; }
   .two-col { display:grid; grid-template-columns: 1fr 1fr; gap:1rem; }
+  .three-col { display:grid; grid-template-columns: repeat(3, 1fr); gap:1rem; }
   .chart { height: 500px; }
   .spark { height: 80px; }
   .stale { border:1px solid var(--red); background:#2a0b13; color:var(--red); font-size:13px; }
@@ -168,9 +169,15 @@ INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
-  <div class="two-col">
+  <div class="panel" id="strat-walked-vwap">
+    <div class="panel-title">walked_vwap (candidate)</div>
+    <div id="walked-rejects" class="hbar" style="margin-bottom:0.5rem;color:var(--dim)"></div>
+  </div>
+
+  <div class="three-col">
     <div class="panel" id="strat-base"><div class="panel-title">base (paper)</div></div>
     <div class="panel" id="strat-enh"><div class="panel-title">enhanced (live-capable)</div></div>
+    <div class="panel" id="strat-refined"><div class="panel-title">refined (baseline)</div></div>
   </div>
 
   <div class="panel"><div class="panel-title">enhanced extras</div>
@@ -497,10 +504,33 @@ INDEX_HTML = """<!doctype html>
       + '<span><span class="lbl">market up</span><span class="val">' + (typeof mktUp === 'number' ? mktUp.toFixed(3) : '-') + '</span></span>';
   }
 
+  function renderRejectSummary(extra) {
+    const el = document.getElementById('walked-rejects');
+    if (!el) return;
+    const ct = extra.reject_count || 0;
+    const reasons = extra.reject_reasons || {};
+    const top3 = Object.entries(reasons).sort((a,b) => b[1]-a[1]).slice(0, 3);
+    const lastWe = extra.last_walked_edge;
+    let html = '<span><span class="lbl">rejects</span><span class="val">' + ct + '</span></span>';
+    for (const [r, n] of top3) {
+      html += '  <span><span class="lbl">' + r + '</span><span class="val">' + n + '</span></span>';
+    }
+    if (typeof lastWe === 'number') {
+      const c = lastWe > 0 ? 'var(--green)' : 'var(--red)';
+      html += '  <span><span class="lbl">last walked_edge</span><span class="val" style="color:' + c + '">' + lastWe.toFixed(4) + '</span></span>';
+    }
+    el.innerHTML = html;
+  }
+
   function renderStrategies(d) {
     const mktUp = d.market_price_up;
+    renderStrategyPanel('strat-walked-vwap', 'walked_vwap', '(candidate)',
+                        d.walked_vwap || {}, mktUp, 'walked_vwap');
     renderStrategyPanel('strat-base', 'base', '(paper)', d.base || {}, mktUp, 'base');
     renderStrategyPanel('strat-enh',  'enhanced', '(live-capable)', d.enhanced || {}, mktUp, 'enhanced');
+    renderStrategyPanel('strat-refined', 'refined', '(baseline)',
+                        d.refined || {}, mktUp, 'refined');
+    renderRejectSummary((d.walked_vwap && d.walked_vwap.extra) || {});
     renderExtras(d.enhanced || {}, mktUp);
   }
 
@@ -511,8 +541,10 @@ INDEX_HTML = """<!doctype html>
     const strat = ev.strategy || '';
     const ts = ev.ts || 0;
     const tm = ts ? new Date(ts * 1000).toTimeString().slice(0, 8) : '--:--:--';
-    const prefix = strat === 'enhanced' ? '<span style="color:var(--cyan)">[E]</span>'
-                 : strat === 'base'     ? '<span>[B]</span>'
+    const prefix = strat === 'enhanced'    ? '<span style="color:var(--cyan)">[E]</span>'
+                 : strat === 'base'        ? '<span>[B]</span>'
+                 : strat === 'walked_vwap' ? '<span style="color:var(--amber)">[W]</span>'
+                 : strat === 'refined'     ? '<span style="color:#bbbbbb">[R]</span>'
                  : '<span style="color:var(--dim)">[?]</span>';
     const sideHtml = side => side === 'Up'
       ? '<span style="color:var(--green)">Up  </span>'
@@ -564,7 +596,7 @@ INDEX_HTML = """<!doctype html>
     if (stream && stream.textContent.trim() === '(no stream yet)') stream.textContent = '';
     if (stream) prependLine(stream, html);
     const strat = ev.strategy;
-    if (strat === 'base' || strat === 'enhanced') {
+    if (strat === 'base' || strat === 'enhanced' || strat === 'walked_vwap' || strat === 'refined') {
       const ol = document.getElementById('orders-' + strat);
       if (ol) {
         if (ol.textContent.trim() === '(none yet)') ol.textContent = '';
