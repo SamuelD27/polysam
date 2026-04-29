@@ -1,4 +1,4 @@
-"""LiveExecutor — send real CLOB orders via py-clob-client.
+"""LiveExecutor — send real CLOB orders via py-clob-client-v2.
 
 Entries:
   * strategy emits action {side=Up|Down, entry_price, size_usdc, size_shares}
@@ -62,9 +62,9 @@ from .token_resolver import TokenResolver
 
 logger = logging.getLogger("execution.live")
 
-# py-clob-client order types — we don't import the enum at module load
-# because py-clob-client may not be installed in paper-only environments.
-# These are string constants accepted by post_order().
+# py-clob-client-v2 order types — we don't import the enum at module load
+# because py-clob-client-v2 may not be installed in paper-only environments.
+# These are string constants accepted by create_and_post_market_order().
 ORDER_TYPE_FAK = "FAK"
 SIDE_BUY = "BUY"
 SIDE_SELL = "SELL"
@@ -339,21 +339,20 @@ class LiveExecutor:
     ) -> dict | None:
         """Build + sign + post a FAK market order.
 
-        amount is USD for BUY, shares for SELL (py-clob-client convention).
+        amount is USD for BUY, shares for SELL (py-clob-client-v2 keeps the
+        V1 amount convention).
         """
         try:
-            from py_clob_client.clob_types import (  # type: ignore
+            from py_clob_client_v2 import (  # type: ignore
                 MarketOrderArgs,
                 OrderType,
-            )
-            from py_clob_client.order_builder.constants import (  # type: ignore
-                BUY, SELL,
+                Side,
             )
         except ImportError:
-            logger.error("py-clob-client not installed; cannot place live orders")
+            logger.error("py-clob-client-v2 not installed; cannot place live orders")
             return None
 
-        side_const = BUY if side == SIDE_BUY else SELL
+        side_const = Side.BUY if side == SIDE_BUY else Side.SELL
         args = MarketOrderArgs(
             token_id=token_id,
             amount=float(amount),
@@ -368,9 +367,21 @@ class LiveExecutor:
             )
             return _fake_fill_response(amount=amount, side=side)
 
+        # V2 SDK: combined create_and_post_market_order replaces V1's
+        # create_market_order + post_order(orderType=...) two-call pattern.
+        # options=None defers to V2's internal tick-size resolution (V1
+        # auto-fetched server-side via the GET /tick-size?token_id=... call
+        # visible in V1 traces; V2 either does the same internally or via
+        # its tick-size cache).
+        # TODO(probe): verify options=None works on first live probe; if V2
+        # requires explicit tick_size, switch to
+        # PartialCreateOrderOptions(tick_size=str(client.get_tick_size(token_id))).
         try:
-            signed = self._client.create_market_order(args)
-            resp = self._client.post_order(signed, orderType=OrderType.FAK)
+            resp = self._client.create_and_post_market_order(
+                order_args=args,
+                options=None,
+                order_type=OrderType.FAK,
+            )
             return resp if isinstance(resp, dict) else None
         except Exception as e:  # pylint: disable=broad-except
             # SELL dust: Polymarket takes a fee out of filled share count, so
@@ -390,8 +401,11 @@ class LiveExecutor:
                     order_type=OrderType.FAK,
                 )
                 try:
-                    signed2 = self._client.create_market_order(args2)
-                    resp2 = self._client.post_order(signed2, orderType=OrderType.FAK)
+                    resp2 = self._client.create_and_post_market_order(
+                        order_args=args2,
+                        options=None,
+                        order_type=OrderType.FAK,
+                    )
                     return resp2 if isinstance(resp2, dict) else None
                 except Exception as e2:  # pylint: disable=broad-except
                     logger.error(
@@ -450,13 +464,25 @@ def _token_for_side(side: str, ctx: MarketCtx) -> str | None:
 
 
 def _extract_fills(resp: dict, *, side: str) -> tuple[float, float]:
-    """Return (filled_shares, avg_price) from a post_order response.
+    """Return (filled_shares, avg_price) from a CLOB response.
 
-    Polymarket post_order response shape (observed):
+    Two response shapes are supported:
+
+    V1 (legacy, observed pre-cutover; still used by ``_fake_fill_response``
+    and may still appear if a paper test seeds V1-shaped fixtures):
       { "success": bool, "orderID": str,
         "makingAmount": str,  # what WE gave up
         "takingAmount": str,  # what WE received
         "status": str, ... }
+
+    V2 (CLOB V2, post-cutover): field names not yet fully verified against
+    a live response. Best-effort parsing reads both V1 CamelCase and V2
+    snake_case keys (``order_id``/``making_amount``/``taking_amount``).
+    TODO(probe): replace this best-effort branch with the actual V2 shape
+    captured from the first successful create_and_post_market_order call.
+    Specifically verify: is it ``makingAmount`` or ``making_amount``? Are
+    ``filled``/``status`` field names changed? Is there a per-fill array
+    that supersedes the aggregate makingAmount/takingAmount?
 
     For a BUY  we gave USD and received shares → shares=takingAmount,
                                                   price=makingAmount/shares
@@ -477,8 +503,10 @@ def _extract_fills(resp: dict, *, side: str) -> tuple[float, float]:
     if status in ("unmatched", "cancelled", "rejected"):
         return 0.0, 0.0
 
-    making = _to_float(resp.get("makingAmount"))
-    taking = _to_float(resp.get("takingAmount"))
+    # V1 CamelCase keys first (preserved for fake-response paths); V2
+    # snake_case as fallback. Both map to the same maker/taker semantics.
+    making = _to_float(resp.get("makingAmount") or resp.get("making_amount"))
+    taking = _to_float(resp.get("takingAmount") or resp.get("taking_amount"))
     if making <= 0 or taking <= 0:
         return 0.0, 0.0
 
@@ -494,6 +522,7 @@ def _extract_fills(resp: dict, *, side: str) -> tuple[float, float]:
 def _get_order_id(resp: dict) -> str | None:
     if not resp:
         return None
+    # V1: orderID; V2: order_id (best-effort); legacy: id.
     return resp.get("orderID") or resp.get("order_id") or resp.get("id")
 
 
@@ -505,8 +534,11 @@ def _redact(resp: dict | None) -> dict:
     if not resp:
         return {}
     keep = (
-        "success", "status", "orderID", "order_id", "errorMsg",
-        "makingAmount", "takingAmount",
+        "success", "status",
+        "orderID", "order_id",            # V1, V2
+        "errorMsg", "error_msg",          # V1, V2 (best-effort)
+        "makingAmount", "making_amount",  # V1, V2 (best-effort)
+        "takingAmount", "taking_amount",  # V1, V2 (best-effort)
     )
     return {k: resp[k] for k in keep if k in resp}
 

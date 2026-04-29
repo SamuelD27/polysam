@@ -39,23 +39,30 @@ def _ctx(slug: str = "btc-updown-5m-9999999000") -> MarketCtx:
 
 
 class _FakeClient:
-    """Minimal stand-in for py-clob-client.ClobClient.
+    """Minimal stand-in for py-clob-client-v2.ClobClient.
 
     ``post_order_returns`` is a list of dicts; each call to
-    ``post_order`` pops the next one. ``create_market_order`` is a
-    no-op that just echoes the args — LiveExecutor doesn't inspect
-    the signed-order return value.
+    ``create_and_post_market_order`` pops the next one (V2 collapsed the
+    V1 two-call sign+post pattern into a single method).
+
+    Response dicts use the V1 CamelCase shape (``makingAmount`` /
+    ``takingAmount`` / ``orderID``); ``_extract_fills`` accepts both V1
+    and V2 keys, so V1-shaped fixtures keep these tests valid until the
+    live probe captures the actual V2 response shape.
     """
 
     def __init__(self, post_order_returns: list[dict[str, Any] | Exception]):
         self._returns = list(post_order_returns)
         self.post_calls: list[dict[str, Any]] = []
 
-    def create_market_order(self, args: Any) -> Any:
-        return args
-
-    def post_order(self, signed: Any, orderType: Any = None) -> Any:
-        self.post_calls.append({"signed": signed, "orderType": orderType})
+    def create_and_post_market_order(
+        self, order_args: Any, options: Any = None, order_type: Any = None,
+    ) -> Any:
+        self.post_calls.append({
+            "order_args": order_args,
+            "options": options,
+            "order_type": order_type,
+        })
         nxt = self._returns.pop(0)
         if isinstance(nxt, Exception):
             raise nxt

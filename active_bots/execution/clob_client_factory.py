@@ -1,4 +1,4 @@
-"""Build a fully-authenticated py_clob_client.ClobClient from env config.
+"""Build a fully-authenticated py_clob_client_v2.ClobClient from env config.
 
 Usage:
     from active_bots.execution.clob_client_factory import build_client
@@ -24,17 +24,16 @@ class ClobFactoryError(RuntimeError):
 
 
 def build_client():
-    """Return a py-clob-client ClobClient with API creds set.
+    """Return a py-clob-client-v2 ClobClient with API creds set.
 
     Raises ClobFactoryError with a human-readable message if env is missing or
-    py-clob-client is not installed.
+    py-clob-client-v2 is not installed.
     """
     try:
-        from py_clob_client.client import ClobClient  # type: ignore
-        from py_clob_client.clob_types import ApiCreds  # type: ignore
+        from py_clob_client_v2 import ApiCreds, ClobClient  # type: ignore
     except ImportError as exc:
         raise ClobFactoryError(
-            "py-clob-client not installed. Run: uv pip install -r requirements.txt"
+            "py-clob-client-v2 not installed. Run: uv pip install -r requirements.txt"
         ) from exc
 
     key = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
@@ -64,15 +63,16 @@ def build_client():
     preseeded = all([api_key, api_secret, api_passphrase])
     client = ClobClient(
         HOST,
-        key=key,
         chain_id=chain_id,
+        key=key,
         signature_type=signature_type,
         funder=funder,
         creds=ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
         if preseeded else None,
     )
     if not preseeded:
-        client.set_api_creds(client.create_or_derive_api_creds())
+        # V2 renamed create_or_derive_api_creds() to create_or_derive_api_key().
+        client.set_api_creds(client.create_or_derive_api_key())
 
     logger.info(
         "ClobClient ready: funder=%s chain=%d sig_type=%d creds=%s",
