@@ -46,6 +46,17 @@ import os
 import sys
 from pathlib import Path
 
+# Load .env so the probe works from any shell (the daemon loads it via
+# dotenv at startup; a bare `python scripts/probe_v2_order.py …` invocation
+# doesn't, which previously failed at build_client() with a missing
+# POLYMARKET_PRIVATE_KEY). Optional — silently no-ops if env is already
+# exported (the launcher's path) or if python-dotenv isn't installed.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Repo-root on sys.path so we can reuse the factory.
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
