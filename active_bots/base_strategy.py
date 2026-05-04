@@ -181,12 +181,18 @@ class BaseStrategy:
         max_risk: float = MAX_RISK,
         entry_offset_min: int = 120,
         entry_offset_max: int = 150,
+        role: str = "observer",
     ):
+        if role not in ("trader", "observer"):
+            raise ValueError(
+                f"role must be 'trader' or 'observer', got {role!r}"
+            )
         self.edge_min = edge_min
         self.edge_max = edge_max
         self.max_risk = max_risk
         self.entry_offset_min = entry_offset_min
         self.entry_offset_max = entry_offset_max
+        self.role = role
 
         self._t_zero = None
         self._strike = None

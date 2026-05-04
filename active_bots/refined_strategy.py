@@ -31,7 +31,7 @@ class RefinedStrategy(EnhancedStrategy):
     DEFAULT_TP_DELTA_MIN = 0.08
     DEFAULT_TP_ABSOLUTE_FAVOR = 0.15
 
-    def __init__(self, max_risk: float = MAX_RISK):
+    def __init__(self, max_risk: float = MAX_RISK, role: str = "observer"):
         super().__init__(
             enable_time_based=True,
             enable_profit_grabber=True,
@@ -39,4 +39,5 @@ class RefinedStrategy(EnhancedStrategy):
             max_risk=max_risk,
             tp_delta_min=self.DEFAULT_TP_DELTA_MIN,
             tp_absolute_favor=self.DEFAULT_TP_ABSOLUTE_FAVOR,
+            role=role,
         )

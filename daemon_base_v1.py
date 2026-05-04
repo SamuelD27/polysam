@@ -1072,25 +1072,60 @@ async def strategy_loop(
     state: DaemonState, executor: Executor, resolver, risk: RiskManager,
     events: EventLogger, max_risk: float = MAX_RISK,
 ):
-    # BASE and ENHANCED are paper benchmarks — never trade live. REFINED is
-    # the session champion (squeeze off + tighter TP) and uses the main
-    # executor, which may be live or paper depending on env.
-    base_executor: Executor = PaperExecutor()
-    enh_executor: Executor = PaperExecutor()
     """Main strategy loop. Runs at 1 Hz.
 
     - Detects market rollover
     - Enters positions at ENTRY_OFFSET..ENTRY_CUTOFF (base) or via strategies
     - Resolves at market expiry (T+300)
     - Delegates order placement / fill bookkeeping to the right executor
+
+    Per-strategy role gating: each strategy carries a `role` ("trader" or
+    "observer", default observer). At dispatch-time we bind once per
+    strategy: trader role → live `executor` arg + canonical event names;
+    observer role → shared `paper_exec` + `shadow_*`-prefixed event names.
+    Currently only walked_vwap is the trader; refined / enhanced / base are
+    benchmarks. The role attribute lives on the strategy class so a future
+    strategy created without an explicit role defaults to observer
+    (safe-by-construction — accidental new-strategy live trading is
+    impossible without an explicit `role="trader"` opt-in).
     """
+    paper_exec: Executor = PaperExecutor()
+
+    enh = EnhancedStrategy(max_risk=max_risk, role="observer")
+    refined = RefinedStrategy(max_risk=max_risk, role="observer")
+    walked = WalkedVWAPStrategy(max_risk=max_risk, role="trader")
+
+    # Bind (executor, event-name map) per strategy ONCE based on role.
+    # Observer event names are shadow_-prefixed so benchmark fills are
+    # distinguishable from real-money fills in events.jsonl.
+    _OBSERVER_EVENTS = {
+        "entry_filled":    "shadow_entry",
+        "entry_rejected":  "shadow_entry_rejected",
+        "exit_filled":     "shadow_exit",
+        "exit_rejected":   "shadow_exit_rejected",
+        "resolve":         "shadow_resolve",
+    }
+    _TRADER_EVENTS = {k: k for k in _OBSERVER_EVENTS}
+
+    def _bind(strategy):
+        if strategy.role == "trader":
+            return executor, _TRADER_EVENTS
+        return paper_exec, _OBSERVER_EVENTS
+
+    walked_exec,  walked_evt  = _bind(walked)
+    refined_exec, refined_evt = _bind(refined)
+    enh_exec,     enh_evt     = _bind(enh)
+    # base uses the BaseStrategy class only at the entry-signal block
+    # (lines ~1660+). Mirror the same binding contract for consistency.
+    base_role = "observer"
+    base_exec, base_evt = (paper_exec, _OBSERVER_EVENTS)
+
     logger.info(
-        "Strategy loop started — refined=%s, enhanced=paper, base=paper (benchmarks), max_risk=%.2f",
-        executor.mode, max_risk,
+        "Strategy loop started — walked_vwap=%s (trader), refined=%s/observer, "
+        "enhanced=%s/observer, base=%s/observer, max_risk=%.2f",
+        walked_exec.mode, refined_exec.mode, enh_exec.mode, base_exec.mode,
+        max_risk,
     )
-    enh = EnhancedStrategy(max_risk=max_risk)
-    refined = RefinedStrategy(max_risk=max_risk)
-    walked = WalkedVWAPStrategy(max_risk=max_risk)
     market_ctx: MarketCtx | None = None
 
     def refresh_market_ctx() -> MarketCtx | None:
@@ -1123,7 +1158,7 @@ async def strategy_loop(
                 prev_ctx = market_ctx  # settlement belongs to the OLD market
                 if state.base_position is not None:
                     if state.btc_price > 0 and prev_ctx is not None:
-                        result = base_executor.resolve(
+                        result = base_exec.resolve(
                             state.base_position, prev_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1134,7 +1169,7 @@ async def strategy_loop(
                             if len(state.base_trades) > MAX_CLOSED_TRADES:
                                 state.base_trades = state.base_trades[-MAX_CLOSED_TRADES:]
                             outcome = "WIN" if trade["won"] else "LOSS"
-                            events.log("resolve", strategy="base", trade=trade, trigger="rollover")
+                            events.log(base_evt["resolve"], strategy="base", trade=trade, trigger="rollover")
                             logger.info(
                                 "BASE RESOLVED [%s] %s %s PnL=%+.2f",
                                 outcome, trade["side"], trade["slug"], trade["pnl"],
@@ -1148,7 +1183,7 @@ async def strategy_loop(
 
                 if state.enh_position is not None:
                     if state.btc_price > 0 and prev_ctx is not None:
-                        result = enh_executor.resolve(
+                        result = enh_exec.resolve(
                             state.enh_position, prev_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1161,7 +1196,7 @@ async def strategy_loop(
                             state.enh_extra["resolution_count"] += 1
                             state.enh_extra["last_exit_type"] = "RESOLUTION"
                             outcome = "WIN" if trade["won"] else "LOSS"
-                            events.log("resolve", strategy="enhanced", trade=trade, trigger="rollover")
+                            events.log(enh_evt["resolve"], strategy="enhanced", trade=trade, trigger="rollover")
                             logger.info(
                                 "ENH RESOLVED [%s] %s %s PnL=%+.2f",
                                 outcome, trade["side"], trade["slug"], trade["pnl"],
@@ -1175,7 +1210,7 @@ async def strategy_loop(
 
                 if state.refined_position is not None:
                     if state.btc_price > 0 and prev_ctx is not None:
-                        result = executor.resolve(
+                        result = refined_exec.resolve(
                             state.refined_position, prev_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1189,7 +1224,7 @@ async def strategy_loop(
                             state.refined_extra["resolution_count"] += 1
                             state.refined_extra["last_exit_type"] = "RESOLUTION"
                             outcome = "WIN" if trade["won"] else "LOSS"
-                            events.log("resolve", strategy="refined", trade=trade, trigger="rollover")
+                            events.log(refined_evt["resolve"], strategy="refined", trade=trade, trigger="rollover")
                             logger.info(
                                 "REFINED RESOLVED [%s] %s %s PnL=%+.2f",
                                 outcome, trade["side"], trade["slug"], trade["pnl"],
@@ -1203,7 +1238,7 @@ async def strategy_loop(
 
                 if state.walked_position is not None:
                     if state.btc_price > 0 and prev_ctx is not None:
-                        result = executor.resolve(
+                        result = walked_exec.resolve(
                             state.walked_position, prev_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1217,7 +1252,7 @@ async def strategy_loop(
                             state.walked_extra["resolution_count"] += 1
                             state.walked_extra["last_exit_type"] = "RESOLUTION"
                             outcome = "WIN" if trade["won"] else "LOSS"
-                            events.log("resolve", strategy="walked_vwap", trade=trade, trigger="rollover")
+                            events.log(walked_evt["resolve"], strategy="walked_vwap", trade=trade, trigger="rollover")
                             logger.info(
                                 "WALKED_VWAP RESOLVED [%s] %s %s PnL=%+.2f",
                                 outcome, trade["side"], trade["slug"], trade["pnl"],
@@ -1282,7 +1317,7 @@ async def strategy_loop(
                                 time_zone=tz, spike_score=enh_action.get("spike_score"),
                                 offset=offset, slug=state.slug,
                             )
-                            result = enh_executor.enter(
+                            result = enh_exec.enter(
                                 enh_action, market_ctx, now, source=src,
                             )
                             if result is not None:
@@ -1299,7 +1334,7 @@ async def strategy_loop(
                                 state.enh_extra["last_source"] = src
                                 state.enh_extra["last_time_zone"] = tz
                                 events.log(
-                                    "entry_filled",
+                                    enh_evt["entry_filled"],
                                     strategy="enhanced", source=src, position=result.to_position_dict(),
                                     order_id=result.order_id, token_id=result.token_id,
                                     fill_details=result.fill_details,
@@ -1311,7 +1346,7 @@ async def strategy_loop(
                                 )
                             else:
                                 events.log(
-                                    "entry_rejected",
+                                    enh_evt["entry_rejected"],
                                     strategy="enhanced", source=src, side=enh_action.get("side"),
                                     slug=state.slug,
                                 )
@@ -1329,7 +1364,7 @@ async def strategy_loop(
                     action_type = enh_action.get("action")
 
                     if action_type in ("EXIT_TP", "EXIT_SL"):
-                        result = enh_executor.exit(
+                        result = enh_exec.exit(
                             state.enh_position, enh_action, market_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1346,7 +1381,7 @@ async def strategy_loop(
                             state.enh_extra["last_exit_type"] = result.exit_type
                             state.enh_position = None
                             events.log(
-                                "exit_filled", strategy="enhanced", trade=trade,
+                                enh_evt["exit_filled"], strategy="enhanced", trade=trade,
                                 fill_details=result.fill_details,
                             )
                             logger.info(
@@ -1356,13 +1391,13 @@ async def strategy_loop(
                             )
                         else:
                             events.log(
-                                "exit_rejected",
+                                enh_evt["exit_rejected"],
                                 strategy="enhanced", action=action_type,
                                 position=state.enh_position,
                             )
 
                     elif action_type == "RESOLVE":
-                        result = enh_executor.resolve(
+                        result = enh_exec.resolve(
                             state.enh_position, market_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1375,7 +1410,7 @@ async def strategy_loop(
                             state.enh_extra["resolution_count"] += 1
                             state.enh_extra["last_exit_type"] = "RESOLUTION"
                             outcome = "WIN" if trade["won"] else "LOSS"
-                            events.log("resolve", strategy="enhanced", trade=trade)
+                            events.log(enh_evt["resolve"], strategy="enhanced", trade=trade)
                             logger.info(
                                 "ENH RESOLVED [%s] %s %s PnL=%+.2f",
                                 outcome, trade["side"], trade["slug"], trade["pnl"],
@@ -1412,7 +1447,7 @@ async def strategy_loop(
                                 size_usdc=ref_action.get("size_usdc"),
                                 time_zone=tz, offset=offset, slug=state.slug,
                             )
-                            result = executor.enter(
+                            result = refined_exec.enter(
                                 ref_action, market_ctx, now, source="edge",
                             )
                             if result is not None:
@@ -1422,7 +1457,7 @@ async def strategy_loop(
                                 state.refined_extra["last_source"] = "edge"
                                 state.refined_extra["last_time_zone"] = tz
                                 events.log(
-                                    "entry_filled",
+                                    refined_evt["entry_filled"],
                                     strategy="refined", source="edge",
                                     position=result.to_position_dict(),
                                     order_id=result.order_id, token_id=result.token_id,
@@ -1435,7 +1470,7 @@ async def strategy_loop(
                                 )
                             else:
                                 events.log(
-                                    "entry_rejected",
+                                    refined_evt["entry_rejected"],
                                     strategy="refined", source="edge", side=ref_action.get("side"),
                                     slug=state.slug,
                                 )
@@ -1478,7 +1513,7 @@ async def strategy_loop(
                                 ),
                             )
                             state.walked_extra["last_walked_edge"] = walked_action.get("walked_edge")
-                            result = executor.enter(
+                            result = walked_exec.enter(
                                 walked_action, market_ctx, now, source="edge",
                             )
                             if result is not None:
@@ -1488,7 +1523,7 @@ async def strategy_loop(
                                 state.walked_extra["last_source"] = "edge"
                                 state.walked_extra["last_time_zone"] = tz
                                 events.log(
-                                    "entry_filled",
+                                    walked_evt["entry_filled"],
                                     strategy="walked_vwap", source="edge",
                                     position=result.to_position_dict(),
                                     order_id=result.order_id, token_id=result.token_id,
@@ -1501,7 +1536,7 @@ async def strategy_loop(
                                 )
                             else:
                                 events.log(
-                                    "entry_rejected",
+                                    walked_evt["entry_rejected"],
                                     strategy="walked_vwap", source="edge",
                                     side=walked_action.get("side"),
                                     slug=state.slug,
@@ -1515,7 +1550,7 @@ async def strategy_loop(
                             counts[reason] = counts.get(reason, 0) + 1
                             state.walked_extra["last_walked_edge"] = walked_action.get("walked_edge")
                             events.log(
-                                "entry_rejected",
+                                walked_evt["entry_rejected"],
                                 strategy="walked_vwap", source="edge",
                                 slug=state.slug,
                                 reason=reason,
@@ -1536,7 +1571,7 @@ async def strategy_loop(
                     action_type = ref_action.get("action")
 
                     if action_type in ("EXIT_TP", "EXIT_SL"):
-                        result = executor.exit(
+                        result = refined_exec.exit(
                             state.refined_position, ref_action, market_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1554,7 +1589,7 @@ async def strategy_loop(
                             state.refined_extra["last_exit_type"] = result.exit_type
                             state.refined_position = None
                             events.log(
-                                "exit_filled", strategy="refined", trade=trade,
+                                refined_evt["exit_filled"], strategy="refined", trade=trade,
                                 fill_details=result.fill_details,
                             )
                             logger.info(
@@ -1564,13 +1599,13 @@ async def strategy_loop(
                             )
                         else:
                             events.log(
-                                "exit_rejected",
+                                refined_evt["exit_rejected"],
                                 strategy="refined", action=action_type,
                                 position=state.refined_position,
                             )
 
                     elif action_type == "RESOLVE":
-                        result = executor.resolve(
+                        result = refined_exec.resolve(
                             state.refined_position, market_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1584,7 +1619,7 @@ async def strategy_loop(
                             state.refined_extra["resolution_count"] += 1
                             state.refined_extra["last_exit_type"] = "RESOLUTION"
                             outcome = "WIN" if trade["won"] else "LOSS"
-                            events.log("resolve", strategy="refined", trade=trade)
+                            events.log(refined_evt["resolve"], strategy="refined", trade=trade)
                             logger.info(
                                 "REFINED RESOLVED [%s] %s %s PnL=%+.2f",
                                 outcome, trade["side"], trade["slug"], trade["pnl"],
@@ -1605,7 +1640,7 @@ async def strategy_loop(
                 if walked_action is not None:
                     action_type = walked_action.get("action")
                     if action_type in ("EXIT_TP", "EXIT_SL"):
-                        result = executor.exit(
+                        result = walked_exec.exit(
                             state.walked_position, walked_action, market_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1623,7 +1658,7 @@ async def strategy_loop(
                             state.walked_extra["last_exit_type"] = result.exit_type
                             state.walked_position = None
                             events.log(
-                                "exit_filled", strategy="walked_vwap", trade=trade,
+                                walked_evt["exit_filled"], strategy="walked_vwap", trade=trade,
                                 fill_details=result.fill_details,
                             )
                             logger.info(
@@ -1632,7 +1667,7 @@ async def strategy_loop(
                                 result.pnl, result.hold_time_s or 0,
                             )
                     elif action_type == "RESOLVE":
-                        result = executor.resolve(
+                        result = walked_exec.resolve(
                             state.walked_position, market_ctx, now,
                             btc_price=state.btc_price,
                         )
@@ -1646,7 +1681,7 @@ async def strategy_loop(
                             state.walked_extra["resolution_count"] += 1
                             state.walked_extra["last_exit_type"] = "RESOLUTION"
                             outcome = "WIN" if trade["won"] else "LOSS"
-                            events.log("resolve", strategy="walked_vwap", trade=trade)
+                            events.log(walked_evt["resolve"], strategy="walked_vwap", trade=trade)
                             logger.info(
                                 "WALKED_VWAP RESOLVED [%s] %s %s PnL=%+.2f",
                                 outcome, trade["side"], trade["slug"], trade["pnl"],
@@ -1694,14 +1729,14 @@ async def strategy_loop(
                                     edge=edge, size_usdc=size_usdc, fair=fair,
                                     market=market, offset=offset, slug=state.slug,
                                 )
-                                result = base_executor.enter(
+                                result = base_exec.enter(
                                     base_action, market_ctx, now, source="base",
                                 )
                                 if result is not None:
                                     result.ack_ts = time.time()
                                     state.base_position = result.to_position_dict()
                                     events.log(
-                                        "entry_filled", strategy="base",
+                                        base_evt["entry_filled"], strategy="base",
                                         position=result.to_position_dict(),
                                         order_id=result.order_id, token_id=result.token_id,
                                         fill_details=result.fill_details,
@@ -1713,14 +1748,14 @@ async def strategy_loop(
                                     )
                                 else:
                                     events.log(
-                                        "entry_rejected", strategy="base", side=side,
+                                        base_evt["entry_rejected"], strategy="base", side=side,
                                         slug=state.slug,
                                     )
 
             # ── Base: resolve at T+300 (paper only) ──
             if state.base_position is not None and offset >= MARKET_DURATION:
                 if state.btc_price > 0 and market_ctx is not None:
-                    result = base_executor.resolve(
+                    result = base_exec.resolve(
                         state.base_position, market_ctx, now,
                         btc_price=state.btc_price,
                     )
@@ -1731,7 +1766,7 @@ async def strategy_loop(
                         if len(state.base_trades) > MAX_CLOSED_TRADES:
                             state.base_trades = state.base_trades[-MAX_CLOSED_TRADES:]
                         outcome = "WIN" if trade["won"] else "LOSS"
-                        events.log("resolve", strategy="base", trade=trade)
+                        events.log(base_evt["resolve"], strategy="base", trade=trade)
                         logger.info(
                             "BASE RESOLVED [%s] %s %s PnL=%+.2f",
                             outcome, trade["side"], trade["slug"], trade["pnl"],

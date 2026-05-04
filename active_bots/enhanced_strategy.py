@@ -508,7 +508,13 @@ class EnhancedStrategy:
         sl_delta_max: float | None = None,
         tp_absolute_favor: float | None = None,
         force_exit_before_s: float | None = None,
+        role: str = "observer",
     ):
+        if role not in ("trader", "observer"):
+            raise ValueError(
+                f"role must be 'trader' or 'observer', got {role!r}"
+            )
+        self.role = role
         if enable_time_based:
             self.time_strategy = TimeBasedStrategy(max_risk=max_risk)
         else:
