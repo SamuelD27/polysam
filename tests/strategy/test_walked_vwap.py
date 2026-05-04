@@ -612,3 +612,56 @@ def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
     assert (expected_mid - pnl_walked) > 1.0, (
         f"non-trivial spread expected; got walked={pnl_walked} mid={expected_mid}"
     )
+
+
+# ── parent-position phantom-clear on reject (Commit 5 fix) ──────────────────
+
+def test_gate_reject_clears_parent_phantom_open_position(monkeypatch):
+    """Regression: when the gate rejects, the parent's self._open_position
+    (set by EnhancedStrategy.on_tick BEFORE this gate ran) must be cleared.
+    Otherwise the strategy thinks it has a position the daemon doesn't know
+    about, blocks new entries this market, and emits phantom exits the daemon
+    silently swallows.
+
+    Triggered here via insufficient_top_of_book; same clear must happen on
+    every reject reason since the parent's stash is set independently of the
+    rejection path."""
+    s, mb = _make_strategy_with_books(
+        yes_asks=[{"price": "0.30", "size": "5"}],  # top size 5 < requested 16.7
+    )
+
+    def fake_parent(self_, *a, **k):
+        action = _refined_would_enter_action()
+        # Mirror EnhancedStrategy.on_tick storing the position BEFORE the
+        # gate sees the action.
+        s._open_position = {
+            "side": action["side"],
+            "entry_price": action["entry_price"],
+            "size_usdc": action["size_usdc"],
+            "size_shares": action["size_shares"],
+            "strike": 110_000.0,
+            "entry_time": time.time(),
+            "edge": action["edge"],
+        }
+        s._position_source = "edge"
+        return action
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.WalkedVWAPStrategy._run_parent_on_tick",
+        fake_parent,
+    )
+
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "WALKED_VWAP_REJECT"
+    assert out["reject_reason"] == "insufficient_top_of_book"
+    # The fix: phantom position is gone; strategy is free to consider new
+    # entries on subsequent ticks.
+    assert s._open_position is None
+    assert s._position_source is None
+    # Sanity: _resolved was never set to True on reject (only set True after
+    # a real exit/resolution), so we don't need to clear it.
+    assert s._resolved is False

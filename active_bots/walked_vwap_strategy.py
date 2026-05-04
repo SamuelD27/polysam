@@ -206,6 +206,18 @@ class WalkedVWAPStrategy(RefinedStrategy):
         reason: str,
         **diag: Any,
     ) -> dict[str, Any]:
+        # Clear the parent's phantom position. EnhancedStrategy.on_tick stores
+        # self._open_position BEFORE this gate runs (enhanced_strategy.py:634
+        # for edge entries, :613 for squeeze) as part of returning the ENTER
+        # action. On a reject, the daemon never enters — but the parent still
+        # thinks it has a position, which (a) blocks future entries this market
+        # (has_position guard at on_tick:609 / 630) and (b) emits phantom EXIT
+        # actions on subsequent ticks that the daemon silently swallows. Worst
+        # case: profit_grabber sets self._resolved=True (on_tick:597) and the
+        # strategy is dead-stuck until the next market rollover.
+        if getattr(self, "_open_position", None) is not None:
+            self._open_position = None
+            self._position_source = None
         return {
             "action": "WALKED_VWAP_REJECT",
             "reject_reason": reason,
