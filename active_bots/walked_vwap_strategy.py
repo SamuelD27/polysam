@@ -165,7 +165,7 @@ class WalkedVWAPStrategy(RefinedStrategy):
 
         # Replace the parent's mid-quoted entry with the realistic per-share cost
         # (effective_VWAP = walked book + bell-curve fee). This makes downstream
-        # TP/SL math (EnhancedStrategy.evaluate uses position["entry_price"])
+        # TP/SL math (ProfitGrabber.check_exit reads position["entry_price"])
         # operate against what the trader actually paid, not the mid. The
         # original mid quote is preserved as entry_price_mid for diagnostics
         # and for the parallel pnl_mid computed at exit.
@@ -173,6 +173,20 @@ class WalkedVWAPStrategy(RefinedStrategy):
         action["entry_price_mid"] = float(action["entry_price"])
         action["entry_price"] = eff_vwap
         action["size_usdc"] = size_shares * eff_vwap
+
+        # Sync the parent's internal stash. EnhancedStrategy.on_tick stored
+        # self._open_position BEFORE this gate ran (enhanced_strategy.py:634
+        # for edge entries, :613 for squeeze) using the mid-quoted entry_price.
+        # ProfitGrabber.check_exit reads self._open_position["entry_price"] on
+        # every subsequent tick — both for the TP/SL thresholds and for the pnl
+        # field returned in the exit action. Without this sync, the daemon-side
+        # position dict (built from to_position_dict on EntryResult) carries
+        # the walked entry while the parent's check_exit operates on the mid,
+        # and trade.pnl ends up identical to trade.pnl_mid.
+        if getattr(self, "_open_position", None) is not None:
+            self._open_position["entry_price"] = eff_vwap
+            self._open_position["size_shares"] = size_shares
+            self._open_position["size_usdc"] = size_shares * eff_vwap
 
         action.update({
             "walked_VWAP": walk.vwap,

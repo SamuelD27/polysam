@@ -450,3 +450,165 @@ def test_paper_executor_entries_without_mid_omit_pnl_mid():
     trade = res.to_trade_dict()
     assert "pnl_mid" not in trade
     assert "entry_price_mid" not in trade
+
+
+# ── parent-position sync (Commit 4 fix) ─────────────────────────────────────
+
+def test_gate_pass_syncs_parent_open_position_with_effective_vwap(monkeypatch):
+    """Regression: the gate-pass branch must mutate self._open_position so
+    that ProfitGrabber.check_exit (which reads position["entry_price"] on
+    every subsequent tick) operates against the walked entry, not the mid.
+
+    Without this sync, daemon-side trade.pnl is computed against the mid and
+    ends up identical to trade.pnl_mid, defeating the dual-PnL design."""
+    s, mb = _make_strategy_with_books(
+        yes_asks=[
+            {"price": "0.30", "size": "50"},
+            {"price": "0.32", "size": "200"},
+        ],
+    )
+    # Stub the parent so it returns a real ENTER action AND populates
+    # self._open_position the way EnhancedStrategy.on_tick does on its real
+    # entry path (line 634).
+    def fake_parent(self_, *a, **k):
+        action = _refined_would_enter_action()
+        # Mirror EnhancedStrategy.on_tick line 634-647: the parent stores
+        # the mid-quoted entry as the position before returning the action.
+        s._open_position = {
+            "side": action["side"],
+            "entry_price": action["entry_price"],   # mid quote (0.30)
+            "size_usdc": action["size_usdc"],
+            "size_shares": action["size_shares"],
+            "strike": 110_000.0,
+            "entry_time": time.time(),
+            "edge": action["edge"],
+        }
+        s._position_source = "edge"
+        return action
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.WalkedVWAPStrategy._run_parent_on_tick",
+        fake_parent,
+    )
+
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "ENTER"
+    eff = out["effective_VWAP"]
+    assert eff > 0.30, "effective_VWAP should exceed mid (walked + fees)"
+
+    # The action carries the walked entry — already covered by an earlier test.
+    # The new assertion: the parent's internal stash is synced too.
+    assert s._open_position is not None
+    assert s._open_position["entry_price"] == pytest.approx(eff)
+    assert s._open_position["size_shares"] == pytest.approx(out["size_shares"])
+    assert s._open_position["size_usdc"] == pytest.approx(
+        out["size_shares"] * eff
+    )
+
+
+def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
+    """End-to-end regression: ProfitGrabber.check_exit, called against the
+    synced _open_position, must produce a pnl computed against the walked
+    entry. If the sync regresses, this fails because pnl will reflect mid
+    arithmetic — and trade.pnl_mid (computed independently in PaperExecutor)
+    will silently equal trade.pnl."""
+    from active_bots.enhanced_strategy import ProfitGrabber
+
+    # Multi-level book: top 50 @ 0.30, then 200 @ 0.40 → walked vwap on
+    # 175 shares straddles both levels and lands well above mid.
+    s, mb = _make_strategy_with_books(
+        yes_asks=[
+            {"price": "0.30", "size": "50"},
+            {"price": "0.40", "size": "200"},
+        ],
+        # Big top-of-book overlay so the gate's MIN_TOP_OF_BOOK_SHARES_RATIO
+        # check (defaults to 1.0 of requested) doesn't reject; we want the
+        # walked vwap to exceed mid via the second level, not the gate to fail.
+    )
+    # Override MIN_TOP_OF_BOOK_SHARES_RATIO so 50-share top is enough to gate.
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.MIN_TOP_OF_BOOK_SHARES_RATIO", 0.0,
+    )
+
+    requested_shares = 175.0
+    mid_quote = 0.30
+
+    def fake_parent(self_, *a, **k):
+        action = {
+            "action": "ENTER",
+            "side": "Up",
+            "entry_price": mid_quote,
+            "edge": 0.20,
+            "size_usdc": requested_shares * mid_quote,
+            "size_shares": requested_shares,
+            "fair": 0.50,
+            "market": mid_quote,
+            "time_zone": "sweet_spot",
+        }
+        s._open_position = {
+            "side": "Up",
+            "entry_price": mid_quote,           # parent stores mid
+            "size_usdc": action["size_usdc"],
+            "size_shares": requested_shares,
+            "strike": 110_000.0,
+            "entry_time": time.time(),
+            "edge": 0.20,
+        }
+        s._position_source = "edge"
+        return action
+
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.WalkedVWAPStrategy._run_parent_on_tick",
+        fake_parent,
+    )
+
+    enter_action = s.on_tick(
+        btc_price=110_000, market_price_up=mid_quote, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert enter_action["action"] == "ENTER"
+    eff_vwap = enter_action["effective_VWAP"]
+    assert eff_vwap > mid_quote + 0.04, (
+        f"need a meaningful spread for this test; got eff={eff_vwap} "
+        f"vs mid={mid_quote}"
+    )
+
+    # Simulate a TP-favourable market move and run ProfitGrabber against the
+    # parent's _open_position. With the sync, pnl reflects (exit-eff)×shares;
+    # without it, pnl reflects (exit-mid)×shares.
+    pg = ProfitGrabber(tp_delta_min=0.01, tp_absolute_favor=0.0)
+    exit_market_up = 0.70
+    exit_action = pg.check_exit(
+        s._open_position,
+        btc_price=110_000.0, sigma=0.5,
+        t_zero=time.time() - 200,
+        market_price_up=exit_market_up,
+        market_price_ts=time.time(),
+    )
+    assert exit_action is not None
+    assert exit_action["action"] == "EXIT_TP"
+    pnl_walked = exit_action["pnl"]
+    # Walked-PnL formula: (exit - eff) * shares - SPREAD_COST * shares
+    SPREAD_COST = 0.01
+    expected_walked = (
+        (exit_market_up - eff_vwap) * requested_shares
+        - SPREAD_COST * requested_shares
+    )
+    expected_mid = (
+        (exit_market_up - mid_quote) * requested_shares
+        - SPREAD_COST * requested_shares
+    )
+    assert pnl_walked == pytest.approx(expected_walked)
+    # The whole point of dual PnL: walked < mid when fees + book walk push
+    # eff above mid. A regression that forgets the sync would make pnl_walked
+    # equal expected_mid.
+    assert pnl_walked != pytest.approx(expected_mid)
+    assert (expected_mid - pnl_walked) > 1.0, (
+        f"non-trivial spread expected; got walked={pnl_walked} mid={expected_mid}"
+    )
