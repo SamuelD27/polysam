@@ -155,6 +155,7 @@ class LiveExecutor:
             requested_shares=requested_shares,
             filled_shares=filled_shares,
             avg_price=avg_price,
+            transactions_hashes=_extract_transaction_hashes(resp),
         )
 
         spike = action.get("spike_score")
@@ -248,6 +249,7 @@ class LiveExecutor:
             requested_shares=size_shares,
             filled_shares=filled_shares,
             avg_price=avg_price,
+            transactions_hashes=_extract_transaction_hashes(resp),
         )
 
         return ExitResult(
@@ -369,13 +371,8 @@ class LiveExecutor:
 
         # V2 SDK: combined create_and_post_market_order replaces V1's
         # create_market_order + post_order(orderType=...) two-call pattern.
-        # options=None defers to V2's internal tick-size resolution (V1
-        # auto-fetched server-side via the GET /tick-size?token_id=... call
-        # visible in V1 traces; V2 either does the same internally or via
-        # its tick-size cache).
-        # TODO(probe): verify options=None works on first live probe; if V2
-        # requires explicit tick_size, switch to
-        # PartialCreateOrderOptions(tick_size=str(client.get_tick_size(token_id))).
+        # options=None defers to V2's internal tick-size resolution
+        # (verified against the 2026-04-29 live $5 probe).
         try:
             resp = self._client.create_and_post_market_order(
                 order_args=args,
@@ -464,25 +461,14 @@ def _token_for_side(side: str, ctx: MarketCtx) -> str | None:
 
 
 def _extract_fills(resp: dict, *, side: str) -> tuple[float, float]:
-    """Return (filled_shares, avg_price) from a CLOB response.
+    """Return (filled_shares, avg_price) from a CLOB V2 response.
 
-    Two response shapes are supported:
-
-    V1 (legacy, observed pre-cutover; still used by ``_fake_fill_response``
-    and may still appear if a paper test seeds V1-shaped fixtures):
+    Verified shape (2026-04-29 live $5 probe — V2 kept V1 CamelCase):
       { "success": bool, "orderID": str,
         "makingAmount": str,  # what WE gave up
         "takingAmount": str,  # what WE received
-        "status": str, ... }
-
-    V2 (CLOB V2, post-cutover): field names not yet fully verified against
-    a live response. Best-effort parsing reads both V1 CamelCase and V2
-    snake_case keys (``order_id``/``making_amount``/``taking_amount``).
-    TODO(probe): replace this best-effort branch with the actual V2 shape
-    captured from the first successful create_and_post_market_order call.
-    Specifically verify: is it ``makingAmount`` or ``making_amount``? Are
-    ``filled``/``status`` field names changed? Is there a per-fill array
-    that supersedes the aggregate makingAmount/takingAmount?
+        "status": str,
+        "transactionsHashes": list[str], ... }
 
     For a BUY  we gave USD and received shares → shares=takingAmount,
                                                   price=makingAmount/shares
@@ -503,10 +489,8 @@ def _extract_fills(resp: dict, *, side: str) -> tuple[float, float]:
     if status in ("unmatched", "cancelled", "rejected"):
         return 0.0, 0.0
 
-    # V1 CamelCase keys first (preserved for fake-response paths); V2
-    # snake_case as fallback. Both map to the same maker/taker semantics.
-    making = _to_float(resp.get("makingAmount") or resp.get("making_amount"))
-    taking = _to_float(resp.get("takingAmount") or resp.get("taking_amount"))
+    making = _to_float(resp.get("makingAmount"))
+    taking = _to_float(resp.get("takingAmount"))
     if making <= 0 or taking <= 0:
         return 0.0, 0.0
 
@@ -522,8 +506,23 @@ def _extract_fills(resp: dict, *, side: str) -> tuple[float, float]:
 def _get_order_id(resp: dict) -> str | None:
     if not resp:
         return None
-    # V1: orderID; V2: order_id (best-effort); legacy: id.
-    return resp.get("orderID") or resp.get("order_id") or resp.get("id")
+    return resp.get("orderID")
+
+
+def _extract_transaction_hashes(resp: dict | None) -> list[str] | None:
+    """Pull V2 ``transactionsHashes`` out of a CLOB response.
+
+    V2 returns the on-chain settlement tx hashes for filled orders so the
+    daemon can audit settlements against the chain. Returns None when the
+    field is missing (dry-run / unfilled / pre-V2 fixtures) or empty.
+    """
+    if not resp:
+        return None
+    raw = resp.get("transactionsHashes")
+    if not raw:
+        return None
+    hashes = [str(h) for h in raw if h]
+    return hashes or None
 
 
 def _redact(resp: dict | None) -> dict:
@@ -535,10 +534,11 @@ def _redact(resp: dict | None) -> dict:
         return {}
     keep = (
         "success", "status",
-        "orderID", "order_id",            # V1, V2
-        "errorMsg", "error_msg",          # V1, V2 (best-effort)
-        "makingAmount", "making_amount",  # V1, V2 (best-effort)
-        "takingAmount", "taking_amount",  # V1, V2 (best-effort)
+        "orderID",
+        "errorMsg",
+        "makingAmount",
+        "takingAmount",
+        "transactionsHashes",
     )
     return {k: resp[k] for k in keep if k in resp}
 
@@ -560,6 +560,7 @@ def _build_fill_details(
     requested_shares: float,
     filled_shares: float,
     avg_price: float,
+    transactions_hashes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Populate the fill-outcome subset of FILL_DETAILS_KEYS.
 
@@ -587,6 +588,7 @@ def _build_fill_details(
     details["residual_size_shares"] = residual
     details["classification"] = classification
     details["fill_vwap"] = float(avg_price) if filled > 0 and avg_price > 0 else None
+    details["transactions_hashes"] = transactions_hashes
     return details
 
 
