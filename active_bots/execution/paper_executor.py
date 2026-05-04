@@ -55,6 +55,7 @@ class PaperExecutor:
             return None
 
         spike = action.get("spike_score")
+        mid = action.get("entry_price_mid")
         return EntryResult(
             slug=market_ctx.slug,
             side=action["side"],
@@ -70,6 +71,7 @@ class PaperExecutor:
             fair_at_entry=action.get("fair"),
             market_at_entry=action.get("market"),
             t_zero=market_ctx.t_zero,
+            entry_price_mid=float(mid) if mid is not None else None,
             fill_details=_paper_fill_details(size_shares, entry_price),
         )
 
@@ -89,6 +91,13 @@ class PaperExecutor:
         pnl = float(action.get("pnl", 0.0))
         hold = float(action.get("hold_time_s", now - position.get("entry_time", now)))
 
+        size_shares = float(position["size_shares"])
+        mid = position.get("entry_price_mid")
+        pnl_mid = (
+            (exit_price - float(mid)) * size_shares - SPREAD_COST * size_shares
+            if mid is not None else None
+        )
+
         return ExitResult(
             slug=position["slug"],
             side=position["side"],
@@ -97,7 +106,7 @@ class PaperExecutor:
             pnl=pnl,
             edge=position.get("edge", 0.0),
             size_usdc=position["size_usdc"],
-            size_shares=position["size_shares"],
+            size_shares=size_shares,
             won=(exit_type == "TP" and pnl > 0),
             resolved_time=now,
             strike=position["strike"],
@@ -107,9 +116,9 @@ class PaperExecutor:
             time_zone=position.get("time_zone"),
             spike_score=position.get("spike_score"),
             hold_time_s=hold,
-            fill_details=_paper_fill_details(
-                float(position["size_shares"]), exit_price,
-            ),
+            entry_price_mid=float(mid) if mid is not None else None,
+            pnl_mid=pnl_mid,
+            fill_details=_paper_fill_details(size_shares, exit_price),
         )
 
     def resolve(
@@ -132,6 +141,12 @@ class PaperExecutor:
         exit_price = 1.0 if won else 0.0
         pnl = (exit_price - entry_price) * size_shares - spread_total
 
+        mid = position.get("entry_price_mid")
+        pnl_mid = (
+            (exit_price - float(mid)) * size_shares - spread_total
+            if mid is not None else None
+        )
+
         hold = now - position.get("entry_time", now)
 
         return ExitResult(
@@ -152,6 +167,8 @@ class PaperExecutor:
             time_zone=position.get("time_zone"),
             spike_score=position.get("spike_score"),
             hold_time_s=hold,
+            entry_price_mid=float(mid) if mid is not None else None,
+            pnl_mid=pnl_mid,
             fill_details=_paper_fill_details(size_shares, exit_price),
         )
 

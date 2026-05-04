@@ -162,7 +162,17 @@ class WalkedVWAPStrategy(RefinedStrategy):
         # Down-size if partial allowed
         if walk.classification == "partial" and WALKED_VWAP_PARTIAL_OK:
             action["size_shares"] = walk.filled_shares
-            action["size_usdc"] = walk.filled_shares * walk.vwap
+
+        # Replace the parent's mid-quoted entry with the realistic per-share cost
+        # (effective_VWAP = walked book + bell-curve fee). This makes downstream
+        # TP/SL math (EnhancedStrategy.evaluate uses position["entry_price"])
+        # operate against what the trader actually paid, not the mid. The
+        # original mid quote is preserved as entry_price_mid for diagnostics
+        # and for the parallel pnl_mid computed at exit.
+        size_shares = float(action["size_shares"])
+        action["entry_price_mid"] = float(action["entry_price"])
+        action["entry_price"] = eff_vwap
+        action["size_usdc"] = size_shares * eff_vwap
 
         action.update({
             "walked_VWAP": walk.vwap,

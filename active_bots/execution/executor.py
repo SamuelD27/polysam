@@ -43,6 +43,7 @@ FILL_DETAILS_KEYS: tuple[str, ...] = (
     "fill_vwap",
     "fill_levels",               # null: CLOB response has no per-level breakdown
     "levels_consumed",           # null: requires local book matching
+    "transactions_hashes",       # V2 only: list[str] of on-chain settlement tx hashes
     # book-context (null in this phase — see module docstring)
     "best_bid_at_decision",
     "best_ask_at_decision",
@@ -108,6 +109,11 @@ class EntryResult:
     fair_at_entry: float | None = None
     market_at_entry: float | None = None
     t_zero: int | None = None
+    # Mid-quoted price the parent strategy emitted before the walked-VWAP gate
+    # rewrote entry_price to effective_VWAP (book-walk + fees). Preserved so a
+    # parallel "what mid said" PnL can be computed at exit time. None on
+    # entries that did not pass through the walked-VWAP gate.
+    entry_price_mid: float | None = None
     # Live-only: set by LiveExecutor so Reconciler can match fills back.
     order_id: str | None = None
     token_id: str | None = None
@@ -153,6 +159,8 @@ class EntryResult:
             d["token_id"] = self.token_id
         if self.ack_ts is not None:
             d["ack_ts"] = self.ack_ts
+        if self.entry_price_mid is not None:
+            d["entry_price_mid"] = round(self.entry_price_mid, 4)
         return d
 
 
@@ -180,6 +188,14 @@ class ExitResult:
     time_zone: str | None = None
     spike_score: float | None = None
     hold_time_s: float | None = None
+    # Mirror of EntryResult.entry_price_mid carried through to the closed-trade
+    # row. None when the entry did not pass through the walked-VWAP gate.
+    entry_price_mid: float | None = None
+    # Parallel PnL using entry_price_mid instead of the actual entry_price
+    # (= effective_VWAP after the walked-VWAP gate). Same exit_price + fees.
+    # Lets the dashboard surface "what naive mid math would have predicted"
+    # alongside the real walked PnL. None when entry_price_mid is None.
+    pnl_mid: float | None = None
     # Observability payload attached to events.jsonl exit_filled rows.
     # Same schema + rationale as EntryResult.fill_details.
     fill_details: dict[str, Any] = field(default_factory=empty_fill_details)
@@ -208,6 +224,10 @@ class ExitResult:
             d["spike_score"] = self.spike_score
         if self.hold_time_s is not None:
             d["hold_time_s"] = round(self.hold_time_s, 1)
+        if self.entry_price_mid is not None:
+            d["entry_price_mid"] = round(self.entry_price_mid, 4)
+        if self.pnl_mid is not None:
+            d["pnl_mid"] = round(self.pnl_mid, 2)
         return d
 
 

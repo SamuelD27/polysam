@@ -159,6 +159,7 @@ class LiveExecutor:
         )
 
         spike = action.get("spike_score")
+        mid = action.get("entry_price_mid")
         return EntryResult(
             slug=market_ctx.slug,
             side=action["side"],
@@ -176,6 +177,7 @@ class LiveExecutor:
             t_zero=market_ctx.t_zero,
             order_id=_get_order_id(resp),
             token_id=token_id,
+            entry_price_mid=float(mid) if mid is not None else None,
             fill_details=fill_details,
         )
 
@@ -239,6 +241,12 @@ class LiveExecutor:
         pnl = (avg_price - entry_price) * filled_shares
         hold = now - float(position.get("entry_time", now))
 
+        mid = position.get("entry_price_mid")
+        pnl_mid = (
+            (avg_price - float(mid)) * filled_shares
+            if mid is not None else None
+        )
+
         logger.info(
             "EXIT %s %s %s @%.4f shares=%.2f pnl=%+.2f hold=%.0fs",
             exit_type, position["side"], position["slug"],
@@ -270,6 +278,8 @@ class LiveExecutor:
             time_zone=position.get("time_zone"),
             spike_score=position.get("spike_score"),
             hold_time_s=hold,
+            entry_price_mid=float(mid) if mid is not None else None,
+            pnl_mid=pnl_mid,
             fill_details=fill_details,
         )
 
@@ -301,6 +311,12 @@ class LiveExecutor:
         pnl = (exit_price - entry_price) * size_shares
         hold = now - float(position.get("entry_time", now))
 
+        mid = position.get("entry_price_mid")
+        pnl_mid = (
+            (exit_price - float(mid)) * size_shares
+            if mid is not None else None
+        )
+
         logger.info(
             "RESOLVE (on-chain settlement pending) %s %s won=%s expected_pnl=%+.2f",
             side, position["slug"], won, pnl,
@@ -324,6 +340,8 @@ class LiveExecutor:
             time_zone=position.get("time_zone"),
             spike_score=position.get("spike_score"),
             hold_time_s=hold,
+            entry_price_mid=float(mid) if mid is not None else None,
+            pnl_mid=pnl_mid,
         )
 
     # ── Reconcile ─────────────────────────────────────────────────────────

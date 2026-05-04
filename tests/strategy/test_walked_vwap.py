@@ -342,3 +342,111 @@ def test_partial_fill_on_downsizes(monkeypatch):
     assert out["action"] == "ENTER"
     assert out["size_shares"] == pytest.approx(5.0)
     assert out["walked_VWAP"] == pytest.approx(0.30)
+
+
+# ── entry_price overwrite + entry_price_mid preservation ────────────────────
+
+def test_gate_pass_overwrites_entry_price_with_effective_vwap(monkeypatch):
+    """On gate-pass the action's entry_price is overwritten with effective_VWAP
+    (book-walk + bell-curve fees) so dry-run / live PnL reflects realizable
+    fills. The original mid quote is preserved as entry_price_mid."""
+    s, mb = _make_strategy_with_books(
+        yes_asks=[{"price": "0.30", "size": "1000"}],
+    )
+    monkeypatch.setattr(s, "_run_parent_on_tick",
+                        lambda *a, **k: _refined_would_enter_action())
+    out = s.on_tick(
+        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    assert out["action"] == "ENTER"
+    # Mid (parent-quoted) preserved as diagnostic
+    assert out["entry_price_mid"] == pytest.approx(0.30)
+    # entry_price now equals the effective per-share cost (= walked_VWAP +
+    # fee/share). Since walked_VWAP = 0.30 and the book has 1 level, fees push
+    # the effective up by a small amount.
+    assert out["entry_price"] == pytest.approx(out["effective_VWAP"])
+    assert out["entry_price"] > out["entry_price_mid"]
+    # size_usdc is recomputed against the new (higher) per-share cost
+    assert out["size_usdc"] == pytest.approx(
+        out["size_shares"] * out["effective_VWAP"]
+    )
+
+
+def test_paper_executor_carries_entry_price_mid_and_pnl_mid():
+    """PaperExecutor stores entry_price_mid on the position, and at exit
+    computes a parallel pnl_mid using the mid as the entry baseline."""
+    from active_bots.execution.executor import MarketCtx
+    from active_bots.execution.paper_executor import PaperExecutor
+
+    ex = PaperExecutor()
+    ctx = MarketCtx(slug="s", t_zero=1000, strike=110_000.0)
+    action = {
+        "action": "ENTER",
+        "side": "Up",
+        "entry_price": 0.32,        # post-gate, walked
+        "entry_price_mid": 0.30,    # pre-gate, parent's mid quote
+        "size_usdc": 32.0,
+        "size_shares": 100.0,
+        "edge": 0.20,
+        "fair": 0.50,
+        "market": 0.30,
+    }
+    entry = ex.enter(action, ctx, now=1776860000.0)
+    assert entry is not None
+    assert entry.entry_price == pytest.approx(0.32)
+    assert entry.entry_price_mid == pytest.approx(0.30)
+    pos = entry.to_position_dict()
+    assert pos["entry_price"] == pytest.approx(0.32)
+    assert pos["entry_price_mid"] == pytest.approx(0.30)
+
+    exit_action = {
+        "action": "EXIT_TP",
+        "exit_price": 0.45,
+        # Strategy quotes pnl using position["entry_price"] (= 0.32):
+        # (0.45 - 0.32) * 100 - 0.01 * 100 = 13.0 - 1.0 = 12.0
+        "pnl": 12.0,
+        "hold_time_s": 60.0,
+    }
+    res = ex.exit(pos, exit_action, ctx, now=1776860100.0, btc_price=109_000.0)
+    assert res is not None
+    assert res.pnl == pytest.approx(12.0)
+    # pnl_mid uses entry_price_mid (= 0.30): (0.45 - 0.30) * 100 - 1.0 = 14.0
+    assert res.pnl_mid == pytest.approx(14.0)
+    assert res.entry_price_mid == pytest.approx(0.30)
+    trade = res.to_trade_dict()
+    assert trade["pnl"] == pytest.approx(12.0)
+    assert trade["pnl_mid"] == pytest.approx(14.0)
+    assert trade["entry_price_mid"] == pytest.approx(0.30)
+
+
+def test_paper_executor_entries_without_mid_omit_pnl_mid():
+    """Backwards compat: entries that did not pass through the walked-VWAP gate
+    have no entry_price_mid → no pnl_mid is computed and the trade dict
+    excludes both keys."""
+    from active_bots.execution.executor import MarketCtx
+    from active_bots.execution.paper_executor import PaperExecutor
+
+    ex = PaperExecutor()
+    ctx = MarketCtx(slug="s", t_zero=1000, strike=110_000.0)
+    action = {
+        "action": "ENTER", "side": "Up", "entry_price": 0.30,
+        "size_usdc": 30.0, "size_shares": 100.0, "edge": 0.20,
+    }
+    entry = ex.enter(action, ctx, now=1776860000.0)
+    assert entry is not None
+    assert entry.entry_price_mid is None
+    pos = entry.to_position_dict()
+    assert "entry_price_mid" not in pos
+
+    exit_action = {
+        "action": "EXIT_TP", "exit_price": 0.40, "pnl": 9.0, "hold_time_s": 60.0,
+    }
+    res = ex.exit(pos, exit_action, ctx, now=1776860100.0, btc_price=109_000.0)
+    assert res is not None
+    assert res.pnl_mid is None
+    trade = res.to_trade_dict()
+    assert "pnl_mid" not in trade
+    assert "entry_price_mid" not in trade
