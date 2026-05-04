@@ -1703,6 +1703,7 @@ async def strategy_loop(
                                     events.log(
                                         "entry_filled", strategy="base",
                                         position=result.to_position_dict(),
+                                        order_id=result.order_id, token_id=result.token_id,
                                         fill_details=result.fill_details,
                                     )
                                     logger.info(
