@@ -189,6 +189,32 @@ FORCE_EXIT_BEFORE_S = float(os.environ.get("FORCE_EXIT_BEFORE_S", 30.0))
 # Set to 0 to disable.
 TP_ABSOLUTE_FAVOR = float(os.environ.get("TP_ABSOLUTE_FAVOR", 0.10))
 
+# Phase 4A — absolute SL cap, mirror of TP_ABSOLUTE_FAVOR. When set, SL
+# fires if delta_against >= this regardless of the adaptive curve. Default
+# unset (None = disabled) so today's behaviour is preserved bit-for-bit.
+# Reads as None when the env var is unset/empty/non-numeric. Pattern matches
+# WALKED_VWAP_EXIT_ENABLE — the operator opts in per deployment.
+def _parse_optional_float(raw: str | None) -> float | None:
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+SL_ABSOLUTE_AGAINST: float | None = _parse_optional_float(
+    os.environ.get("SL_ABSOLUTE_AGAINST"),
+)
+
+# Phase 4B — time-decay on adaptive SL, mirror of adaptive_tp's decay.
+# When SL_DECAY_ENABLE=1, the SL threshold starts at the un-decayed
+# adaptive_sl ceiling at entry and shrinks linearly toward
+# SL_DELTA_DECAY_FLOOR over the cycle. Default 0 = today's static
+# adaptive_sl curve.
+SL_DECAY_ENABLE = os.environ.get("SL_DECAY_ENABLE", "0").strip() in ("1", "true", "True")
+SL_DELTA_DECAY_FLOOR = float(os.environ.get("SL_DELTA_DECAY_FLOOR", 0.05))
+
 # Outside the force-exit window, ProfitGrabber refuses to act on a market
 # quote older than this — protects against booking a phantom TP/SL when the
 # RTDS feed has stalled. Inside the force-window we take whatever we have.
@@ -224,6 +250,40 @@ def adaptive_sl(
     return max(lo, min(hi, 0.5 * edge + 0.05))
 
 
+def adaptive_sl_decayed(
+    edge: float,
+    time_remaining: float,
+    sl_delta_min: float | None = None,
+    sl_delta_max: float | None = None,
+    sl_delta_decay_floor: float | None = None,
+) -> float:
+    """Time-decayed SL threshold (mirror of ``adaptive_tp``).
+
+    At entry (``time_remaining == MARKET_DURATION``): returns the un-decayed
+    ``adaptive_sl(edge)`` value — bit-for-bit identical to today.
+    As the clock runs down, the threshold linearly shrinks toward
+    ``sl_delta_decay_floor`` so that late in the cycle a smaller drawdown
+    triggers SL (mirror of the TP decay logic that takes any profit late).
+
+    Args:
+        edge: entry edge of the position (drives the un-decayed ceiling).
+        time_remaining: seconds remaining on the market.
+        sl_delta_min / sl_delta_max: bounds for ``adaptive_sl``; passed
+            through unchanged.
+        sl_delta_decay_floor: target asymptote at ``time_remaining = 0``.
+            Defaults to module-level ``SL_DELTA_DECAY_FLOOR``.
+
+    Returns:
+        Threshold in [floor, adaptive_sl(edge)] depending on time remaining.
+    """
+    floor = SL_DELTA_DECAY_FLOOR if sl_delta_decay_floor is None else sl_delta_decay_floor
+    ceiling = adaptive_sl(edge, sl_delta_min=sl_delta_min, sl_delta_max=sl_delta_max)
+    if time_remaining <= 0:
+        return floor
+    frac = max(0.0, min(1.0, time_remaining / MARKET_DURATION))
+    return max(floor, floor + (ceiling - floor) * frac)
+
+
 class ProfitGrabber:
     """Monitors open positions and triggers TP/SL exits before resolution.
 
@@ -232,6 +292,10 @@ class ProfitGrabber:
     fall back to the module-level env-driven globals.
     """
 
+    # Sentinel for "use module default" so callers can explicitly pass None
+    # to mean "disabled" for sl_absolute_against without hitting the default.
+    _UNSET = object()
+
     def __init__(
         self,
         tp_delta_min: float | None = None,
@@ -239,6 +303,9 @@ class ProfitGrabber:
         sl_delta_max: float | None = None,
         tp_absolute_favor: float | None = None,
         force_exit_before_s: float | None = None,
+        sl_absolute_against: float | None | object = _UNSET,
+        sl_decay_enable: bool | None = None,
+        sl_delta_decay_floor: float | None = None,
     ) -> None:
         self.tp_delta_min = TP_DELTA_MIN if tp_delta_min is None else tp_delta_min
         self.sl_delta_min = SL_DELTA_MIN if sl_delta_min is None else sl_delta_min
@@ -248,6 +315,18 @@ class ProfitGrabber:
         )
         self.force_exit_before_s = (
             FORCE_EXIT_BEFORE_S if force_exit_before_s is None else force_exit_before_s
+        )
+        # Phase 4A: None = absolute SL cap disabled (today's behaviour).
+        # Use _UNSET sentinel so callers can pass None to override env-derived
+        # default ("yes I want it disabled even if SL_ABSOLUTE_AGAINST is set").
+        self.sl_absolute_against: float | None = (
+            SL_ABSOLUTE_AGAINST if sl_absolute_against is ProfitGrabber._UNSET
+            else sl_absolute_against  # type: ignore[assignment]
+        )
+        # Phase 4B: time-decay on adaptive SL.
+        self.sl_decay_enable = SL_DECAY_ENABLE if sl_decay_enable is None else sl_decay_enable
+        self.sl_delta_decay_floor = (
+            SL_DELTA_DECAY_FLOOR if sl_delta_decay_floor is None else sl_delta_decay_floor
         )
 
     def check_exit(
@@ -307,16 +386,35 @@ class ProfitGrabber:
         delta_against = entry_price - realizable
 
         tp_delta = adaptive_tp(entry_edge, time_remaining, tp_delta_min=self.tp_delta_min)
-        sl_delta = adaptive_sl(
-            entry_edge, sl_delta_min=self.sl_delta_min, sl_delta_max=self.sl_delta_max
-        )
+        # Phase 4B: when sl_decay_enable=True, the SL threshold time-decays
+        # toward sl_delta_decay_floor. Default-off: identical to today.
+        if self.sl_decay_enable:
+            sl_delta = adaptive_sl_decayed(
+                entry_edge,
+                time_remaining,
+                sl_delta_min=self.sl_delta_min,
+                sl_delta_max=self.sl_delta_max,
+                sl_delta_decay_floor=self.sl_delta_decay_floor,
+            )
+        else:
+            sl_delta = adaptive_sl(
+                entry_edge, sl_delta_min=self.sl_delta_min, sl_delta_max=self.sl_delta_max
+            )
 
+        # Phase 4A: absolute SL cap (mirror of tp_absolute_favor). When set,
+        # SL fires if delta_against >= cap regardless of the adaptive curve.
+        # Treated independently of the adaptive_sl branch — semantically the
+        # cap is "no matter what the conviction-scaled curve says, never let
+        # a drawdown exceed this hard limit." None = disabled (today's behaviour).
+        sl_absolute_against = self.sl_absolute_against
         if in_force_window:
             action = "EXIT_TP" if delta_favor >= 0 else "EXIT_SL"
         elif self.tp_absolute_favor > 0 and delta_favor >= self.tp_absolute_favor:
             action = "EXIT_TP"
         elif delta_favor >= tp_delta:
             action = "EXIT_TP"
+        elif sl_absolute_against is not None and delta_against >= sl_absolute_against:
+            action = "EXIT_SL"
         elif delta_against >= sl_delta:
             action = "EXIT_SL"
         else:

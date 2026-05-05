@@ -241,6 +241,12 @@ class WalkedVWAPStrategy(RefinedStrategy):
                 sl_delta_max=self.profit_grabber.sl_delta_max,
                 tp_absolute_favor=self.profit_grabber.tp_absolute_favor,
                 force_exit_before_s=self.profit_grabber.force_exit_before_s,
+                # Phase 4A/4B: forward the SL asymmetry knobs so the swap
+                # preserves whatever the parent's ProfitGrabber resolved
+                # from env vars / explicit kwargs.
+                sl_absolute_against=self.profit_grabber.sl_absolute_against,
+                sl_decay_enable=self.profit_grabber.sl_decay_enable,
+                sl_delta_decay_floor=self.profit_grabber.sl_delta_decay_floor,
             )
 
     def _run_parent_on_tick(
