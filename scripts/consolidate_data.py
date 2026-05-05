@@ -18,6 +18,17 @@ ASSETS = ("btc", "doge", "eth", "sol", "xrp")
 DB_PATHS = {asset: DATA_DIR / f"{asset}5m.db" for asset in ASSETS}
 
 
+def slug_to_asset(slug: str | None) -> str | None:
+    """Map a market slug to its underlying asset, or None if unknown."""
+    if not slug:
+        return None
+    s = slug.lower()
+    for asset in ASSETS:
+        if s.startswith(f"{asset}-"):
+            return asset
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
