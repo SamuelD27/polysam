@@ -71,7 +71,8 @@ class ShutdownTimeoutTests(unittest.TestCase):
                 # until they give up. Go straight to the bounded wait,
                 # which is the line of code this test is guarding.
                 _, pending = await asyncio.wait(
-                    tasks, timeout=daemon_base_v1.SHUTDOWN_TIMEOUT_S,
+                    tasks,
+                    timeout=daemon_base_v1.SHUTDOWN_TIMEOUT_S,
                 )
                 pending_count = len(pending)
 
@@ -94,7 +95,8 @@ class ShutdownTimeoutTests(unittest.TestCase):
 
         pending_count = asyncio.run(bounded())
         self.assertEqual(
-            pending_count, 2,
+            pending_count,
+            2,
             "asyncio.wait must surface tasks that ignored cancel as pending — "
             "otherwise the daemon's shutdown timeout has no effect.",
         )

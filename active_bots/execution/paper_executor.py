@@ -15,7 +15,8 @@ SPREAD_COST = 0.01  # matches daemon_base_v1 constant
 
 
 def _paper_fill_details(
-    requested_shares: float, fill_price: float | None,
+    requested_shares: float,
+    fill_price: float | None,
 ) -> dict[str, Any]:
     """Paper fills are always full at the quoted price; book-context
     fields stay None for parity with LiveExecutor (see executor.py
@@ -32,6 +33,15 @@ def _paper_fill_details(
 
 
 class PaperExecutor:
+    """No-network executor — simulates fills at the strategy's quoted prices.
+
+    Default for ``POLYMARKET_MODE=paper``. Entry price is whatever the
+    strategy emits (e.g. ``effective_VWAP`` after the walked-VWAP gate),
+    exit price is the strategy's ``EXIT_TP``/``EXIT_SL`` action ``exit_price``,
+    and resolutions are deterministic Up-wins-iff-(BTC > strike). No order
+    book interaction, no order_ids, no reconcile work.
+    """
+
     mode = "paper"
 
     def enter(
@@ -42,15 +52,14 @@ class PaperExecutor:
         *,
         source: str = "edge",
     ) -> EntryResult | None:
+        """Open a paper position by accepting the strategy's quoted entry price."""
         entry_price = float(action["entry_price"])
         if entry_price <= 0:
             return None
         size_usdc = float(action.get("size_usdc", 0.0))
         if size_usdc <= 0:
             return None
-        size_shares = float(
-            action.get("size_shares", size_usdc / entry_price) or 0.0
-        )
+        size_shares = float(action.get("size_shares", size_usdc / entry_price) or 0.0)
         if size_shares <= 0:
             return None
 
@@ -95,7 +104,8 @@ class PaperExecutor:
         mid = position.get("entry_price_mid")
         pnl_mid = (
             (exit_price - float(mid)) * size_shares - SPREAD_COST * size_shares
-            if mid is not None else None
+            if mid is not None
+            else None
         )
 
         return ExitResult(
@@ -143,8 +153,7 @@ class PaperExecutor:
 
         mid = position.get("entry_price_mid")
         pnl_mid = (
-            (exit_price - float(mid)) * size_shares - spread_total
-            if mid is not None else None
+            (exit_price - float(mid)) * size_shares - spread_total if mid is not None else None
         )
 
         hold = now - position.get("entry_time", now)
@@ -173,4 +182,5 @@ class PaperExecutor:
         )
 
     def reconcile(self, now: float) -> None:
+        """No-op — paper mode has no pending fills to reconcile."""
         return None

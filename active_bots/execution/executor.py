@@ -39,11 +39,11 @@ FILL_DETAILS_KEYS: tuple[str, ...] = (
     "requested_size_shares",
     "filled_size_shares",
     "residual_size_shares",
-    "classification",            # "full" | "partial" | "unfilled"
+    "classification",  # "full" | "partial" | "unfilled"
     "fill_vwap",
-    "fill_levels",               # null: CLOB response has no per-level breakdown
-    "levels_consumed",           # null: requires local book matching
-    "transactions_hashes",       # V2 only: list[str] of on-chain settlement tx hashes
+    "fill_levels",  # null: CLOB response has no per-level breakdown
+    "levels_consumed",  # null: requires local book matching
+    "transactions_hashes",  # V2 only: list[str] of on-chain settlement tx hashes
     # book-context (null in this phase — see module docstring)
     "best_bid_at_decision",
     "best_ask_at_decision",
@@ -84,6 +84,7 @@ class MarketCtx:
 
     @property
     def ready_for_live(self) -> bool:
+        """True iff both YES and NO token_ids are resolved (LiveExecutor needs both)."""
         return bool(self.yes_token_id and self.no_token_id)
 
 
@@ -96,14 +97,14 @@ class EntryResult:
     """
 
     slug: str
-    side: str                # "Up" | "Down"
-    entry_price: float       # actual avg fill price, not strategy estimate
-    size_usdc: float         # actual notional filled
-    size_shares: float       # actual shares filled
+    side: str  # "Up" | "Down"
+    entry_price: float  # actual avg fill price, not strategy estimate
+    size_usdc: float  # actual notional filled
+    size_shares: float  # actual shares filled
     strike: float
     entry_time: float
     edge: float = 0.0
-    source: str = "edge"     # "edge" | "squeeze" | "base"
+    source: str = "edge"  # "edge" | "squeeze" | "base"
     time_zone: str | None = None
     spike_score: float | None = None
     fair_at_entry: float | None = None
@@ -143,9 +144,7 @@ class EntryResult:
             "entry_time": self.entry_time,
             "source": self.source,
             "time_zone": self.time_zone,
-            "spike_score": (
-                round(self.spike_score, 2) if self.spike_score is not None else None
-            ),
+            "spike_score": (round(self.spike_score, 2) if self.spike_score is not None else None),
         }
         if self.fair_at_entry is not None:
             d["fair_at_entry"] = round(self.fair_at_entry, 4)
@@ -183,7 +182,7 @@ class ExitResult:
     resolved_time: float
     strike: float
     final_btc: float
-    exit_type: str           # "TP" | "SL" | "RESOLUTION"
+    exit_type: str  # "TP" | "SL" | "RESOLUTION"
     source: str | None = None
     time_zone: str | None = None
     spike_score: float | None = None
@@ -201,6 +200,7 @@ class ExitResult:
     fill_details: dict[str, Any] = field(default_factory=empty_fill_details)
 
     def to_trade_dict(self) -> dict[str, Any]:
+        """Dict shape matching legacy state.{base,enh,refined,walked}_trades."""
         d: dict[str, Any] = {
             "slug": self.slug,
             "side": self.side,
@@ -244,7 +244,9 @@ class Executor(Protocol):
         now: float,
         *,
         source: str = "edge",
-    ) -> EntryResult | None: ...
+    ) -> EntryResult | None:
+        """Open a position from a strategy ``ENTER`` action. None on reject."""
+        ...
 
     def exit(
         self,
@@ -254,7 +256,9 @@ class Executor(Protocol):
         now: float,
         *,
         btc_price: float,
-    ) -> ExitResult | None: ...
+    ) -> ExitResult | None:
+        """Close a position from a strategy ``EXIT_TP`` / ``EXIT_SL`` action."""
+        ...
 
     def resolve(
         self,
@@ -263,6 +267,10 @@ class Executor(Protocol):
         now: float,
         *,
         btc_price: float,
-    ) -> ExitResult | None: ...
+    ) -> ExitResult | None:
+        """Settle an unresolved position at its final BTC outcome."""
+        ...
 
-    def reconcile(self, now: float) -> None: ...
+    def reconcile(self, now: float) -> None:
+        """Per-tick housekeeping: reconcile pending live orders / paper-mode no-op."""
+        ...

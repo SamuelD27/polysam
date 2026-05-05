@@ -45,6 +45,7 @@ MAX_ENTRY_PRICE = 0.95  # symmetric: avoid near-certain outcomes too
 
 # ── Enhancement 1: Time-Based Entry ─────────────────────────────���──────────
 
+
 class TimeBasedStrategy:
     """Edge entry strategy with time-zone-adaptive thresholds.
 
@@ -56,13 +57,13 @@ class TimeBasedStrategy:
         self,
         edge_max: float = EDGE_MAX,
         max_risk: float = MAX_RISK,
-    ):
+    ) -> None:
         self.edge_max = edge_max
         self.max_risk = max_risk
 
-        self._t_zero = None
-        self._strike = None
-        self._open_position = None
+        self._t_zero: float | None = None
+        self._strike: float | None = None
+        self._open_position: dict[str, Any] | None = None
         self._resolved = False
 
     def reset(self, t_zero: float | None = None, strike: float | None = None) -> None:
@@ -74,10 +75,12 @@ class TimeBasedStrategy:
 
     @property
     def has_position(self) -> bool:
+        """True iff an open position is currently held on this market."""
         return self._open_position is not None
 
     @property
     def is_resolved(self) -> bool:
+        """True iff the current market has already been resolved (won/lost)."""
         return self._resolved
 
     def on_tick(
@@ -121,7 +124,8 @@ class TimeBasedStrategy:
 
                     if edge >= zone_edge_min and MIN_ENTRY_PRICE <= entry_price <= MAX_ENTRY_PRICE:
                         size_usdc, size_shares = compute_position_size(
-                            edge, entry_price,
+                            edge,
+                            entry_price,
                             edge_min=zone_edge_min,
                             edge_max=self.edge_max,
                             max_risk=self.max_risk,
@@ -185,6 +189,12 @@ FORCE_EXIT_BEFORE_S = float(os.environ.get("FORCE_EXIT_BEFORE_S", 30.0))
 # Set to 0 to disable.
 TP_ABSOLUTE_FAVOR = float(os.environ.get("TP_ABSOLUTE_FAVOR", 0.10))
 
+# Outside the force-exit window, ProfitGrabber refuses to act on a market
+# quote older than this — protects against booking a phantom TP/SL when the
+# RTDS feed has stalled. Inside the force-window we take whatever we have.
+# Distinct from book staleness (WALKED_VWAP_*_STALENESS_S env vars).
+MARKET_PRICE_STALENESS_S = 10.0
+
 
 def adaptive_tp(edge: float, time_remaining: float, tp_delta_min: float | None = None) -> float:
     """Time-decayed TP threshold.
@@ -229,12 +239,16 @@ class ProfitGrabber:
         sl_delta_max: float | None = None,
         tp_absolute_favor: float | None = None,
         force_exit_before_s: float | None = None,
-    ):
+    ) -> None:
         self.tp_delta_min = TP_DELTA_MIN if tp_delta_min is None else tp_delta_min
         self.sl_delta_min = SL_DELTA_MIN if sl_delta_min is None else sl_delta_min
         self.sl_delta_max = SL_DELTA_MAX if sl_delta_max is None else sl_delta_max
-        self.tp_absolute_favor = TP_ABSOLUTE_FAVOR if tp_absolute_favor is None else tp_absolute_favor
-        self.force_exit_before_s = FORCE_EXIT_BEFORE_S if force_exit_before_s is None else force_exit_before_s
+        self.tp_absolute_favor = (
+            TP_ABSOLUTE_FAVOR if tp_absolute_favor is None else tp_absolute_favor
+        )
+        self.force_exit_before_s = (
+            FORCE_EXIT_BEFORE_S if force_exit_before_s is None else force_exit_before_s
+        )
 
     def check_exit(
         self,
@@ -265,7 +279,9 @@ class ProfitGrabber:
         strike = position["strike"]
         entry_price = position["entry_price"]
         side = position["side"]
-        entry_edge = float(position.get("edge", 0.10))
+        # Default to EDGE_MIN when the position dict lacks an `edge` field —
+        # a phantom open from a buggy code path shouldn't crash check_exit.
+        entry_edge = float(position.get("edge", EDGE_MIN))
 
         fair_up = compute_fair_price(btc_price, strike, sigma, time_remaining)
         current_fair = fair_up if side == "Up" else 1.0 - fair_up
@@ -273,7 +289,7 @@ class ProfitGrabber:
         market_fresh = (
             market_price_up is not None
             and market_price_ts > 0.0
-            and (now - market_price_ts) < 10.0
+            and (now - market_price_ts) < MARKET_PRICE_STALENESS_S
         )
         # Force-exit window: close to resolution, never hold — take whatever
         # the last known price gives us. Outside the window we still require
@@ -291,7 +307,9 @@ class ProfitGrabber:
         delta_against = entry_price - realizable
 
         tp_delta = adaptive_tp(entry_edge, time_remaining, tp_delta_min=self.tp_delta_min)
-        sl_delta = adaptive_sl(entry_edge, sl_delta_min=self.sl_delta_min, sl_delta_max=self.sl_delta_max)
+        sl_delta = adaptive_sl(
+            entry_edge, sl_delta_min=self.sl_delta_min, sl_delta_max=self.sl_delta_max
+        )
 
         if in_force_window:
             action = "EXIT_TP" if delta_favor >= 0 else "EXIT_SL"
@@ -330,6 +348,11 @@ SQUEEZE_ENTRY_MIN = 60
 SQUEEZE_ENTRY_MAX = 150
 SQUEEZE_REVERSION_FRAC = 0.30
 
+# Squeeze sizing: map (spike_score - threshold) onto [0, EDGE_MAX] linearly,
+# saturating at SPIKE_SCORE_SAT_HIGH. The 4.0 ceiling is empirical — spike
+# scores above this are rare and don't size up the position further.
+SPIKE_SCORE_SAT_HIGH = 4.0
+
 
 class SqueezeDetector:
     """Detects early BTC spikes and trades mean reversion.
@@ -351,7 +374,7 @@ class SqueezeDetector:
         reversion_frac: float = SQUEEZE_REVERSION_FRAC,
         edge_max: float = EDGE_MAX,
         max_risk: float = MAX_RISK,
-    ):
+    ) -> None:
         self.spike_threshold = spike_threshold
         self.spike_window = spike_window
         self.entry_min = entry_min
@@ -361,7 +384,7 @@ class SqueezeDetector:
         self.max_risk = max_risk
 
         self._max_deviation = 0.0
-        self._spike_direction = None
+        self._spike_direction: str | None = None
         self._spike_score = 0.0
         self._is_squeeze_candidate = False
         self._entered = False
@@ -376,14 +399,17 @@ class SqueezeDetector:
 
     @property
     def is_squeeze_candidate(self) -> bool:
+        """True iff this market triggered the spike threshold in the detection window."""
         return self._is_squeeze_candidate
 
     @property
     def spike_score(self) -> float:
+        """Z-score of the spike — `max |ln(S/K)| / (sigma * sqrt(elapsed/year))`."""
         return self._spike_score
 
     @property
     def spike_direction(self) -> str | None:
+        """`"up"` or `"down"` per the direction of the detected spike, or None."""
         return self._spike_direction
 
     def on_tick(
@@ -460,13 +486,22 @@ class SqueezeDetector:
         if not (MIN_ENTRY_PRICE <= entry_price <= MAX_ENTRY_PRICE):
             return None
 
-        # Size based on spike score (clamped)
-        edge_equiv = min((self._spike_score - self.spike_threshold) / (4.0 - self.spike_threshold), 1.0) * 0.25
+        # Size based on spike score (clamped) — linear interp from 0 at the
+        # detection threshold to EDGE_MAX at SPIKE_SCORE_SAT_HIGH.
+        edge_equiv = (
+            min(
+                (self._spike_score - self.spike_threshold)
+                / (SPIKE_SCORE_SAT_HIGH - self.spike_threshold),
+                1.0,
+            )
+            * EDGE_MAX
+        )
         if edge_equiv <= 0.0:
             edge_equiv = EDGE_MIN
 
         size_usdc, size_shares = compute_position_size(
-            edge_equiv, entry_price,
+            edge_equiv,
+            entry_price,
             edge_min=EDGE_MIN,
             edge_max=self.edge_max,
             max_risk=self.max_risk,
@@ -485,6 +520,7 @@ class SqueezeDetector:
 
 
 # ── Combined Strategy ───────────────────────────────���──────────────────────
+
 
 class EnhancedStrategy:
     """Combined strategy with all 3 enhancements.
@@ -508,17 +544,17 @@ class EnhancedStrategy:
         tp_absolute_favor: float | None = None,
         force_exit_before_s: float | None = None,
         role: str = "observer",
-    ):
+    ) -> None:
         if role not in ("trader", "observer"):
-            raise ValueError(
-                f"role must be 'trader' or 'observer', got {role!r}"
-            )
+            raise ValueError(f"role must be 'trader' or 'observer', got {role!r}")
         self.role = role
+        self.time_strategy: TimeBasedStrategy | BaseStrategy
         if enable_time_based:
             self.time_strategy = TimeBasedStrategy(max_risk=max_risk)
         else:
             self.time_strategy = BaseStrategy(max_risk=max_risk)
 
+        self.profit_grabber: ProfitGrabber | None
         if enable_profit_grabber:
             self.profit_grabber = ProfitGrabber(
                 tp_delta_min=tp_delta_min,
@@ -530,15 +566,16 @@ class EnhancedStrategy:
         else:
             self.profit_grabber = None
 
+        self.squeeze: SqueezeDetector | None
         if enable_squeeze:
             self.squeeze = SqueezeDetector(max_risk=max_risk)
         else:
             self.squeeze = None
 
-        self._t_zero = None
-        self._strike = None
-        self._open_position = None
-        self._position_source = None
+        self._t_zero: float | None = None
+        self._strike: float | None = None
+        self._open_position: dict[str, Any] | None = None
+        self._position_source: str | None = None
         self._resolved = False
 
     def reset(self, t_zero: float | None = None, strike: float | None = None) -> None:
@@ -555,10 +592,12 @@ class EnhancedStrategy:
 
     @property
     def has_position(self) -> bool:
+        """True iff an open position is currently held on this market."""
         return self._open_position is not None
 
     @property
     def is_resolved(self) -> bool:
+        """True iff the current market has already been resolved (won/lost)."""
         return self._resolved
 
     def on_tick(
@@ -587,9 +626,16 @@ class EnhancedStrategy:
         time_remaining = MARKET_DURATION - elapsed
 
         # 1. Profit grabber on existing position
-        if self.profit_grabber is not None and self._open_position is not None and not self._resolved:
+        if (
+            self.profit_grabber is not None
+            and self._open_position is not None
+            and not self._resolved
+        ):
             exit_action = self.profit_grabber.check_exit(
-                self._open_position, btc_price, sigma, self._t_zero,
+                self._open_position,
+                btc_price,
+                sigma,
+                self._t_zero,
                 market_price_up=market_price_up,
                 market_price_ts=market_price_ts,
             )
@@ -624,7 +670,9 @@ class EnhancedStrategy:
                     "entry_time": now,
                     "entry_elapsed": elapsed,
                     "edge": sq_action.get("spike_score", 0.0),
-                    "fair_price": compute_fair_price(btc_price, self._strike, sigma, time_remaining),
+                    "fair_price": compute_fair_price(
+                        btc_price, self._strike, sigma, time_remaining
+                    ),
                     "market_price_up": market_price_up,
                     "market_price_ts": 0.0,
                 }
@@ -645,7 +693,9 @@ class EnhancedStrategy:
                     "entry_time": now,
                     "entry_elapsed": elapsed,
                     "edge": entry["edge"],
-                    "fair_price": compute_fair_price(btc_price, self._strike, sigma, time_remaining),
+                    "fair_price": compute_fair_price(
+                        btc_price, self._strike, sigma, time_remaining
+                    ),
                     "market_price_up": market_price_up,
                     "market_price_ts": 0.0,
                 }

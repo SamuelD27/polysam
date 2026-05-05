@@ -51,7 +51,7 @@ class Book:
     token_id: str
     side_bids: tuple[Level, ...]
     side_asks: tuple[Level, ...]
-    tick_size: Decimal                       # symmetric default (also back-compat)
+    tick_size: Decimal  # symmetric default (also back-compat)
     ts_ns: int
     source_seq: int | None = None
     # Per-side overrides (spec §2.2 / §8.2 nautilus_trader #2980): when the YES
@@ -63,10 +63,12 @@ class Book:
 
     @property
     def bids_tick(self) -> Decimal:
+        """Effective tick size on the bid side (per-side override or shared)."""
         return self.tick_size_bids if self.tick_size_bids is not None else self.tick_size
 
     @property
     def asks_tick(self) -> Decimal:
+        """Effective tick size on the ask side (per-side override or shared)."""
         return self.tick_size_asks if self.tick_size_asks is not None else self.tick_size
 
 
@@ -89,9 +91,7 @@ class FillResult:
 def _reject_float(*values: object) -> None:
     for v in values:
         if isinstance(v, float):
-            raise TypeError(
-                "float not accepted on boundary; pass Decimal or str"
-            )
+            raise TypeError("float not accepted on boundary; pass Decimal or str")
 
 
 def _tick_key(tick_size: Decimal) -> str:
@@ -120,9 +120,7 @@ def quantize_price(price: Decimal, tick_size: Decimal) -> Decimal:
     return price.quantize(quant, rounding=ROUND_HALF_EVEN)
 
 
-def freeze_last_book(
-    snapshots: list[Book], t_query_ns: int
-) -> tuple[Book, int]:
+def freeze_last_book(snapshots: list[Book], t_query_ns: int) -> tuple[Book, int]:
     """Return the latest snapshot at or before ``t_query_ns`` and its
     staleness in milliseconds.
 
@@ -139,9 +137,7 @@ def freeze_last_book(
             raise ValueError("snapshots must be sorted ascending by ts_ns")
     idx = bisect.bisect_right(ts_list, t_query_ns) - 1
     if idx < 0:
-        raise LookupError(
-            f"no snapshot with ts_ns <= {t_query_ns}"
-        )
+        raise LookupError(f"no snapshot with ts_ns <= {t_query_ns}")
     snap = snapshots[idx]
     staleness_ms = (t_query_ns - snap.ts_ns) // 1_000_000
     return snap, staleness_ms
@@ -304,12 +300,8 @@ def apply_deltas(
         else:
             book_side[price] = size
 
-    new_bids = tuple(
-        Level(p, bids[p]) for p in sorted(bids.keys(), reverse=True)
-    )
-    new_asks = tuple(
-        Level(p, asks[p]) for p in sorted(asks.keys())
-    )
+    new_bids = tuple(Level(p, bids[p]) for p in sorted(bids.keys(), reverse=True))
+    new_asks = tuple(Level(p, asks[p]) for p in sorted(asks.keys()))
     return dataclasses.replace(
         base,
         side_bids=new_bids,

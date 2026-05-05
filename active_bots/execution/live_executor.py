@@ -70,6 +70,14 @@ SIDE_SELL = "SELL"
 
 
 class LiveExecutor:
+    """Real-money CLOB executor — posts FAK orders via py-clob-client v2.
+
+    Used when ``POLYMARKET_MODE=live``. Coordinates: token-id resolution
+    (YES/NO per side), the RiskManager pre-trade gate, FAK order POST,
+    Reconciler matching against on-chain fills. Treat any non-test invocation
+    as a real-money path.
+    """
+
     mode = "live"
 
     def __init__(
@@ -82,7 +90,7 @@ class LiveExecutor:
         dry_run: bool = False,
         exit_retry: int = 3,
         exit_retry_sleep_s: float = 1.5,
-    ):
+    ) -> None:
         self._client = client
         self._resolver = token_resolver
         self._risk = risk
@@ -101,11 +109,18 @@ class LiveExecutor:
         *,
         source: str = "edge",
     ) -> EntryResult | None:
+        """Resolve token, gate risk, post a FAK BUY, return the fill.
+
+        Returns None on risk reject / token unresolved / order rejected by
+        the CLOB. Caller (daemon) is responsible for stamping ``ack_ts``.
+        """
         decision = self._risk.check_entry(action)
         if not decision.allowed:
             logger.warning(
                 "entry blocked (%s) side=%s slug=%s",
-                decision.reason, action.get("side"), market_ctx.slug,
+                decision.reason,
+                action.get("side"),
+                market_ctx.slug,
             )
             return None
         if decision.reason:
@@ -115,7 +130,8 @@ class LiveExecutor:
         if token_id is None:
             logger.warning(
                 "entry blocked: missing token id for %s (slug=%s)",
-                action["side"], market_ctx.slug,
+                action["side"],
+                market_ctx.slug,
             )
             return None
 
@@ -133,15 +149,21 @@ class LiveExecutor:
         if filled_shares <= 0 or avg_price <= 0:
             logger.warning(
                 "entry unfilled (FAK): slug=%s resp=%s",
-                market_ctx.slug, _redact(resp),
+                market_ctx.slug,
+                _redact(resp),
             )
             return None
 
         actual_usdc = filled_shares * avg_price
         logger.info(
             "ENTRY FILLED %s %s @%.4f shares=%.2f $%.2f src=%s order_id=%s",
-            action["side"], market_ctx.slug, avg_price,
-            filled_shares, actual_usdc, source, _get_order_id(resp),
+            action["side"],
+            market_ctx.slug,
+            avg_price,
+            filled_shares,
+            actual_usdc,
+            source,
+            _get_order_id(resp),
         )
 
         requested_shares = float(action.get("size_shares") or 0.0)
@@ -191,13 +213,16 @@ class LiveExecutor:
         *,
         btc_price: float,
     ) -> ExitResult | None:
+        """Post a FAK SELL for an open position. Retries up to ``exit_retry`` times."""
         token_id = position.get("token_id") or _token_for_side(
-            position["side"], market_ctx,
+            position["side"],
+            market_ctx,
         )
         if token_id is None:
             logger.error(
                 "cannot exit %s %s: no token id",
-                position["side"], position["slug"],
+                position["side"],
+                position["slug"],
             )
             return None
 
@@ -218,7 +243,10 @@ class LiveExecutor:
                     break
             logger.warning(
                 "exit attempt %d/%d unfilled for %s %s",
-                attempt, self._exit_retry, position["side"], position["slug"],
+                attempt,
+                self._exit_retry,
+                position["side"],
+                position["slug"],
             )
             if attempt < self._exit_retry:
                 time.sleep(self._exit_retry_sleep_s)
@@ -231,7 +259,9 @@ class LiveExecutor:
             # pick up auto-settlement at T+300.
             logger.error(
                 "EXIT FAILED %s %s — no fills after %d attempts",
-                position["side"], position["slug"], self._exit_retry,
+                position["side"],
+                position["slug"],
+                self._exit_retry,
             )
             return None
 
@@ -241,15 +271,17 @@ class LiveExecutor:
         hold = now - float(position.get("entry_time", now))
 
         mid = position.get("entry_price_mid")
-        pnl_mid = (
-            (avg_price - float(mid)) * filled_shares
-            if mid is not None else None
-        )
+        pnl_mid = (avg_price - float(mid)) * filled_shares if mid is not None else None
 
         logger.info(
             "EXIT %s %s %s @%.4f shares=%.2f pnl=%+.2f hold=%.0fs",
-            exit_type, position["side"], position["slug"],
-            avg_price, filled_shares, pnl, hold,
+            exit_type,
+            position["side"],
+            position["slug"],
+            avg_price,
+            filled_shares,
+            pnl,
+            hold,
         )
 
         fill_details = _build_fill_details(
@@ -311,14 +343,14 @@ class LiveExecutor:
         hold = now - float(position.get("entry_time", now))
 
         mid = position.get("entry_price_mid")
-        pnl_mid = (
-            (exit_price - float(mid)) * size_shares
-            if mid is not None else None
-        )
+        pnl_mid = (exit_price - float(mid)) * size_shares if mid is not None else None
 
         logger.info(
             "RESOLVE (on-chain settlement pending) %s %s won=%s expected_pnl=%+.2f",
-            side, position["slug"], won, pnl,
+            side,
+            position["slug"],
+            won,
+            pnl,
         )
 
         return ExitResult(
@@ -346,6 +378,7 @@ class LiveExecutor:
     # ── Reconcile ─────────────────────────────────────────────────────────
 
     def reconcile(self, now: float) -> None:
+        """Per-tick: drive the Reconciler to match pending live orders against fills."""
         if self._reconciler is None:
             return None
         self._reconciler.poll(now)
@@ -354,7 +387,11 @@ class LiveExecutor:
     # ── Internals ────────────────────────────────────────────────────────
 
     def _place_market_order(
-        self, *, token_id: str, side: str, amount: float,
+        self,
+        *,
+        token_id: str,
+        side: str,
+        amount: float,
     ) -> dict | None:
         """Build + sign + post a FAK market order.
 
@@ -382,7 +419,9 @@ class LiveExecutor:
         if self._dry_run:
             logger.info(
                 "DRY_RUN market_order token=%s… side=%s amount=%.4f type=FAK",
-                token_id[:10], side, amount,
+                token_id[:10],
+                side,
+                amount,
             )
             return _fake_fill_response(amount=amount, side=side)
 
@@ -406,7 +445,9 @@ class LiveExecutor:
             if retry_amount is not None:
                 logger.warning(
                     "sell dust adjust token=%s… wanted %.6f, actual %.6f; retrying",
-                    token_id[:10], amount, retry_amount,
+                    token_id[:10],
+                    amount,
+                    retry_amount,
                 )
                 args2 = MarketOrderArgs(
                     token_id=token_id,
@@ -424,12 +465,18 @@ class LiveExecutor:
                 except Exception as e2:  # pylint: disable=broad-except
                     logger.error(
                         "post_order retry failed token=%s… side=%s amount=%.6f: %s",
-                        token_id[:10], side, retry_amount, e2,
+                        token_id[:10],
+                        side,
+                        retry_amount,
+                        e2,
                     )
                     return None
             logger.error(
                 "post_order failed token=%s… side=%s amount=%.4f: %s",
-                token_id[:10], side, amount, e,
+                token_id[:10],
+                side,
+                amount,
+                e,
             )
             return None
 
@@ -550,7 +597,8 @@ def _redact(resp: dict | None) -> dict:
     if not resp:
         return {}
     keep = (
-        "success", "status",
+        "success",
+        "status",
         "orderID",
         "errorMsg",
         "makingAmount",
@@ -617,7 +665,7 @@ def _fake_fill_response(*, amount: float, side: str) -> dict:
         shares = amount
     return {
         "success": True,
-        "orderID": f"dry-run-{int(time.time()*1000)}",
+        "orderID": f"dry-run-{int(time.time() * 1000)}",
         "status": "matched",
         "filled_shares": shares,
         "avg_price": 0.5,

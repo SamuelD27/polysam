@@ -60,7 +60,9 @@ _10K = Decimal("10000")
 
 
 class BookStore(Protocol):
-    def snapshots_for(self, token_id: str) -> list[Book]: ...
+    def snapshots_for(self, token_id: str) -> list[Book]:
+        """Return chronologically-sorted ``Book`` snapshots for one token_id."""
+        ...
 
 
 @dataclass
@@ -70,12 +72,15 @@ class DictBookStore:
     data: dict[str, list[Book]] = field(default_factory=dict)
 
     def snapshots_for(self, token_id: str) -> list[Book]:
+        """Return the snapshot list for ``token_id`` (empty list if unknown)."""
         return self.data.get(token_id, [])
 
     def add(self, snap: Book) -> None:
+        """Append one snapshot to its token_id bucket. Sort with ``freeze()``."""
         self.data.setdefault(snap.token_id, []).append(snap)
 
     def freeze(self) -> None:
+        """Sort each bucket by ts_ns. Call once after batch ingest, before queries."""
         for k in self.data:
             self.data[k].sort(key=lambda s: s.ts_ns)
 
@@ -241,9 +246,7 @@ def _mid(book: Book) -> Decimal | None:
     return (bb + ba) / 2
 
 
-def _time_in_market_bucket(
-    decision_ts_ns: int, t_zero_ns: int | None, t_end_ns: int | None
-) -> str:
+def _time_in_market_bucket(decision_ts_ns: int, t_zero_ns: int | None, t_end_ns: int | None) -> str:
     if t_zero_ns is None or t_end_ns is None or t_end_ns <= t_zero_ns:
         return "unk"
     if decision_ts_ns < t_zero_ns:
@@ -261,6 +264,13 @@ def _time_in_market_bucket(
 
 
 class ReplayExecutor:
+    """Offline backtest executor: walks recorded book snapshots with a latency model.
+
+    Used by ``experiments/backtest/`` harnesses to score strategies against
+    historical CLOB data. Not on the live tick path. See the spec at
+    ``docs/book_walked_replay_backtester_spec.md`` for the full design.
+    """
+
     def __init__(
         self,
         books: BookStore,
@@ -272,7 +282,7 @@ class ReplayExecutor:
         staleness_soft_ms: int = 200,
         rng: random.Random | None = None,
         p_bucket_used: str = "base",
-    ):
+    ) -> None:
         self._books = books
         self._fees_fn = fees_fn
         self._profile = latency_profile
@@ -323,7 +333,9 @@ class ReplayExecutor:
         )
 
         if book_ack is None or stale_ack_ms is None:
-            return _with(base, classification="book_stale", book_staleness_ms=_nan_to_int(stale_ack_ms))
+            return _with(
+                base, classification="book_stale", book_staleness_ms=_nan_to_int(stale_ack_ms)
+            )
 
         if stale_ack_ms > self._staleness_hard_ms:
             return _with(
@@ -348,8 +360,16 @@ class ReplayExecutor:
 
         # Attribution in price units (signed so positive = cost to trader).
         half_spread = (best_opp_dec - dec_mid) * sign if best_opp_dec is not None else None
-        latency_drift = (best_opp_ack - best_opp_dec) * sign if (best_opp_ack is not None and best_opp_dec is not None) else None
-        book_walk = (fill.vwap - best_opp_ack) * sign if (fill.vwap is not None and best_opp_ack is not None) else None
+        latency_drift = (
+            (best_opp_ack - best_opp_dec) * sign
+            if (best_opp_ack is not None and best_opp_dec is not None)
+            else None
+        )
+        book_walk = (
+            (fill.vwap - best_opp_ack) * sign
+            if (fill.vwap is not None and best_opp_ack is not None)
+            else None
+        )
 
         half_spread_bps = _bps_of(half_spread, dec_mid) if half_spread is not None else NAN
         latency_drift_bps = _bps_of(latency_drift, dec_mid) if latency_drift is not None else NAN
@@ -363,9 +383,7 @@ class ReplayExecutor:
             fees_usdc = Decimal(0)
             fees_bps = 0.0 if fill.classification == "unfilled" else NAN
 
-        total_is = _sum_nan_propagating(
-            half_spread_bps, latency_drift_bps, book_walk_bps, fees_bps
-        )
+        total_is = _sum_nan_propagating(half_spread_bps, latency_drift_bps, book_walk_bps, fees_bps)
 
         # Regime flags
         top_bid = _top_size(book_ack.side_bids)
@@ -508,4 +526,5 @@ def _empty_record(
 
 def _with(rec: ExecutionRecord, **overrides) -> ExecutionRecord:
     from dataclasses import replace as _replace
+
     return _replace(rec, **overrides)

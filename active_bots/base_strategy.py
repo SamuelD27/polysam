@@ -23,6 +23,7 @@ MARKET_DURATION = 300
 
 # ── Helper functions ───────────────────────────────────────────────────────
 
+
 def norm_cdf(x: float) -> float:
     """Standard normal CDF via erfc -- no scipy needed."""
     return 0.5 * math.erfc(-x / math.sqrt(2))
@@ -156,6 +157,7 @@ def resolve_trade(
 
 # ── BaseStrategy ───────────────────────────────────────────────────────────
 
+
 class BaseStrategy:
     """Stateful base strategy for a single BTC 5m binary option market.
 
@@ -181,11 +183,9 @@ class BaseStrategy:
         entry_offset_min: int = 120,
         entry_offset_max: int = 150,
         role: str = "observer",
-    ):
+    ) -> None:
         if role not in ("trader", "observer"):
-            raise ValueError(
-                f"role must be 'trader' or 'observer', got {role!r}"
-            )
+            raise ValueError(f"role must be 'trader' or 'observer', got {role!r}")
         self.edge_min = edge_min
         self.edge_max = edge_max
         self.max_risk = max_risk
@@ -193,9 +193,9 @@ class BaseStrategy:
         self.entry_offset_max = entry_offset_max
         self.role = role
 
-        self._t_zero = None
-        self._strike = None
-        self._open_position = None
+        self._t_zero: float | None = None
+        self._strike: float | None = None
+        self._open_position: dict[str, Any] | None = None
         self._resolved = False
 
     def reset(self, t_zero: float | None = None, strike: float | None = None) -> None:
@@ -207,10 +207,12 @@ class BaseStrategy:
 
     @property
     def has_position(self) -> bool:
+        """True iff an open position is currently held on this market."""
         return self._open_position is not None
 
     @property
     def is_resolved(self) -> bool:
+        """True iff the current market has already been resolved (won/lost)."""
         return self._resolved
 
     def on_tick(
@@ -259,7 +261,8 @@ class BaseStrategy:
 
                 if edge >= self.edge_min:
                     size_usdc, size_shares = compute_position_size(
-                        edge, entry_price,
+                        edge,
+                        entry_price,
                         edge_min=self.edge_min,
                         edge_max=self.edge_max,
                         max_risk=self.max_risk,

@@ -35,6 +35,13 @@ class ReconcilerState:
 
 
 class Reconciler:
+    """Polls Polymarket data API to detect on-chain fills for a funder address.
+
+    Used by ``LiveExecutor.reconcile`` to match posted FAK orders against
+    actual fills (orders can fill / partially fill / no-match independent of
+    the order ack). Throttled by ``poll_interval_s``.
+    """
+
     def __init__(
         self,
         funder_address: str,
@@ -42,7 +49,7 @@ class Reconciler:
         session: requests.Session | None = None,
         poll_interval_s: float = 30.0,
         timeout: float = 5.0,
-    ):
+    ) -> None:
         self._funder = funder_address.lower()
         self._session = session or requests.Session()
         self._poll_interval_s = poll_interval_s
@@ -90,15 +97,16 @@ class Reconciler:
         # Cap set size so we don't leak memory over long daemon runtimes.
         if len(self.state.known_trade_ids) > 2000:
             # Keep only the most recent 1000 ids by dropping and rebuilding.
-            self.state.known_trade_ids = set(
-                list(self.state.known_trade_ids)[-1000:]
-            )
+            self.state.known_trade_ids = set(list(self.state.known_trade_ids)[-1000:])
 
         for row in new:
             logger.info(
                 "RECONCILE trade side=%s size=%s price=%s asset=%s… ts=%s",
-                row.get("side"), row.get("size"), row.get("price"),
-                str(row.get("asset", ""))[:10], row.get("timestamp"),
+                row.get("side"),
+                row.get("size"),
+                row.get("price"),
+                str(row.get("asset", ""))[:10],
+                row.get("timestamp"),
             )
         return new
 

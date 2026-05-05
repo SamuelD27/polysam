@@ -20,6 +20,8 @@ def _norm_cdf(x: float) -> float:
 
 @dataclass
 class FairPriceResult:
+    """Per-tick fair-price snapshot (P(Up), the d2 input, and provenance)."""
+
     p_up: float
     d2: float
     sigma_used: float
@@ -38,6 +40,14 @@ class FairPriceModel:
         sigma: float,
         time_to_expiry_s: float,
     ) -> FairPriceResult:
+        """Return ``P(Up) = Phi(d2)`` for a single (spot, strike, sigma, tau) point.
+
+        Edge cases handled (degenerate inputs collapse to deterministic outcomes):
+
+        - ``time_to_expiry_s <= 0``: returns 1.0 / 0.0 / 0.5 by sign of S-K.
+        - ``sigma <= 1e-12``: returns 1.0 / 0.0 / 0.5 by sign of S-K.
+        - ``spot == strike``: returns 0.5 (no drift assumption).
+        """
         if time_to_expiry_s <= 0:
             if spot > strike:
                 p = 1.0
@@ -66,7 +76,14 @@ class FairPriceModel:
         return FairPriceResult(p_up, d2, sigma, time_to_expiry_s, spot, strike)
 
     def compute_batch(self, spots, strike: float, sigmas, times_s):
+        """Vectorized ``P(Up)`` for an array of (spot, sigma, tau) inputs.
+
+        Used by backtest harnesses that walk historical bars; not on the
+        single-tick critical path. Output clipped to ``[0.001, 0.999]`` to
+        avoid log-domain explosions in downstream PnL math.
+        """
         import numpy as np
+
         tau = times_s / SECONDS_PER_YEAR
         sqrt_tau = np.sqrt(np.maximum(tau, 1e-20))
         safe_sigma = np.maximum(sigmas, 1e-12)

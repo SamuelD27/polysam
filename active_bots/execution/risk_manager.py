@@ -23,6 +23,8 @@ logger = logging.getLogger("execution.risk")
 
 @dataclass
 class RiskConfig:
+    """Static config for the live RiskManager (loaded once at daemon startup)."""
+
     max_daily_loss_usdc: float = 300.0
     # Session loss is a tighter circuit breaker than the daily one: it only
     # counts PnL accumulated in the current process run (not across
@@ -39,6 +41,8 @@ class RiskConfig:
 
 @dataclass
 class RiskDecision:
+    """Outcome of one ``RiskManager.check_entry`` call (allow/deny + clamp info)."""
+
     allowed: bool
     size_usdc: float
     size_shares: float
@@ -46,7 +50,21 @@ class RiskDecision:
 
 
 class RiskManager:
-    def __init__(self, config: RiskConfig):
+    """Pre-trade circuit breaker for entries; never blocks exits or resolutions.
+
+    Three independent gates are applied in order:
+
+    1. ``daemon_state/KILL`` file existence — hard halt.
+    2. Cumulative session loss (cleared per-process) below
+       ``-max_session_loss_usdc`` — short-fuse breaker.
+    3. UTC-rolling daily loss below ``-max_daily_loss_usdc`` — long-fuse breaker.
+
+    On pass, the requested size is floor-clamped to ``min_trade_size_usdc`` and
+    ceiling-clamped to ``max_trade_size_usdc``. Both clamps surface in the
+    ``RiskDecision.reason`` string for observability.
+    """
+
+    def __init__(self, config: RiskConfig) -> None:
         self.config = config
         self._day_key: str | None = None
         self._day_pnl: float = 0.0
@@ -56,19 +74,24 @@ class RiskManager:
     # ── Entry gate ────────────────────────────────────────────────────────
 
     def check_entry(self, action: dict[str, Any]) -> RiskDecision:
+        """Apply the kill-switch + loss-breaker + size-clamp gate to one entry."""
         if self._kill_switch_active():
             return RiskDecision(False, 0.0, 0.0, "kill switch active")
 
         if self._session_loss_breached():
             return RiskDecision(
-                False, 0.0, 0.0,
+                False,
+                0.0,
+                0.0,
                 f"session loss breached ({self._session_pnl:+.2f} "
                 f"<= -{self.config.max_session_loss_usdc:.0f})",
             )
 
         if self._daily_loss_breached():
             return RiskDecision(
-                False, 0.0, 0.0,
+                False,
+                0.0,
+                0.0,
                 f"daily loss breached ({self._day_pnl:+.2f} "
                 f"<= -{self.config.max_daily_loss_usdc:.0f})",
             )
@@ -99,6 +122,10 @@ class RiskManager:
     # ── PnL tracking (called by daemon after each closed trade) ──────────
 
     def record_trade(self, pnl: float, resolved_time: float | None = None) -> None:
+        """Add a closed-trade PnL to the day + session totals.
+
+        The day key auto-rolls on UTC midnight; session never rolls.
+        """
         ts = resolved_time or time.time()
         day = _utc_day_key(ts)
         if day != self._day_key:
@@ -108,10 +135,12 @@ class RiskManager:
         self._session_pnl += pnl
 
     def current_day_pnl(self) -> float:
+        """Cumulative realized PnL since UTC midnight of the current day."""
         self._roll_day()
         return self._day_pnl
 
     def current_session_pnl(self) -> float:
+        """Cumulative realized PnL since process start (never rolls)."""
         return self._session_pnl
 
     # ── Internals ────────────────────────────────────────────────────────

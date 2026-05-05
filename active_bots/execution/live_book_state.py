@@ -8,6 +8,7 @@ and ``active_bots/execution/book.py:walk_book``.
 # FUTURE-REFACTOR: extract a shared Protocol once a third caller
 # (e.g. an in-daemon shadow reconciler) needs the same state machine.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ from typing import Literal
 
 @dataclass
 class WalkResult:
+    """Output of one ``walk_for_vwap`` call: ``"full"``, ``"partial"``, or ``"unfilled"``."""
+
     classification: Literal["full", "partial", "unfilled"]
     filled_shares: float
     residual_shares: float
@@ -63,6 +66,7 @@ class LiveBookState:
 
     apply_delta before any snapshot is dropped (recorded in dropped_deltas_no_baseline).
     """
+
     tick_size: float
     bids: list[tuple[float, float]] = field(default_factory=list)  # descending
     asks: list[tuple[float, float]] = field(default_factory=list)  # ascending
@@ -77,22 +81,39 @@ class LiveBookState:
         ts_ms: int,
         tick_size: float | None = None,
     ) -> None:
+        """Replace both sides of the book from a CLOB snapshot frame.
+
+        Filters out zero-size levels, sorts bids descending and asks
+        ascending, and marks the book as baseline-ready (allowing subsequent
+        deltas to mutate it).
+        """
         if tick_size is not None:
             self.tick_size = tick_size
         self.bids = sorted(
-            ((float(lvl["price"]), float(lvl["size"]))
-             for lvl in (bids or []) if float(lvl["size"]) > 0),
+            (
+                (float(lvl["price"]), float(lvl["size"]))
+                for lvl in (bids or [])
+                if float(lvl["size"]) > 0
+            ),
             key=lambda x: -x[0],
         )
         self.asks = sorted(
-            ((float(lvl["price"]), float(lvl["size"]))
-             for lvl in (asks or []) if float(lvl["size"]) > 0),
+            (
+                (float(lvl["price"]), float(lvl["size"]))
+                for lvl in (asks or [])
+                if float(lvl["size"]) > 0
+            ),
             key=lambda x: x[0],
         )
         self.ts_ms = ts_ms
         self.has_baseline = True
 
     def apply_delta(self, delta: dict, ts_ms: int) -> None:
+        """Apply one CLOB delta frame (single-level mutation).
+
+        Drops the delta if no snapshot has been applied yet (counts in
+        ``dropped_deltas_no_baseline``). Side is "BUY" → bids, "SELL" → asks.
+        """
         if not self.has_baseline:
             self.dropped_deltas_no_baseline += 1
             return
@@ -109,6 +130,7 @@ class LiveBookState:
         self.ts_ms = ts_ms
 
     def top_size(self, which: Literal["bids", "asks"]) -> float:
+        """Return the top-of-book size on the requested side, or 0.0 if empty."""
         levels = self.bids if which == "bids" else self.asks
         return levels[0][1] if levels else 0.0
 
@@ -130,15 +152,18 @@ def _apply_one(
 @dataclass
 class MarketBooks:
     """Pair of YES + NO LiveBookState for a single market slug."""
+
     yes: LiveBookState | None = None
     no: LiveBookState | None = None
 
     def yes_staleness_ms(self, now_ms: int) -> int | None:
+        """Age of the YES book in ms, or None if no baseline has been applied."""
         if self.yes is None or not self.yes.has_baseline:
             return None
         return now_ms - self.yes.ts_ms
 
     def no_staleness_ms(self, now_ms: int) -> int | None:
+        """Age of the NO book in ms, or None if no baseline has been applied."""
         if self.no is None or not self.no.has_baseline:
             return None
         return now_ms - self.no.ts_ms

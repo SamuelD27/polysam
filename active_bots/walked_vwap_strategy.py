@@ -12,6 +12,7 @@ NO (consumes books.no.asks). Both are LONG positions in different tokens.
 Floats throughout. For canonical Decimal arithmetic see
 experiments/backtest/replay_executor.py.
 """
+
 from __future__ import annotations
 
 import logging
@@ -31,29 +32,29 @@ from .execution.live_book_state import (
 from .refined_strategy import RefinedStrategy
 
 # Defaults — env overridable per project convention.
-MARKET_PRICE_MAX_STALENESS_S = float(
-    os.environ.get("WALKED_VWAP_MARKET_STALENESS_S", 30.0)
-)
-MIN_TOP_OF_BOOK_SHARES_RATIO = float(
-    os.environ.get("WALKED_VWAP_MIN_TOP_RATIO", 1.0)
-)
+MARKET_PRICE_MAX_STALENESS_S = float(os.environ.get("WALKED_VWAP_MARKET_STALENESS_S", 30.0))
+MIN_TOP_OF_BOOK_SHARES_RATIO = float(os.environ.get("WALKED_VWAP_MIN_TOP_RATIO", 1.0))
 WALKED_EDGE_MIN = float(os.environ.get("WALKED_VWAP_EDGE_MIN", 0.02))
-WALKED_VWAP_PARTIAL_OK = (
-    os.environ.get("WALKED_VWAP_PARTIAL_OK", "0").strip() in ("1", "true", "True")
+WALKED_VWAP_PARTIAL_OK = os.environ.get("WALKED_VWAP_PARTIAL_OK", "0").strip() in (
+    "1",
+    "true",
+    "True",
 )
 FEE_CATEGORY = os.environ.get("WALKED_VWAP_FEE_CATEGORY", "crypto")
 
 # Exit-gate knobs — default-off; mid-quoted exit path is preserved bit-for-bit
 # until WALKED_VWAP_EXIT_ENABLE is flipped per-deployment after paper-validation.
-EXIT_ENABLE = (
-    os.environ.get("WALKED_VWAP_EXIT_ENABLE", "0").strip() in ("1", "true", "True")
-)
+EXIT_ENABLE = os.environ.get("WALKED_VWAP_EXIT_ENABLE", "0").strip() in ("1", "true", "True")
 EXIT_STALENESS_S = float(os.environ.get("WALKED_VWAP_EXIT_STALENESS_S", 30.0))
-EXIT_PARTIAL_OK = (
-    os.environ.get("WALKED_VWAP_EXIT_PARTIAL_OK", "0").strip() in ("1", "true", "True")
+EXIT_PARTIAL_OK = os.environ.get("WALKED_VWAP_EXIT_PARTIAL_OK", "0").strip() in (
+    "1",
+    "true",
+    "True",
 )
-EXIT_FALLBACK_MID = (
-    os.environ.get("WALKED_VWAP_EXIT_FALLBACK_MID", "1").strip() in ("1", "true", "True")
+EXIT_FALLBACK_MID = os.environ.get("WALKED_VWAP_EXIT_FALLBACK_MID", "1").strip() in (
+    "1",
+    "true",
+    "True",
 )
 
 
@@ -69,28 +70,36 @@ class WalkedExitProfitGrabber(ProfitGrabber):
     force-close still fires (never orphan a residual position pre-resolution).
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         # Set fresh by wrapper.on_tick each tick (even when books is None);
         # subclass's own None branch handles fallback so the wrapper does not
         # need to gate the stash.
-        self._latest_books = None
+        self._latest_books: MarketBooks | None = None
 
     def check_exit(
         self,
-        position,
-        btc_price,
-        sigma,
-        t_zero,
-        market_price_up=None,
-        market_price_ts=0.0,
-    ):
+        position: dict[str, Any],
+        btc_price: float,
+        sigma: float,
+        t_zero: float,
+        market_price_up: float | None = None,
+        market_price_ts: float = 0.0,
+    ) -> dict[str, Any] | None:
+        """Re-price exit on walked-bid VWAP (post-fee), then defer to parent.
+
+        See STRATEGY.md §4 for the full mechanics. With ``EXIT_ENABLE=False``
+        this is a transparent passthrough to ``ProfitGrabber.check_exit``.
+        """
         # Default-off: short-circuit so behaviour is identical to vanilla
         # ProfitGrabber.check_exit when EXIT_ENABLE is False (preserves mid
         # quoting bit-for-bit, no logging side effects).
         if not EXIT_ENABLE:
             return super().check_exit(
-                position, btc_price, sigma, t_zero,
+                position,
+                btc_price,
+                sigma,
+                t_zero,
                 market_price_up=market_price_up,
                 market_price_ts=market_price_ts,
             )
@@ -104,7 +113,9 @@ class WalkedExitProfitGrabber(ProfitGrabber):
         )
 
         translated = self._compute_translated_market_price_up(
-            position, market_price_up, in_force_window,
+            position,
+            market_price_up,
+            in_force_window,
         )
         if translated is None:
             # FALLBACK_MID=0 + non-force-window + bad book → hold position;
@@ -112,14 +123,20 @@ class WalkedExitProfitGrabber(ProfitGrabber):
             return None
 
         return super().check_exit(
-            position, btc_price, sigma, t_zero,
+            position,
+            btc_price,
+            sigma,
+            t_zero,
             market_price_up=translated,
             market_price_ts=market_price_ts,
         )
 
     def _compute_translated_market_price_up(
-        self, position, mid_market_price_up, in_force_window,
-    ):
+        self,
+        position: dict[str, Any],
+        mid_market_price_up: float | None,
+        in_force_window: bool,
+    ) -> float | None:
         """Returns market_price_up to feed parent.check_exit, or None to hold.
 
         Returns the original mid_market_price_up unchanged if the book is bad
@@ -152,16 +169,13 @@ class WalkedExitProfitGrabber(ProfitGrabber):
         # EXIT_FALLBACK_MID — by then in_force_window has already widened the
         # accept condition (see plan gate matrix).
         partial_ok = EXIT_PARTIAL_OK or in_force_window
-        if (
-            walk.classification == "unfilled"
-            or walk.vwap is None
-            or not math.isfinite(walk.vwap)
-        ):
+        if walk.classification == "unfilled" or walk.vwap is None or not math.isfinite(walk.vwap):
             self._log_liquidity_gap(reason="empty_book", side=side)
             return mid_market_price_up if (EXIT_FALLBACK_MID or in_force_window) else None
         if walk.classification == "partial" and not partial_ok:
             self._log_liquidity_gap(
-                reason="partial_fill_disallowed", side=side,
+                reason="partial_fill_disallowed",
+                side=side,
                 filled_shares=walk.filled_shares,
             )
             return mid_market_price_up if EXIT_FALLBACK_MID else None
@@ -180,7 +194,7 @@ class WalkedExitProfitGrabber(ProfitGrabber):
         # for both sides — the holder's true post-fee per-share exit proceeds.
         return eff if side == "Up" else (1.0 - eff)
 
-    def _effective_exit_after_fees(self, fill_vwap, filled_shares):
+    def _effective_exit_after_fees(self, fill_vwap: float, filled_shares: float) -> float:
         """Per-share exit proceeds net of bell-curve taker fee (selling side).
 
         Symmetric to _effective_vwap_after_fees but SUBTRACTS the per-share
@@ -197,7 +211,7 @@ class WalkedExitProfitGrabber(ProfitGrabber):
         )
         return fill_vwap - float(fee) / filled_shares  # SUBTRACT on the sell side
 
-    def _log_liquidity_gap(self, **diag):
+    def _log_liquidity_gap(self, **diag: Any) -> None:
         # Light structured log — no event-bus dep on the daemon path.
         logging.getLogger(__name__).info("walked_vwap_exit_liquidity_gap %s", diag)
 
@@ -205,7 +219,13 @@ class WalkedExitProfitGrabber(ProfitGrabber):
 class WalkedVWAPStrategy(RefinedStrategy):
     """RefinedStrategy + walked-VWAP entry gate."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Build a RefinedStrategy and swap in the walked-bid exit grabber.
+
+        See STRATEGY.md §1.5 / §3 for full mechanics. Parent receives all
+        positional and keyword args; the override only swaps
+        ``self.profit_grabber`` for the exit-aware subclass when present.
+        """
         super().__init__(*args, **kwargs)
         # Swap the parent's ProfitGrabber for the exit-aware subclass, carrying
         # the SAME tp/sl/force config the parent already built. Reading the
@@ -224,8 +244,13 @@ class WalkedVWAPStrategy(RefinedStrategy):
             )
 
     def _run_parent_on_tick(
-        self, btc_price, market_price_up, sigma, t_zero, market_price_ts,
-    ):
+        self,
+        btc_price: float,
+        market_price_up: float,
+        sigma: float,
+        t_zero: float,
+        market_price_ts: float,
+    ) -> dict[str, Any] | None:
         # Indirection so tests can monkeypatch this seam.
         return RefinedStrategy.on_tick(
             self,
@@ -246,6 +271,12 @@ class WalkedVWAPStrategy(RefinedStrategy):
         *,
         books: MarketBooks | None = None,
     ) -> dict[str, Any] | None:
+        """Run the parent's on_tick and gate any ENTER through walked-VWAP.
+
+        See STRATEGY.md §3 for the per-tick flow. Returns the parent's action
+        unchanged for non-ENTER, the gate-augmented action on entry pass, or
+        a ``WALKED_VWAP_REJECT`` action when an entry is rejected.
+        """
         # Stash books onto the exit-aware ProfitGrabber every tick, even when
         # books is None — the subclass's own None branch handles fallback, so
         # keeping the stash unconditional avoids a stale book leaking from a
@@ -253,7 +284,11 @@ class WalkedVWAPStrategy(RefinedStrategy):
         if isinstance(self.profit_grabber, WalkedExitProfitGrabber):
             self.profit_grabber._latest_books = books
         action = self._run_parent_on_tick(
-            btc_price, market_price_up, sigma, t_zero, market_price_ts,
+            btc_price,
+            market_price_up,
+            sigma,
+            t_zero,
+            market_price_ts,
         )
         if action is None:
             return None
@@ -277,7 +312,8 @@ class WalkedVWAPStrategy(RefinedStrategy):
             or (now - market_price_ts) > MARKET_PRICE_MAX_STALENESS_S
         ):
             return self._reject(
-                action, "stale_market_price",
+                action,
+                "stale_market_price",
                 staleness_s=(now - market_price_ts) if market_price_ts else None,
             )
 
@@ -295,9 +331,13 @@ class WalkedVWAPStrategy(RefinedStrategy):
         top_size = book.top_size("asks")
 
         # 3. Top-of-book liquidity (NaN-guarded — reviewer requirement)
-        if not math.isfinite(top_size) or top_size < requested_shares * MIN_TOP_OF_BOOK_SHARES_RATIO:
+        if (
+            not math.isfinite(top_size)
+            or top_size < requested_shares * MIN_TOP_OF_BOOK_SHARES_RATIO
+        ):
             return self._reject(
-                action, "insufficient_top_of_book",
+                action,
+                "insufficient_top_of_book",
                 book_top_size_take=top_size if math.isfinite(top_size) else None,
                 requested_shares=requested_shares,
             )
@@ -310,19 +350,24 @@ class WalkedVWAPStrategy(RefinedStrategy):
             return self._reject(action, "empty_book")
         if walk.vwap is None or not math.isfinite(walk.vwap):
             return self._reject(
-                action, "empty_book",
+                action,
+                "empty_book",
                 walked_VWAP=walk.vwap,
             )
         if walk.classification == "partial" and not WALKED_VWAP_PARTIAL_OK:
             return self._reject(
-                action, "partial_fill_disallowed",
-                walked_VWAP=walk.vwap, filled_shares=walk.filled_shares,
+                action,
+                "partial_fill_disallowed",
+                walked_VWAP=walk.vwap,
+                filled_shares=walk.filled_shares,
             )
         eff_vwap = self._effective_vwap_after_fees(walk.vwap, walk.filled_shares)
         if not math.isfinite(eff_vwap):
             return self._reject(
-                action, "empty_book",
-                walked_VWAP=walk.vwap, effective_VWAP=eff_vwap,
+                action,
+                "empty_book",
+                walked_VWAP=walk.vwap,
+                effective_VWAP=eff_vwap,
             )
         fair = float(action.get("fair") or action.get("fair_price") or 0.0)
         # walked_edge for a BUY (long YES or long NO): fair - effective per-share
@@ -330,7 +375,8 @@ class WalkedVWAPStrategy(RefinedStrategy):
 
         if walked_edge < WALKED_EDGE_MIN:
             return self._reject(
-                action, "insufficient_walked_edge",
+                action,
+                "insufficient_walked_edge",
                 walked_VWAP=walk.vwap,
                 effective_VWAP=eff_vwap,
                 walked_edge=walked_edge,
@@ -339,7 +385,9 @@ class WalkedVWAPStrategy(RefinedStrategy):
         # 5. Pass — augment action with diagnostics
         opposite = book.bids
         spread = (book.asks[0][0] - opposite[0][0]) if (book.asks and opposite) else 0.0
-        mid = (book.asks[0][0] + opposite[0][0]) / 2 if (book.asks and opposite) else book.asks[0][0]
+        mid = (
+            (book.asks[0][0] + opposite[0][0]) / 2 if (book.asks and opposite) else book.asks[0][0]
+        )
         staleness_ms = int((now - book.ts_ms / 1000.0) * 1000) if book.ts_ms else None
 
         # Down-size if partial allowed
@@ -371,16 +419,18 @@ class WalkedVWAPStrategy(RefinedStrategy):
             self._open_position["size_shares"] = size_shares
             self._open_position["size_usdc"] = size_shares * eff_vwap
 
-        action.update({
-            "walked_VWAP": walk.vwap,
-            "effective_VWAP": eff_vwap,
-            "walked_edge": walked_edge,
-            "book_top_size_take": top_size,
-            "book_top_size_make": book.top_size("bids"),
-            "spread_at_entry": (spread / mid) if mid > 0 else 0.0,
-            "book_staleness_at_entry_ms": staleness_ms,
-            "gate_passed": True,
-        })
+        action.update(
+            {
+                "walked_VWAP": walk.vwap,
+                "effective_VWAP": eff_vwap,
+                "walked_edge": walked_edge,
+                "book_top_size_take": top_size,
+                "book_top_size_make": book.top_size("bids"),
+                "spread_at_entry": (spread / mid) if mid > 0 else 0.0,
+                "book_staleness_at_entry_ms": staleness_ms,
+                "gate_passed": True,
+            }
+        )
         return action
 
     def _reject(

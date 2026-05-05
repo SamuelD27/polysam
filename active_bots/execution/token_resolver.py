@@ -27,13 +27,26 @@ logger = logging.getLogger("execution.token_resolver")
 
 @dataclass(frozen=True)
 class TokenIds:
+    """Resolved (YES, NO) token-id pair for a single Polymarket slug."""
+
     yes_token_id: str
     no_token_id: str
     tick_size: float = 0.01
 
 
 class TokenResolver:
-    def __init__(self, session: requests.Session | None = None, timeout: float = 5.0):
+    """Cached slug → (YES, NO) token-id lookup against the Polymarket Gamma API.
+
+    Lookup is thread-safe via a per-instance lock. First successful resolve
+    populates the cache; subsequent calls return the cached value. Failures
+    do NOT poison the cache — the next call retries.
+    """
+
+    def __init__(
+        self,
+        session: requests.Session | None = None,
+        timeout: float = 5.0,
+    ) -> None:
         self._session = session or requests.Session()
         self._timeout = timeout
         self._cache: dict[str, TokenIds] = {}
@@ -58,7 +71,9 @@ class TokenResolver:
             self._cache[slug] = tokens
         logger.info(
             "resolved slug=%s yes=%s… no=%s…",
-            slug, tokens.yes_token_id[:10], tokens.no_token_id[:10],
+            slug,
+            tokens.yes_token_id[:10],
+            tokens.no_token_id[:10],
         )
         return tokens
 

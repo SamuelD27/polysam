@@ -68,7 +68,8 @@ def build_client():
         signature_type=signature_type,
         funder=funder,
         creds=ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
-        if preseeded else None,
+        if preseeded
+        else None,
     )
     if not preseeded:
         # V2 renamed create_or_derive_api_creds() to create_or_derive_api_key().
@@ -76,7 +77,9 @@ def build_client():
 
     logger.info(
         "ClobClient ready: funder=%s chain=%d sig_type=%d creds=%s",
-        funder, chain_id, signature_type,
+        funder,
+        chain_id,
+        signature_type,
         "preseeded" if preseeded else "derived",
     )
     return client

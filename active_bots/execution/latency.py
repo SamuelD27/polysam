@@ -185,7 +185,7 @@ class ConditionedSampler:
         profiles: dict[str, LatencyProfile],
         key_fn: Callable[[object], str],
         fallback: LatencyProfile = SG_WG_PRIOR,
-    ):
+    ) -> None:
         self._profiles: dict[str, LatencyProfile] = dict(profiles)  # allowed to be empty
         self._key_fn = key_fn
         self._fallback = fallback

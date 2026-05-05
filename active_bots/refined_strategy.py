@@ -31,7 +31,14 @@ class RefinedStrategy(EnhancedStrategy):
     DEFAULT_TP_DELTA_MIN = 0.08
     DEFAULT_TP_ABSOLUTE_FAVOR = 0.15
 
-    def __init__(self, max_risk: float = MAX_RISK, role: str = "observer"):
+    def __init__(self, max_risk: float = MAX_RISK, role: str = "observer") -> None:
+        """Build an EnhancedStrategy pre-configured with the champion knobs.
+
+        Args:
+            max_risk: USDC ceiling for a max-edge position. Forwarded to the
+                parent's `compute_position_size` linear interpolation.
+            role: ``"trader"`` posts orders; ``"observer"`` shadows.
+        """
         super().__init__(
             enable_time_based=True,
             enable_profit_grabber=True,

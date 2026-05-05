@@ -22,7 +22,14 @@ logger = logging.getLogger("execution.events")
 
 
 class EventLogger:
-    def __init__(self, path: Path):
+    """Append-only structured event logger that emits one JSON record per line.
+
+    Thread-safe (lock around the write). Auto-creates the parent directory
+    and writes a ``session_start`` marker so consumers can find the start of
+    this process run.
+    """
+
+    def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -31,6 +38,7 @@ class EventLogger:
         self.log("session_start", pid=os.getpid())
 
     def log(self, event_type: str, **fields: Any) -> None:
+        """Write one ``{"ts": ..., "type": event_type, **fields}`` JSON line."""
         rec: dict[str, Any] = {"ts": time.time(), "type": event_type}
         for k, v in fields.items():
             rec[k] = _to_jsonable(v)
@@ -42,6 +50,7 @@ class EventLogger:
                 logger.warning("event log write failed: %s", e)
 
     def close(self) -> None:
+        """Close the underlying file handle. Safe to call multiple times."""
         with self._lock:
             try:
                 self._fh.close()
@@ -63,11 +72,12 @@ _NULL_LOGGER: EventLogger | None = None
 
 
 class _NullEventLogger:
-    def log(self, *a, **k): ...  # noqa: D401, E701
-    def close(self): ...
+    def log(self, *a: Any, **k: Any) -> None: ...
+    def close(self) -> None: ...
 
 
 def null_logger() -> Any:
+    """Singleton no-op event logger — drops every write. Useful in unit tests."""
     global _NULL_LOGGER
     if _NULL_LOGGER is None:
         _NULL_LOGGER = _NullEventLogger()  # type: ignore[assignment]

@@ -47,9 +47,7 @@ def invariant_monotonic_fill_prices(side: str, fill: FillResult) -> None:
 def invariant_fill_qty_bounds(requested: Decimal, fill: FillResult) -> None:
     """filled_qty in [0, requested] with SIZE_QUANTUM overfill tolerance."""
     if fill.filled_qty < Decimal(0):
-        raise AssertionError(
-            f"filled_qty negative: filled_qty={fill.filled_qty}"
-        )
+        raise AssertionError(f"filled_qty negative: filled_qty={fill.filled_qty}")
     upper = requested + SIZE_QUANTUM
     if fill.filled_qty > upper:
         raise AssertionError(
@@ -63,57 +61,40 @@ def invariant_vwap_arithmetic(fill: FillResult) -> None:
     None when classification == 'unfilled' (filled_qty == 0)."""
     if fill.filled_qty == Decimal(0):
         if fill.vwap is not None:
-            raise AssertionError(
-                f"unfilled result has non-None vwap={fill.vwap}"
-            )
+            raise AssertionError(f"unfilled result has non-None vwap={fill.vwap}")
         return
     if fill.vwap is None:
-        raise AssertionError(
-            f"filled_qty={fill.filled_qty} > 0 but vwap is None"
-        )
-    notional = sum(
-        (lvl.price * lvl.qty for lvl in fill.levels), start=Decimal(0)
-    )
+        raise AssertionError(f"filled_qty={fill.filled_qty} > 0 but vwap is None")
+    notional = sum((lvl.price * lvl.qty for lvl in fill.levels), start=Decimal(0))
     qty = sum((lvl.qty for lvl in fill.levels), start=Decimal(0))
     if qty == Decimal(0):
-        raise AssertionError(
-            f"filled_qty={fill.filled_qty} but levels qty sum is zero"
-        )
+        raise AssertionError(f"filled_qty={fill.filled_qty} but levels qty sum is zero")
     expected = notional / qty
     if abs(expected - fill.vwap) > _VWAP_ABS_TOL:
         raise AssertionError(
-            f"vwap mismatch: reported={fill.vwap} expected={expected} "
-            f"notional={notional} qty={qty}"
+            f"vwap mismatch: reported={fill.vwap} expected={expected} notional={notional} qty={qty}"
         )
 
 
-def invariant_fee_symmetry(
-    p: Decimal, shares: Decimal, category: FeeCategory
-) -> None:
+def invariant_fee_symmetry(p: Decimal, shares: Decimal, category: FeeCategory) -> None:
     """fee(p) == fee(1 - p) and fee is non-negative."""
     fa = fee_usdc(p, shares, category)
     fb = fee_usdc(Decimal(1) - p, shares, category)
     if fa < Decimal(0):
-        raise AssertionError(
-            f"fee negative: fee({p})={fa} shares={shares} cat={category.name}"
-        )
+        raise AssertionError(f"fee negative: fee({p})={fa} shares={shares} cat={category.name}")
     if fb < Decimal(0):
         raise AssertionError(
-            f"fee negative: fee({Decimal(1)-p})={fb} shares={shares} "
-            f"cat={category.name}"
+            f"fee negative: fee({Decimal(1) - p})={fb} shares={shares} cat={category.name}"
         )
     # Fees can be dust-clipped to 0 on either side of the bell, so we
     # compare as floats via math.isclose with a generous relative tolerance.
     if not math.isclose(float(fa), float(fb), rel_tol=1e-12, abs_tol=1e-12):
         raise AssertionError(
-            f"fee asymmetric: fee({p})={fa} fee(1-{p})={fb} "
-            f"shares={shares} cat={category.name}"
+            f"fee asymmetric: fee({p})={fa} fee(1-{p})={fb} shares={shares} cat={category.name}"
         )
 
 
-def invariant_residual_conservation(
-    requested: Decimal, fill: FillResult
-) -> None:
+def invariant_residual_conservation(requested: Decimal, fill: FillResult) -> None:
     """filled_qty + residual_qty == requested (within SIZE_QUANTUM tol)."""
     total = fill.filled_qty + fill.residual_qty
     if abs(total - requested) > SIZE_QUANTUM:
@@ -135,16 +116,14 @@ def invariant_price_bounds_respect_tick(book: Book) -> None:
     for lvl in book.side_bids:
         if lvl.price < bid_lo or lvl.price > bid_hi:
             raise AssertionError(
-                f"bid price {lvl.price} outside [{bid_lo}, {bid_hi}] "
-                f"bids_tick={book.bids_tick}"
+                f"bid price {lvl.price} outside [{bid_lo}, {bid_hi}] bids_tick={book.bids_tick}"
             )
     ask_lo = book.asks_tick
     ask_hi = Decimal(1) - book.asks_tick
     for lvl in book.side_asks:
         if lvl.price < ask_lo or lvl.price > ask_hi:
             raise AssertionError(
-                f"ask price {lvl.price} outside [{ask_lo}, {ask_hi}] "
-                f"asks_tick={book.asks_tick}"
+                f"ask price {lvl.price} outside [{ask_lo}, {ask_hi}] asks_tick={book.asks_tick}"
             )
 
 
@@ -222,9 +201,7 @@ def invariant_total_is_sum(rec: ExecutionRecord) -> None:
     if any(math.isnan(v) for v in comps) or math.isnan(rec.total_IS):
         return
     expected = sum(comps)
-    if not math.isclose(
-        rec.total_IS, expected, rel_tol=0.0, abs_tol=_TOTAL_IS_BPS_TOL
-    ):
+    if not math.isclose(rec.total_IS, expected, rel_tol=0.0, abs_tol=_TOTAL_IS_BPS_TOL):
         raise AssertionError(
             f"total_IS mismatch: total_IS={rec.total_IS} expected={expected} "
             f"half_spread={rec.half_spread_cost} "

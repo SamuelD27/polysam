@@ -55,7 +55,7 @@ class DryRunExecutor:
 
     mode = "live"  # downstream dashboards check .mode; "live" keeps labels honest
 
-    def __init__(self, paper: PaperExecutor | None = None):
+    def __init__(self, paper: PaperExecutor | None = None) -> None:
         self._paper = paper or PaperExecutor()
 
     def enter(
@@ -66,6 +66,7 @@ class DryRunExecutor:
         *,
         source: str = "edge",
     ) -> EntryResult | None:
+        """Delegate to paper fill, then stamp a synthetic order_id and resolve token_id."""
         result = self._paper.enter(action, market_ctx, now, source=source)
         if result is None:
             return None
@@ -73,8 +74,13 @@ class DryRunExecutor:
         result.token_id = _token_for_side(result.side, market_ctx)
         logger.info(
             "DRY_RUN entry %s %s @%.4f shares=%.2f $%.2f src=%s order_id=%s",
-            result.side, market_ctx.slug, result.entry_price,
-            result.size_shares, result.size_usdc, source, result.order_id,
+            result.side,
+            market_ctx.slug,
+            result.entry_price,
+            result.size_shares,
+            result.size_usdc,
+            source,
+            result.order_id,
         )
         return result
 
@@ -87,14 +93,16 @@ class DryRunExecutor:
         *,
         btc_price: float,
     ) -> ExitResult | None:
-        result = self._paper.exit(
-            position, action, market_ctx, now, btc_price=btc_price
-        )
+        """Delegate exit to PaperExecutor; log under the DRY_RUN tag."""
+        result = self._paper.exit(position, action, market_ctx, now, btc_price=btc_price)
         if result is not None:
             logger.info(
                 "DRY_RUN exit %s %s @%.4f pnl=%+.2f type=%s",
-                result.side, market_ctx.slug, result.exit_price,
-                result.pnl, result.exit_type,
+                result.side,
+                market_ctx.slug,
+                result.exit_price,
+                result.pnl,
+                result.exit_type,
             )
         return result
 
@@ -106,11 +114,11 @@ class DryRunExecutor:
         *,
         btc_price: float,
     ) -> ExitResult | None:
-        return self._paper.resolve(
-            position, market_ctx, now, btc_price=btc_price
-        )
+        """Resolve at the final BTC price (delegates to PaperExecutor)."""
+        return self._paper.resolve(position, market_ctx, now, btc_price=btc_price)
 
     def reconcile(self, now: float) -> None:
+        """No-op reconcile pass — delegates to PaperExecutor (also a no-op)."""
         return self._paper.reconcile(now)
 
 

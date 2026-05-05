@@ -15,6 +15,8 @@ from .constants import (
 
 @dataclass
 class VarianceSnapshot:
+    """One annualized-sigma reading, emitted once per accepted EWMA sample."""
+
     timestamp: float
     sigma_annualized: float
     variance_per_interval: float
@@ -22,12 +24,18 @@ class VarianceSnapshot:
 
 
 class EWMAVariance:
+    """Online EWMA estimator for log-return variance over a fixed sampling interval.
+
+    Annualises by ``SECONDS_PER_YEAR / delta_seconds``. Returns None until
+    ``min_warmup`` samples have been observed.
+    """
+
     def __init__(
         self,
         lam: float = DEFAULT_EWMA_LAMBDA,
         delta_seconds: float = DEFAULT_DELTA_SECONDS,
         min_warmup: int = DEFAULT_MIN_WARMUP,
-    ):
+    ) -> None:
         self.lam = lam
         self.delta_seconds = delta_seconds
         self.min_warmup = min_warmup
@@ -38,6 +46,12 @@ class EWMAVariance:
         self._n: int = 0
 
     def update(self, price: float, timestamp: float) -> VarianceSnapshot | None:
+        """Ingest one (price, timestamp) sample.
+
+        Returns a snapshot iff (a) at least ``delta_seconds`` have elapsed
+        since the last accepted sample AND (b) at least ``min_warmup``
+        samples have been ingested. Otherwise returns None.
+        """
         if self._last_sample_ts is not None:
             if timestamp - self._last_sample_ts < self.delta_seconds:
                 return None
@@ -62,25 +76,40 @@ class EWMAVariance:
         )
 
     def current_sigma(self) -> float | None:
+        """Return the current annualized sigma estimate, or None if pre-warmup."""
         if self._n < self.min_warmup:
             return None
         return math.sqrt(self._variance * self._ann_factor)
 
     def reset(self) -> None:
+        """Discard all accumulated state — caller resumes from a cold start."""
         self._last_price = None
         self._last_sample_ts = None
         self._variance = 0.0
         self._n = 0
 
 
-def ewma_sigma_from_arrays(prices, timestamps, lam=DEFAULT_EWMA_LAMBDA, delta_seconds=DEFAULT_DELTA_SECONDS, min_warmup=DEFAULT_MIN_WARMUP):
+def ewma_sigma_from_arrays(
+    prices,
+    timestamps,
+    lam: float = DEFAULT_EWMA_LAMBDA,
+    delta_seconds: float = DEFAULT_DELTA_SECONDS,
+    min_warmup: int = DEFAULT_MIN_WARMUP,
+):
+    """Vectorized EWMA sigma over a price/timestamp array; backtest helper.
+
+    Caller supplies parallel arrays. Output array of the same length, with
+    NaN padding before warmup is reached. Used by backtest harnesses, not on
+    the live tick path.
+    """
     import numpy as np
+
     n = len(prices)
     sigmas = np.full(n, np.nan)
     if n < 2:
         return sigmas
     log_returns = np.log(prices[1:] / prices[:-1])
-    r2 = log_returns ** 2
+    r2 = log_returns**2
     dt = np.median(np.diff(timestamps))
     ann = SECONDS_PER_YEAR / dt
     var_t = r2[0]
