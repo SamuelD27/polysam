@@ -221,6 +221,33 @@ def write_trades(db_paths: dict[str, Path], out_dir: Path) -> int:
     return n
 
 
+def write_price_histories(db_paths: dict[str, Path], out_dir: Path) -> int:
+    """Write price_histories.csv (direct concat across DBs with asset col)."""
+    out_path = out_dir / "price_histories.csv"
+    n = 0
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCHEMA_PRICE_HISTORIES)
+        w.writeheader()
+        for asset, db_path in db_paths.items():
+            con = _open_db(db_path)
+            if con is None:
+                continue
+            try:
+                for r in con.execute("SELECT * FROM price_histories"):
+                    w.writerow({
+                        "asset": asset,
+                        "condition_id": r["condition_id"],
+                        "timestamp": r["timestamp"],
+                        "yes_price": r["yes_price"],
+                        "no_price": r["no_price"],
+                    })
+                    n += 1
+            finally:
+                con.close()
+    print(f"  price_histories.csv: {n} rows")
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)

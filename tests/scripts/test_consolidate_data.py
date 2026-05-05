@@ -283,3 +283,36 @@ def test_write_trades_rest_and_ws_unified(tmp_path):
     assert ws_row["price"] == "0.42"
     assert ws_row["size"] == "2.0"
     assert ws_row["slug"] == "btc-updown-5m-1"
+
+
+def _make_ph_db(path: Path, *, rows=()):
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE price_histories (
+        condition_id TEXT, timestamp INTEGER,
+        yes_price REAL, no_price REAL)""")
+    cur.executemany("INSERT INTO price_histories VALUES (?,?,?,?)", rows)
+    con.commit()
+    con.close()
+
+
+def test_write_price_histories_concats_with_asset(tmp_path):
+    from scripts.consolidate_data import write_price_histories
+
+    btc_db = tmp_path / "btc5m.db"
+    eth_db = tmp_path / "eth5m.db"
+    _make_ph_db(btc_db, rows=[("0xC1", 1773000000, 0.5, 0.5)])
+    _make_ph_db(eth_db, rows=[("0xC2", 1773000060, 0.6, 0.4),
+                              ("0xC2", 1773000120, 0.61, 0.39)])
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_price_histories({"btc": btc_db, "eth": eth_db}, out_dir)
+
+    rows = list(csv.DictReader((out_dir / "price_histories.csv").open()))
+    assert len(rows) == 3
+    assets = {r["asset"] for r in rows}
+    assert assets == {"btc", "eth"}
+    btc_row = next(r for r in rows if r["asset"] == "btc")
+    assert btc_row["condition_id"] == "0xC1"
+    assert btc_row["yes_price"] == "0.5"
