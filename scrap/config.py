@@ -69,8 +69,8 @@ BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 # ---------------------------------------------------------------------------
 # Rate limits (divided by 5 for parallel safety -- 5 assets at once)
 # ---------------------------------------------------------------------------
-RATE_GAMMA_EVENTS = 8       # 40 / 5
-RATE_GAMMA_MARKETS = 5      # 25 / 5
+RATE_GAMMA_EVENTS = 4       # 40 / 5 / 2 -- extra margin, shared endpoint
+RATE_GAMMA_MARKETS = 3      # 25 / 5 / ~2 -- extra margin, shared endpoint
 RATE_CLOB_PRICES = 16       # 80 / 5
 RATE_CLOB_MARKET = 24       # 120 / 5
 RATE_DATA_TRADES = 3        # 15 / 5
@@ -177,7 +177,7 @@ def resilient_get(
     url: str,
     params: dict,
     limiter: RateLimiter,
-    max_retries: int = 5,
+    max_retries: int = 8,
     allow_404: bool = False,
     logger: logging.Logger | None = None,
 ) -> requests.Response | None:
