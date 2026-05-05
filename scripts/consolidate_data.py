@@ -551,6 +551,31 @@ def write_daemon_events(events_path: Path, out_dir: Path) -> int:
     return n
 
 
+def write_dashboard_history(src_path: Path, out_dir: Path) -> int:
+    """Write dashboard_history.csv from dashboard_history.jsonl."""
+    out_path = out_dir / "dashboard_history.csv"
+    if not src_path.exists():
+        print(f"  [skip] missing: {src_path}")
+        return 0
+    n = 0
+    with out_path.open("w", newline="") as f_out, src_path.open() as f_in:
+        w = csv.DictWriter(f_out, fieldnames=SCHEMA_DASHBOARD)
+        w.writeheader()
+        for line_no, raw in enumerate(f_in, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"  [warn] dashboard_history.jsonl:{line_no} bad JSON: {e}")
+                continue
+            w.writerow({k: rec.get(k) for k in SCHEMA_DASHBOARD})
+            n += 1
+    print(f"  dashboard_history.csv: {n} rows")
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)

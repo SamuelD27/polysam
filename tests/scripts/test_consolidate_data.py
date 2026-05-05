@@ -589,3 +589,27 @@ def test_write_daemon_events_serializes_nested(tmp_path):
     assert len(rows) == 1
     # Nested object JSON-serialized
     assert json.loads(rows[0]["payload"]) == {"a": 1, "b": [2, 3]}
+
+
+def test_write_dashboard_history(tmp_path):
+    from scripts.consolidate_data import write_dashboard_history
+
+    src = tmp_path / "dashboard_history.jsonl"
+    src.write_text("\n".join([
+        json.dumps({"ts": 1.0, "btc_price": 70000.0,
+                    "market_price_up": 0.6, "market_price_down": 0.4,
+                    "fair_base": 0.55, "fair_enh": 0.57}),
+        json.dumps({"ts": 2.0, "btc_price": 70010.0,
+                    "market_price_up": 0.61, "market_price_down": 0.39,
+                    "fair_base": 0.56, "fair_enh": 0.58}),
+    ]) + "\n")
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    n = write_dashboard_history(src, out_dir)
+    assert n == 2
+
+    rows = list(csv.DictReader((out_dir / "dashboard_history.csv").open()))
+    assert len(rows) == 2
+    assert rows[0]["btc_price"] == "70000.0"
+    assert rows[0]["fair_enh"] == "0.57"
