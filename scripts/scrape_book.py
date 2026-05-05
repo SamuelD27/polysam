@@ -39,12 +39,11 @@ import gzip
 import hashlib
 import json
 import logging
-import os
 import signal
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -147,7 +146,7 @@ class FeedWriter:
         self._open: dict[tuple[str, str], Any] = {}
 
     def _file_for(self, slug: str) -> Any:
-        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date = datetime.now(UTC).strftime("%Y-%m-%d")
         key = (date, slug)
         if key in self._open:
             return self._open[key]

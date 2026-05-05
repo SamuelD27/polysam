@@ -11,14 +11,13 @@ from __future__ import annotations
 import math
 import os
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 from .base_strategy import (
     EDGE_MAX,
     EDGE_MIN,
-    MAX_RISK,
     MARKET_DURATION,
+    MAX_RISK,
     SPREAD_COST,
     BaseStrategy,
     compute_edge,

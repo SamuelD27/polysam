@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal
-from typing import Iterable, Literal
+from typing import Literal
 
 # Spec section 2.2: tick_size (string key) -> price decimal places.
 ROUNDING_CONFIG: dict[str, int] = {
@@ -48,8 +49,8 @@ class Level:
 @dataclass(frozen=True)
 class Book:
     token_id: str
-    side_bids: tuple["Level", ...]
-    side_asks: tuple["Level", ...]
+    side_bids: tuple[Level, ...]
+    side_asks: tuple[Level, ...]
     tick_size: Decimal                       # symmetric default (also back-compat)
     ts_ns: int
     source_seq: int | None = None
@@ -80,7 +81,7 @@ class FillResult:
     classification: Literal["full", "partial", "unfilled"]
     filled_qty: Decimal
     residual_qty: Decimal
-    levels: tuple["FillLevel", ...]
+    levels: tuple[FillLevel, ...]
     vwap: Decimal | None
     levels_consumed: int
 

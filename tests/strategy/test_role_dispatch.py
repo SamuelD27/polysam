@@ -24,7 +24,6 @@ from active_bots.enhanced_strategy import EnhancedStrategy
 from active_bots.refined_strategy import RefinedStrategy
 from active_bots.walked_vwap_strategy import WalkedVWAPStrategy
 
-
 # ── default role is observer (safe-by-construction) ────────────────────────
 
 def test_base_strategy_default_role_is_observer():

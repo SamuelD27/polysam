@@ -15,10 +15,9 @@ from __future__ import annotations
 import math
 from decimal import Decimal
 
-from .book import Book, FillResult, SIZE_QUANTUM
+from .book import SIZE_QUANTUM, Book, FillResult
 from .fees import FeeCategory, fee_usdc
 from .replay_executor import ExecutionRecord
-
 
 _VWAP_ABS_TOL = Decimal("1e-12")
 _TOTAL_IS_BPS_TOL = 1e-6  # tolerance in bps for total_IS sum check

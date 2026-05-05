@@ -12,9 +12,9 @@ import time
 
 import pytest
 
-from active_bots.walked_vwap_strategy import WalkedVWAPStrategy
-from active_bots.refined_strategy import RefinedStrategy
 from active_bots.execution.live_book_state import LiveBookState, MarketBooks
+from active_bots.refined_strategy import RefinedStrategy
+from active_bots.walked_vwap_strategy import WalkedVWAPStrategy
 
 
 def test_imports_cleanly():
@@ -674,9 +674,9 @@ def test_gate_reject_clears_parent_phantom_open_position(monkeypatch):
 # EXIT_PARTIAL_OK / EXIT_FALLBACK_MID) are flipped via monkeypatch the same
 # way WALKED_VWAP_PARTIAL_OK is flipped at line 310-311.
 
-from active_bots.walked_vwap_strategy import WalkedExitProfitGrabber  # noqa: E402
+from active_bots.base_strategy import MARKET_DURATION  # noqa: E402
 from active_bots.enhanced_strategy import ProfitGrabber  # noqa: E402
-from active_bots.base_strategy import MARKET_DURATION, SPREAD_COST  # noqa: E402
+from active_bots.walked_vwap_strategy import WalkedExitProfitGrabber  # noqa: E402
 
 
 def _make_position(

@@ -12,7 +12,7 @@ import gzip
 import json
 import sqlite3
 import zlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -320,7 +320,7 @@ def _parse_ws_timestamp(ts) -> int | str | None:
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return int(dt.timestamp())
     except (TypeError, ValueError):
         return s
@@ -467,7 +467,7 @@ def _book_feed_row(rec: dict) -> dict | None:
     snapshot_time = None
     if ts_ns is not None:
         try:
-            dt = datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=timezone.utc)
+            dt = datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=UTC)
             snapshot_time = dt.isoformat()
         except (OSError, OverflowError, ValueError):
             snapshot_time = None

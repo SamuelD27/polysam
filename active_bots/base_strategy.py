@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 from .pricing.constants import SECONDS_PER_YEAR

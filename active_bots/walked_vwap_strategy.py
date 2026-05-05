@@ -21,15 +21,14 @@ import time as _time
 from decimal import Decimal
 from typing import Any
 
-from .refined_strategy import RefinedStrategy
 from .enhanced_strategy import MARKET_DURATION, ProfitGrabber
 from .execution.fees import CATEGORIES, fee_usdc
 from .execution.live_book_state import (
-    LiveBookState,
     MarketBooks,
     WalkResult,
     walk_for_vwap,
 )
+from .refined_strategy import RefinedStrategy
 
 # Defaults — env overridable per project convention.
 MARKET_PRICE_MAX_STALENESS_S = float(

@@ -7,6 +7,6 @@ The strategy (EnhancedStrategy) and the daemon's state/web layer are both
 agnostic to which executor is active.
 """
 
-from .executor import Executor, MarketCtx, EntryResult, ExitResult
+from .executor import EntryResult, Executor, ExitResult, MarketCtx
 
 __all__ = ["Executor", "MarketCtx", "EntryResult", "ExitResult"]

@@ -22,7 +22,7 @@ the session's preferred tuning.
 
 from __future__ import annotations
 
-from .enhanced_strategy import EnhancedStrategy, MAX_RISK
+from .enhanced_strategy import MAX_RISK, EnhancedStrategy
 
 
 class RefinedStrategy(EnhancedStrategy):

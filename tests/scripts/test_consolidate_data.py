@@ -12,6 +12,7 @@ def test_module_imports():
 
 
 import pytest
+
 from scripts.consolidate_data import slug_to_asset
 
 
@@ -34,9 +35,13 @@ def test_slug_to_asset_unknown_returns_none():
 
 
 from scripts.consolidate_data import (
-    SCHEMA_MARKETS, SCHEMA_TRADES, SCHEMA_PRICE_HISTORIES,
-    SCHEMA_ORDERBOOKS, SCHEMA_SPOT, SCHEMA_TRADERS,
     SCHEMA_DASHBOARD,
+    SCHEMA_MARKETS,
+    SCHEMA_ORDERBOOKS,
+    SCHEMA_PRICE_HISTORIES,
+    SCHEMA_SPOT,
+    SCHEMA_TRADERS,
+    SCHEMA_TRADES,
 )
 
 
@@ -141,6 +146,7 @@ def test_ladder_metrics_one_sided():
 
 import csv
 import sqlite3
+from datetime import UTC
 from pathlib import Path
 
 
@@ -410,8 +416,8 @@ def test_write_spot_unified(tmp_path):
     assert numeric_ts["timestamp"] == "1773000300"
     # ISO string parsed via fromisoformat
     iso_ts = next(r for r in ws_rows if r["price"] == "70080.0")
-    from datetime import datetime, timezone
-    expected = int(datetime.fromisoformat("2026-04-24T07:10:19").replace(tzinfo=timezone.utc).timestamp())
+    from datetime import datetime
+    expected = int(datetime.fromisoformat("2026-04-24T07:10:19").replace(tzinfo=UTC).timestamp())
     assert iso_ts["timestamp"] == str(expected)
     assert iso_ts["open"] == ""  # NULL for WS
 
@@ -456,7 +462,8 @@ import json
 
 def test_append_book_feed_to_orderbooks(tmp_path):
     from scripts.consolidate_data import (
-        write_orderbooks_rest, append_book_feed_to_orderbooks,
+        append_book_feed_to_orderbooks,
+        write_orderbooks_rest,
     )
 
     # Step 1: write the REST half (creates orderbooks.csv with header).
@@ -758,7 +765,8 @@ def test_main_idempotent_rebuild(tmp_path, monkeypatch):
 def test_book_feed_skips_truncated_gz(tmp_path):
     """A truncated .jsonl.gz must be skipped gracefully (not crash the run)."""
     from scripts.consolidate_data import (
-        write_orderbooks_rest, append_book_feed_to_orderbooks,
+        append_book_feed_to_orderbooks,
+        write_orderbooks_rest,
     )
 
     out_dir = tmp_path / "out"
@@ -819,7 +827,8 @@ def test_book_feed_skips_truncated_gz(tmp_path):
 def test_book_feed_skips_corrupted_zlib_block(tmp_path):
     """A .jsonl.gz with a corrupted compression block must also be skipped."""
     from scripts.consolidate_data import (
-        write_orderbooks_rest, append_book_feed_to_orderbooks,
+        append_book_feed_to_orderbooks,
+        write_orderbooks_rest,
     )
 
     out_dir = tmp_path / "out"

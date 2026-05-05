@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -106,8 +105,8 @@ def main() -> int:
     print(f"token_id   : {args.token_id}")
     print(f"side       : {args.side}  (Side.{args.side} = {side_const})")
     print(f"amount     : {args.size_usdc}")
-    print(f"order_type : OrderType.FAK")
-    print(f"options    : None  (defer to V2 internal tick-size resolution)")
+    print("order_type : OrderType.FAK")
+    print("options    : None  (defer to V2 internal tick-size resolution)")
     print(f"dry_run    : {args.dry_run}")
     print()
 
@@ -129,7 +128,7 @@ def main() -> int:
         return 3
 
     print(f"client built: {client.__class__.__module__}.{client.__class__.__name__}")
-    print(f"posting…")
+    print("posting…")
     print()
 
     try:

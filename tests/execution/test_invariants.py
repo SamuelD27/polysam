@@ -19,7 +19,6 @@ from active_bots.execution.book import (
     Book,
     FillResult,
     Level,
-    SIZE_QUANTUM,
     walk_book,
 )
 from active_bots.execution.fees import CRYPTO, FINANCE, GEOPOLITICS
@@ -39,7 +38,6 @@ from active_bots.execution.replay_executor import (
     OrderRequest,
     ReplayExecutor,
 )
-
 
 TICK = Decimal("0.01")
 

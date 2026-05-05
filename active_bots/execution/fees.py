@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal, Union
+from typing import Literal
 
 BPS_PEAK: Decimal = Decimal("180")  # peak rate in basis points at p=0.5
 DUST_THRESHOLD: Decimal = Decimal("0.00001")  # USDC; per help.polymarket.com/en/articles/13364471
@@ -29,7 +29,7 @@ CATEGORIES: dict[str, FeeCategory] = {
 }
 
 
-def _coerce(x: Union[Decimal, int, str], name: str) -> Decimal:
+def _coerce(x: Decimal | int | str, name: str) -> Decimal:
     if isinstance(x, bool):
         raise TypeError(f"{name} must not be bool")
     if isinstance(x, float):

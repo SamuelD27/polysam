@@ -7,11 +7,9 @@ from decimal import Decimal
 import pytest
 
 from active_bots.execution.book import (
-    Book,
-    FillResult,
-    Level,
     ROUNDING_CONFIG,
-    SIZE_QUANTUM,
+    Book,
+    Level,
     apply_deltas,
     freeze_last_book,
     quantize_price,

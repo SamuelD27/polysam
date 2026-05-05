@@ -14,18 +14,16 @@ import pytest
 from active_bots.execution.book import Book, Level
 from active_bots.execution.fees import CRYPTO
 from active_bots.execution.latency import (
-    ConditionedSampler,
     DUBLIN_PRIOR,
-    LatencyProfile,
     SG_WG_PRIOR,
+    ConditionedSampler,
+    LatencyProfile,
 )
 from active_bots.execution.replay_executor import (
     DictBookStore,
-    ExecutionRecord,
     OrderRequest,
     ReplayExecutor,
 )
-
 
 TICK = Decimal("0.01")
 

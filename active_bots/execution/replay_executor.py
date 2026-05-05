@@ -36,16 +36,20 @@ from __future__ import annotations
 import bisect
 import math
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Callable, Literal, Optional, Protocol
+from typing import Literal, Protocol
 
 from .book import Book, FillResult, freeze_last_book, walk_book
-from .fees import FeeCategory, fee_usdc as _default_fee
+from .fees import FeeCategory
+from .fees import fee_usdc as _default_fee
 from .latency import (
+    SG_WG_PRIOR,
     ConditionedSampler,
     LatencyProfile,
-    SG_WG_PRIOR,
+)
+from .latency import (
     sample as _sample_latency,
 )
 
@@ -91,8 +95,8 @@ class OrderRequest:
     trade_id: str = ""
     parent_order_id: str = ""
     backtest_run_id: str = ""
-    t_zero_ns: Optional[int] = None
-    t_end_ns: Optional[int] = None
+    t_zero_ns: int | None = None
+    t_end_ns: int | None = None
     edge_at_signal: float = NAN
     # Latency-sampling context (spec §3.1 / §3.3): harness populates these
     # when it has signal; absent, default "unk" lets a ConditionedSampler
@@ -172,7 +176,7 @@ def _freeze_or_snap(
     snapshots: list[Book],
     t_query_ns: int,
     mode: Literal["freeze_depleted", "snap_back"],
-) -> tuple[Optional[Book], Optional[int]]:
+) -> tuple[Book | None, int | None]:
     """Return (book, staleness_ms) per mode, or (None, None) if unavailable."""
     if not snapshots:
         return None, None
@@ -193,7 +197,7 @@ def _freeze_or_snap(
     raise ValueError(f"invalid mode {mode!r}")
 
 
-def _best_opposite(book: Book, side: str) -> Optional[Decimal]:
+def _best_opposite(book: Book, side: str) -> Decimal | None:
     if side == "BUY":
         return book.side_asks[0].price if book.side_asks else None
     if side == "SELL":
@@ -225,7 +229,7 @@ def _bps_of(delta: Decimal, ref: Decimal) -> float:
     return float(delta / ref * _10K)
 
 
-def _mid(book: Book) -> Optional[Decimal]:
+def _mid(book: Book) -> Decimal | None:
     bb = book.side_bids[0].price if book.side_bids else None
     ba = book.side_asks[0].price if book.side_asks else None
     if bb is None and ba is None:
@@ -238,7 +242,7 @@ def _mid(book: Book) -> Optional[Decimal]:
 
 
 def _time_in_market_bucket(
-    decision_ts_ns: int, t_zero_ns: Optional[int], t_end_ns: Optional[int]
+    decision_ts_ns: int, t_zero_ns: int | None, t_end_ns: int | None
 ) -> str:
     if t_zero_ns is None or t_end_ns is None or t_end_ns <= t_zero_ns:
         return "unk"
@@ -262,11 +266,11 @@ class ReplayExecutor:
         books: BookStore,
         fees_fn: Callable[[Decimal, Decimal, FeeCategory], Decimal] = _default_fee,
         latency_profile: LatencyProfile = SG_WG_PRIOR,
-        latency_sampler: Optional[ConditionedSampler] = None,
+        latency_sampler: ConditionedSampler | None = None,
         mode: Literal["freeze_depleted", "snap_back"] = "freeze_depleted",
         staleness_hard_ms: int = 500,
         staleness_soft_ms: int = 200,
-        rng: Optional[random.Random] = None,
+        rng: random.Random | None = None,
         p_bucket_used: str = "base",
     ):
         self._books = books
@@ -431,7 +435,7 @@ def _sum_nan_propagating(*vals: float) -> float:
     return total
 
 
-def _nan_to_int(v: Optional[int]) -> int:
+def _nan_to_int(v: int | None) -> int:
     return -1 if v is None else int(v)
 
 

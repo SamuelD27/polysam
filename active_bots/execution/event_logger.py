@@ -59,7 +59,7 @@ def _to_jsonable(v: Any) -> Any:
     return str(v)
 
 
-_NULL_LOGGER: "EventLogger | None" = None
+_NULL_LOGGER: EventLogger | None = None
 
 
 class _NullEventLogger:

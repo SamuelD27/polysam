@@ -30,13 +30,13 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from active_bots.enhanced_strategy import EnhancedStrategy
-from active_bots.refined_strategy import RefinedStrategy
-from active_bots.walked_vwap_strategy import WalkedVWAPStrategy
 from active_bots.execution import Executor, MarketCtx
 from active_bots.execution.event_logger import EventLogger
 from active_bots.execution.live_book_state import LiveBookState, MarketBooks
 from active_bots.execution.paper_executor import PaperExecutor
 from active_bots.execution.risk_manager import RiskConfig, RiskManager
+from active_bots.refined_strategy import RefinedStrategy
+from active_bots.walked_vwap_strategy import WalkedVWAPStrategy
 
 try:
     from dotenv import load_dotenv
@@ -567,7 +567,7 @@ class DaemonState:
 
         # Per-slug book registry — populated by clob_book_feed.
         # books_by_slug[slug] = MarketBooks(yes=..., no=...)
-        self.books_by_slug: dict[str, "MarketBooks"] = {}
+        self.books_by_slug: dict[str, MarketBooks] = {}
         # Per-asset_id metadata for the WS dispatcher
         # token_index[asset_id] = {"slug": str, "side": "yes"|"no", "book": LiveBookState}
         self.token_index: dict[str, dict] = {}
@@ -863,7 +863,7 @@ async def rtds_feed(state: DaemonState):
                     watchdog_task.cancel()
                     try:
                         await asyncio.wait_for(watchdog_task, timeout=1.0)
-                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    except (TimeoutError, asyncio.CancelledError, Exception):
                         pass
 
         except (websockets.ConnectionClosed, OSError) as e:
@@ -962,7 +962,7 @@ async def clob_book_feed(state: DaemonState):
                 while state.t_zero == subscribed_slug:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         continue
                     try:
                         payload = json.loads(raw)

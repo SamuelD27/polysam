@@ -18,9 +18,10 @@ import dataclasses
 import json
 import math
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
 
 Z_95 = 1.6448536269514722
 
