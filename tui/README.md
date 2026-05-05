@@ -135,8 +135,6 @@ The launcher expects:
 - **Do not fix the visual bugs by editing `python/dashboard.py`.** The
   Python TUI is now frozen; every pending visual bug below should be
   fixed in the Rust port instead.
-- **Do not touch `scripts/dashboard_streamlit.py`** — a separate web
-  dashboard, independent of this work.
 - **Do not write to `daemon_state/`** — the Python TUI has a test
   (`tests/test_read_only.py`) that enforces this. The Rust TUI is
   expected to follow the same rule.
