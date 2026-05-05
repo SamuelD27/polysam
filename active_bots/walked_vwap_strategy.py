@@ -14,6 +14,7 @@ experiments/backtest/replay_executor.py.
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time as _time
@@ -21,6 +22,7 @@ from decimal import Decimal
 from typing import Any
 
 from .refined_strategy import RefinedStrategy
+from .enhanced_strategy import MARKET_DURATION, ProfitGrabber
 from .execution.fees import CATEGORIES, fee_usdc
 from .execution.live_book_state import (
     LiveBookState,
@@ -42,9 +44,185 @@ WALKED_VWAP_PARTIAL_OK = (
 )
 FEE_CATEGORY = os.environ.get("WALKED_VWAP_FEE_CATEGORY", "crypto")
 
+# Exit-gate knobs — default-off; mid-quoted exit path is preserved bit-for-bit
+# until WALKED_VWAP_EXIT_ENABLE is flipped per-deployment after paper-validation.
+EXIT_ENABLE = (
+    os.environ.get("WALKED_VWAP_EXIT_ENABLE", "0").strip() in ("1", "true", "True")
+)
+EXIT_STALENESS_S = float(os.environ.get("WALKED_VWAP_EXIT_STALENESS_S", 30.0))
+EXIT_PARTIAL_OK = (
+    os.environ.get("WALKED_VWAP_EXIT_PARTIAL_OK", "0").strip() in ("1", "true", "True")
+)
+EXIT_FALLBACK_MID = (
+    os.environ.get("WALKED_VWAP_EXIT_FALLBACK_MID", "1").strip() in ("1", "true", "True")
+)
+
+
+class WalkedExitProfitGrabber(ProfitGrabber):
+    """ProfitGrabber that re-prices realizable exit on walked-bid VWAP (post fee).
+
+    Reads books from self._latest_books, stashed by WalkedVWAPStrategy.on_tick
+    every tick before parent delegation (whether or not books is None — the
+    None branch is handled here so the seam stays tick-uniform). Falls back to
+    mid via the parent's own check_exit when the book is stale, empty,
+    partial-without-flag, or NaN. Inside the force-exit window, partial fills
+    are accepted and a genuinely empty book falls back to mid so the parent's
+    force-close still fires (never orphan a residual position pre-resolution).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Set fresh by wrapper.on_tick each tick (even when books is None);
+        # subclass's own None branch handles fallback so the wrapper does not
+        # need to gate the stash.
+        self._latest_books = None
+
+    def check_exit(
+        self,
+        position,
+        btc_price,
+        sigma,
+        t_zero,
+        market_price_up=None,
+        market_price_ts=0.0,
+    ):
+        # Default-off: short-circuit so behaviour is identical to vanilla
+        # ProfitGrabber.check_exit when EXIT_ENABLE is False (preserves mid
+        # quoting bit-for-bit, no logging side effects).
+        if not EXIT_ENABLE:
+            return super().check_exit(
+                position, btc_price, sigma, t_zero,
+                market_price_up=market_price_up,
+                market_price_ts=market_price_ts,
+            )
+
+        # Force-window detection mirrors enhanced_strategy.py:282-284 so the
+        # gate's bad-book fallback decision matches the parent's own
+        # force-close semantics (never hold past resolution).
+        time_remaining = MARKET_DURATION - (_time.time() - t_zero)
+        in_force_window = (
+            self.force_exit_before_s > 0 and time_remaining <= self.force_exit_before_s
+        )
+
+        translated = self._compute_translated_market_price_up(
+            position, market_price_up, in_force_window,
+        )
+        if translated is None:
+            # FALLBACK_MID=0 + non-force-window + bad book → hold position;
+            # next tick re-runs the gate against a fresh book.
+            return None
+
+        return super().check_exit(
+            position, btc_price, sigma, t_zero,
+            market_price_up=translated,
+            market_price_ts=market_price_ts,
+        )
+
+    def _compute_translated_market_price_up(
+        self, position, mid_market_price_up, in_force_window,
+    ):
+        """Returns market_price_up to feed parent.check_exit, or None to hold.
+
+        Returns the original mid_market_price_up unchanged if the book is bad
+        and FALLBACK_MID=1 (or in_force_window). Returns the walked-bid VWAP
+        translated into the YES-frame on success. Returns None to instruct the
+        caller to hold (FALLBACK_MID=0 + non-force-window + bad book).
+        """
+        side = position["side"]
+        size_shares = float(position["size_shares"])
+        books = self._latest_books
+
+        # No subscription this tick → fallback per knob / force-window.
+        if books is None:
+            return mid_market_price_up if (EXIT_FALLBACK_MID or in_force_window) else None
+
+        book = books.yes if side == "Up" else books.no
+        if book is None or not book.has_baseline or not book.bids:
+            self._log_liquidity_gap(reason="empty_book", side=side)
+            return mid_market_price_up if (EXIT_FALLBACK_MID or in_force_window) else None
+
+        # Staleness gate — book.ts_ms is milliseconds (per LiveBookState).
+        now = _time.time()
+        if book.ts_ms and (now - book.ts_ms / 1000.0) > EXIT_STALENESS_S:
+            self._log_liquidity_gap(reason="stale_book", side=side)
+            return mid_market_price_up if (EXIT_FALLBACK_MID or in_force_window) else None
+
+        walk = walk_for_vwap(book.bids, size_shares)
+        # Force-window flips PARTIAL_OK True before the disallowed-partial
+        # branch is reached, so the partial-disallowed fallback only consults
+        # EXIT_FALLBACK_MID — by then in_force_window has already widened the
+        # accept condition (see plan gate matrix).
+        partial_ok = EXIT_PARTIAL_OK or in_force_window
+        if (
+            walk.classification == "unfilled"
+            or walk.vwap is None
+            or not math.isfinite(walk.vwap)
+        ):
+            self._log_liquidity_gap(reason="empty_book", side=side)
+            return mid_market_price_up if (EXIT_FALLBACK_MID or in_force_window) else None
+        if walk.classification == "partial" and not partial_ok:
+            self._log_liquidity_gap(
+                reason="partial_fill_disallowed", side=side,
+                filled_shares=walk.filled_shares,
+            )
+            return mid_market_price_up if EXIT_FALLBACK_MID else None
+
+        # Effective per-share proceeds for the holder = VWAP MINUS per-share fee
+        # (mirror of the entry-side _effective_vwap_after_fees, which ADDS the
+        # fee for the buyer; on the sell side the taker pays the fee out of
+        # proceeds, so it lowers the effective receive price).
+        eff = self._effective_exit_after_fees(walk.vwap, walk.filled_shares)
+        if not math.isfinite(eff):
+            return mid_market_price_up if (EXIT_FALLBACK_MID or in_force_window) else None
+
+        # Translate into YES-frame: parent computes
+        #   realizable = market_price_up if side=="Up" else 1.0 - market_price_up
+        # so feeding eff (Up) / 1-eff (Down) makes parent.realizable == eff
+        # for both sides — the holder's true post-fee per-share exit proceeds.
+        return eff if side == "Up" else (1.0 - eff)
+
+    def _effective_exit_after_fees(self, fill_vwap, filled_shares):
+        """Per-share exit proceeds net of bell-curve taker fee (selling side).
+
+        Symmetric to _effective_vwap_after_fees but SUBTRACTS the per-share
+        fee — on a sell, the taker pays the fee out of proceeds, so effective
+        receive price < quoted VWAP.
+        """
+        if filled_shares <= 0:
+            return fill_vwap
+        category = CATEGORIES.get(FEE_CATEGORY, CATEGORIES["crypto"])
+        fee = fee_usdc(
+            p=Decimal(str(fill_vwap)),
+            shares=Decimal(str(filled_shares)),
+            category=category,
+        )
+        return fill_vwap - float(fee) / filled_shares  # SUBTRACT on the sell side
+
+    def _log_liquidity_gap(self, **diag):
+        # Light structured log — no event-bus dep on the daemon path.
+        logging.getLogger(__name__).info("walked_vwap_exit_liquidity_gap %s", diag)
+
 
 class WalkedVWAPStrategy(RefinedStrategy):
     """RefinedStrategy + walked-VWAP entry gate."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Swap the parent's ProfitGrabber for the exit-aware subclass, carrying
+        # the SAME tp/sl/force config the parent already built. Reading the
+        # values off the parent's instance keeps this hands-off w.r.t. how
+        # EnhancedStrategy resolves env defaults (do not re-derive them).
+        # When enable_profit_grabber=False (EnhancedStrategy.__init__), the
+        # parent leaves self.profit_grabber=None — preserve that branch
+        # untouched so callers that disabled exits still see the same shape.
+        if self.profit_grabber is not None:
+            self.profit_grabber = WalkedExitProfitGrabber(
+                tp_delta_min=self.profit_grabber.tp_delta_min,
+                sl_delta_min=self.profit_grabber.sl_delta_min,
+                sl_delta_max=self.profit_grabber.sl_delta_max,
+                tp_absolute_favor=self.profit_grabber.tp_absolute_favor,
+                force_exit_before_s=self.profit_grabber.force_exit_before_s,
+            )
 
     def _run_parent_on_tick(
         self, btc_price, market_price_up, sigma, t_zero, market_price_ts,
@@ -69,6 +247,12 @@ class WalkedVWAPStrategy(RefinedStrategy):
         *,
         books: MarketBooks | None = None,
     ) -> dict[str, Any] | None:
+        # Stash books onto the exit-aware ProfitGrabber every tick, even when
+        # books is None — the subclass's own None branch handles fallback, so
+        # keeping the stash unconditional avoids a stale book leaking from a
+        # prior tick into the next exit-gate evaluation.
+        if isinstance(self.profit_grabber, WalkedExitProfitGrabber):
+            self.profit_grabber._latest_books = books
         action = self._run_parent_on_tick(
             btc_price, market_price_up, sigma, t_zero, market_price_ts,
         )
