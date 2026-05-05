@@ -438,7 +438,7 @@ def append_book_feed_to_orderbooks(book_feed_root: Path, out_dir: Path) -> int:
                                 continue
                             w.writerow(row)
                             n += 1
-                except OSError as e:
+                except (OSError, EOFError) as e:
                     print(f"  [warn] failed to read {gz_file}: {e}")
     print(f"  orderbooks.csv (ws_book_feed): {n} rows appended")
     return n
