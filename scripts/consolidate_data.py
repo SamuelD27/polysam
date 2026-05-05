@@ -367,6 +367,40 @@ def write_spot(db_paths: dict[str, Path], out_dir: Path) -> int:
     return n
 
 
+def write_traders(db_paths: dict[str, Path], out_dir: Path) -> int:
+    """Write traders.csv (wallet aggregates, asset col preserved)."""
+    out_path = out_dir / "traders.csv"
+    n = 0
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCHEMA_TRADERS)
+        w.writeheader()
+        for asset, db_path in db_paths.items():
+            con = _open_db(db_path)
+            if con is None:
+                continue
+            try:
+                for r in con.execute("SELECT * FROM traders"):
+                    w.writerow({
+                        "asset": asset,
+                        "wallet": r["wallet"],
+                        "total_trades": r["total_trades"],
+                        "total_volume_usdc": r["total_volume_usdc"],
+                        "win_rate": r["win_rate"],
+                        "avg_trade_size": r["avg_trade_size"],
+                        "first_trade_time": r["first_trade_time"],
+                        "last_trade_time": r["last_trade_time"],
+                        "favorite_side": r["favorite_side"],
+                        "favorite_outcome": r["favorite_outcome"],
+                    })
+                    n += 1
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                con.close()
+    print(f"  traders.csv: {n} rows")
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)

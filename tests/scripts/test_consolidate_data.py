@@ -414,3 +414,37 @@ def test_write_spot_unified(tmp_path):
     expected = int(datetime.fromisoformat("2026-04-24T07:10:19").replace(tzinfo=timezone.utc).timestamp())
     assert iso_ts["timestamp"] == str(expected)
     assert iso_ts["open"] == ""  # NULL for WS
+
+
+def _make_traders_db(path: Path, *, rows=()):
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE traders (
+        wallet TEXT PRIMARY KEY, total_trades INTEGER,
+        total_volume_usdc REAL, win_rate REAL, avg_trade_size REAL,
+        first_trade_time TEXT, last_trade_time TEXT,
+        favorite_side TEXT, favorite_outcome TEXT)""")
+    cur.executemany("INSERT INTO traders VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    con.commit()
+    con.close()
+
+
+def test_write_traders(tmp_path):
+    from scripts.consolidate_data import write_traders
+
+    db = tmp_path / "btc5m.db"
+    _make_traders_db(db, rows=[
+        ("0xWALLET1", 100, 5000.0, 0.55, 50.0, "1773000000", "1773100000", "BUY", "Up"),
+    ])
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_traders({"btc": db}, out_dir)
+
+    rows = list(csv.DictReader((out_dir / "traders.csv").open()))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["asset"] == "btc"
+    assert r["wallet"] == "0xWALLET1"
+    assert r["total_trades"] == "100"
+    assert r["win_rate"] == "0.55"
