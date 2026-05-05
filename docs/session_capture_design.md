@@ -173,3 +173,62 @@ If a future schema field promotes `live_gui_pid` into `manifest.json`
 (useful for `status` to surface dashboard liveness), the preflight
 sweep should grow a parallel branch for it. Until then, this is a
 known-but-dormant gap.
+
+### 5.3 Captured entries reference tokens not present in the feed
+
+Surfaced 2026-04-26 while validating the harness delta-loader fix
+(commits `bad1534` + `fe38146`) against the
+`2026-04-24T07-10-19Z` dryrun session.
+
+**Symptom.** After the delta-loader landed (which raised anchor density
+on active tokens from ~0.2 Hz to ~246 Hz), reconcile still classified
+457/501 (91%) entries as `book_stale`. Investigation found that the
+remaining stale entries' resolved `token_id` values do not appear as
+`asset_id` in any record under `daemon_state/book_feed/<date>/`. The
+delta-vs-snapshot question is settled — for the 2 entries whose token
+*is* in the feed, the loader recovers the book and reconcile classifies
+them `full`. The blocker is upstream: those tokens never reached the
+loader at all.
+
+**Two candidate root causes; triage before relying on this for any
+LIVE_MODE-grade gate evaluation:**
+
+(a) **Scraper subscription gap.** `scrape_book.py`'s 60 s
+    `discover_markets` loop may have missed the markets that produced
+    these entries — a race against the 5-minute rollover, a
+    Gamma `/events?tag_slug=5M&active=true` filter that excluded the
+    relevant slug, or a `reconnect` that did not restore the full
+    subscription set. Diagnostic: parse `scraper.log` for
+    `subscribed assets=` lines and `new market <slug> <side> tick=`
+    lines, build the union of asset_ids the scraper *should have*
+    captured, and `comm` against the asset_ids that actually appear in
+    `book_feed/<date>/*.jsonl.gz`. The diff is a tight upper bound on
+    the bug's blast radius; cross-reference it with the entry events'
+    token_ids to confirm.
+
+(b) **Slug → token_id aliasing drift.** The daemon and reconcile may
+    resolve the same slug to different token_ids if the markets sqlite
+    was rewritten between capture and reconcile. The feed *does*
+    contain the book under a different alias, but the
+    `slug → canonical_token_id` resolver lookup miss-aligns. Less
+    likely given the same DB was used end-to-end, but a one-line check
+    against `data/btc5m.db` for the affected slugs rules it out.
+
+**Why it matters now.** SELL-side reconcile is the gating followup
+before any real LIVE_MODE capture (see
+`docs/superpowers/plans/2026-04-26-reconcile-entries-only.md` Out of
+Scope, and `docs/reconcile_design.md` Purpose section). The R2.2
+hypothesis under test (TP 4.15¢ vs SL 9.80¢ slippage asymmetry,
+concentrated in `adaptive_sl` with `entry_px ≥ 0.55`, on N=39) lives
+on the exit side. If after SELL lands the in-gate-window count is
+still bottlenecked by this bug, the empirical pass has no statistical
+power and the gate is plumbing-validation only — exactly what
+entries-only already established. Triage (a)/(b) before treating the
+SELL gate as load-bearing for hypothesis acceptance.
+
+**Suggested ordering.** Cheap diagnostic first — the asset_id `comm`
+above is ~30 min and answers (a) outright. If (a) is the cause, the
+fix lives in the scraper, not reconcile. If neither (a) nor (b)
+explains it, capture a fresh dryrun against a known-good markets DB
+and re-validate; persistent gap implies a third cause not on this
+list.
