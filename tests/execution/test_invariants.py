@@ -171,7 +171,7 @@ def _book_strategy(draw: st.DrawFn) -> Book:
 
     asks = tuple(
         Level(price=Decimal(p), size=Decimal(s))
-        for p, s in zip(ask_prices, ask_sizes)
+        for p, s in zip(ask_prices, ask_sizes, strict=True)
     )
 
     # Mirror bids below 0.50: same count, descending prices in [0.01, 0.49].
@@ -199,7 +199,7 @@ def _book_strategy(draw: st.DrawFn) -> Book:
     )
     bids = tuple(
         Level(price=Decimal(p), size=Decimal(s))
-        for p, s in zip(bid_prices, bid_sizes)
+        for p, s in zip(bid_prices, bid_sizes, strict=True)
     )
 
     return Book(

@@ -326,7 +326,6 @@ class ReplayExecutor:
             return _with(base, classification="book_stale", book_staleness_ms=_nan_to_int(stale_ack_ms))
 
         if stale_ack_ms > self._staleness_hard_ms:
-            dec_mid_f = float(order.decision_mid)
             return _with(
                 base,
                 classification="book_stale",
@@ -344,7 +343,6 @@ class ReplayExecutor:
         dec_mid = order.decision_mid
         best_opp_dec = _best_opposite(book_dec, order.side) if book_dec is not None else None
         best_opp_ack = _best_opposite(book_ack, order.side)
-        mid_ack = _mid(book_ack)
         if best_opp_dec is None:
             best_opp_dec = best_opp_ack  # fallback: no pre-decision book
 

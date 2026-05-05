@@ -531,7 +531,7 @@ def write_daemon_events(events_path: Path, out_dir: Path) -> int:
     with out_path.open("w", newline="") as f_out, events_path.open() as f_in:
         w = csv.DictWriter(f_out, fieldnames=keys)
         w.writeheader()
-        for line_no, raw in enumerate(f_in, start=1):
+        for _line_no, raw in enumerate(f_in, start=1):
             line = raw.strip()
             if not line:
                 continue

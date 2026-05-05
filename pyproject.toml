@@ -28,6 +28,11 @@ ignore = [
     "B904",  # raise from — noisy on existing daemon error handling
 ]
 
+# E402 in test_consolidate_data.py is intentional: imports are co-located with
+# the test groups that need them, after a sys.path manipulation. Don't fight it.
+[tool.ruff.lint.per-file-ignores]
+"tests/scripts/test_consolidate_data.py" = ["E402"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
@@ -42,14 +47,23 @@ testpaths = [
 # tests/) and tui/tests/ (separate test root). Those still run via their
 # own root-cd'd invocations; they just don't pollute the global suite.
 norecursedirs = [
+    # pytest defaults that would otherwise be lost when norecursedirs is set
+    # explicitly (extending the default is unsupported; we re-list them here
+    # so dot-prefixed caches like .hypothesis stay ignored).
+    ".*",
+    "build",
+    "dist",
+    "CVS",
+    "_darcs",
+    "{arch}",
+    "*.egg",
+    "venv",
+    # Project-specific
     "experiments",
     ".worktrees",
     "tui",
     "scrap",
-    "build",
-    "dist",
     "__pycache__",
-    ".git",
 ]
 asyncio_mode = "strict"
 filterwarnings = [

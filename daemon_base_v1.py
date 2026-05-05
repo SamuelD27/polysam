@@ -19,6 +19,7 @@ import sys
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import requests
 
@@ -37,6 +38,9 @@ from active_bots.execution.paper_executor import PaperExecutor
 from active_bots.execution.risk_manager import RiskConfig, RiskManager
 from active_bots.refined_strategy import RefinedStrategy
 from active_bots.walked_vwap_strategy import WalkedVWAPStrategy
+
+if TYPE_CHECKING:
+    from active_bots.execution.token_resolver import TokenResolver
 
 try:
     from dotenv import load_dotenv
@@ -1117,7 +1121,6 @@ async def strategy_loop(
     enh_exec,     enh_evt     = _bind(enh)
     # base uses the BaseStrategy class only at the entry-signal block
     # (lines ~1660+). Mirror the same binding contract for consistency.
-    base_role = "observer"
     base_exec, base_evt = (paper_exec, _OBSERVER_EVENTS)
 
     logger.info(
