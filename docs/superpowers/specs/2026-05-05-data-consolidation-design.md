@@ -230,3 +230,36 @@ A separate sanity check (run manually): for `trades.csv`, the row count should e
 - Deletion of legacy `data/0X_*.csv` files — explicit user preference to leave alone.
 - Re-runnable / incremental updates — one-shot is sufficient.
 - A 9th `scrape_sessions.csv` from `daemon_state/scrapes/*/manifest.json` — skipped as metadata, not data. Can be added later if needed.
+
+## Run results — 2026-05-05
+
+Full consolidation against production data completed in **14 minutes** (wall clock). Output at `data/consolidated/`.
+
+| File                     | Rows         | Size    |
+|--------------------------|--------------|---------|
+| markets.csv              |       95,708 |  34.8MB |
+| trades.csv               |   52,651,343 |  16.2GB |
+| price_histories.csv      |    4,173,718 | 365.0MB |
+| orderbooks.csv           |   53,640,759 |  18.0GB |
+| spot.csv                 |    2,065,361 | 101.7MB |
+| traders.csv              |          500 |  51.0KB |
+| daemon_events.csv        |       10,142 |   4.9MB |
+| dashboard_history.csv    |        5,277 | 480.7KB |
+| **Total**                | **112,642,808** | **34.7GB** |
+
+`orderbooks.csv` row count breakdown: 525,724 REST snapshots + 53,115,035 live book_feed records.
+
+`daemon_events.csv` ended up 44 columns wide (key union across all event types).
+
+### Sanity checks
+
+- **Trades counts match source byte-for-byte** — per-asset / per-source split in `trades.csv` exactly equals the corresponding `trades` and `ws_trades` row counts in the 5 SQLite DBs.
+- **JSON ladders are parseable** — random sample of 100K `ws_book_feed` rows: 0 JSON-parse failures on `bids_json` / `asks_json`.
+- **No cross-DB market duplicates** — 95,708 markets is exactly the sum of all per-DB markets row counts (no condition_id appears in more than one DB).
+
+### Bugs found and fixed during validation
+
+1. **EOFError on truncated `.jsonl.gz`** — daemon-killed scrapes leave incomplete gzip streams. Original Task 11 only caught `OSError`. Fixed in commit `1d1aae3` to also catch `EOFError`.
+2. **`zlib.error` on corrupted compression blocks** — separate failure mode (different exception type, not a subclass of `OSError` or `EOFError`). Fixed in commit `43e1f34`.
+
+About 30 corrupt files in `book_feed/2026-05-01/` were skipped with warnings; the remaining 3,500+ files contributed 53M records cleanly.
