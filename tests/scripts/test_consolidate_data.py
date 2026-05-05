@@ -31,3 +31,66 @@ def test_slug_to_asset_unknown_returns_none():
     assert slug_to_asset("trump-2028-winner") is None
     assert slug_to_asset("") is None
     assert slug_to_asset(None) is None
+
+
+from scripts.consolidate_data import (
+    SCHEMA_MARKETS, SCHEMA_TRADES, SCHEMA_PRICE_HISTORIES,
+    SCHEMA_ORDERBOOKS, SCHEMA_SPOT, SCHEMA_TRADERS,
+    SCHEMA_DASHBOARD,
+)
+
+
+def test_schema_markets_columns():
+    assert SCHEMA_MARKETS == [
+        "condition_id", "slug", "asset", "title", "start_date", "end_date",
+        "volume", "liquidity", "closed", "active",
+        "yes_token_id", "no_token_id",
+        "outcome_price_yes", "outcome_price_no", "resolved_outcome",
+        "btc_price_at_start", "btc_price_at_end",
+    ]
+
+
+def test_schema_trades_columns():
+    assert SCHEMA_TRADES == [
+        "asset", "source", "trade_id", "wallet", "condition_id", "slug",
+        "side", "outcome", "size", "price", "usdc_value", "fee_rate_bps",
+        "match_time", "transaction_hash", "timestamp",
+    ]
+
+
+def test_schema_price_histories_columns():
+    assert SCHEMA_PRICE_HISTORIES == [
+        "asset", "condition_id", "timestamp", "yes_price", "no_price",
+    ]
+
+
+def test_schema_orderbooks_columns():
+    assert SCHEMA_ORDERBOOKS == [
+        "asset", "source", "condition_id", "slug", "side", "snapshot_time", "ts_ns",
+        "event_type", "best_bid", "best_ask", "spread", "depth_10c",
+        "bids_json", "asks_json",
+        "asset_id", "canonical_tick", "effective_tick",
+        "remote_hash", "local_hash", "reason",
+    ]
+
+
+def test_schema_spot_columns():
+    assert SCHEMA_SPOT == [
+        "asset", "source", "granularity", "timestamp",
+        "open", "high", "low", "close", "volume", "price", "size",
+    ]
+
+
+def test_schema_traders_columns():
+    assert SCHEMA_TRADERS == [
+        "asset", "wallet", "total_trades", "total_volume_usdc", "win_rate",
+        "avg_trade_size", "first_trade_time", "last_trade_time",
+        "favorite_side", "favorite_outcome",
+    ]
+
+
+def test_schema_dashboard_columns():
+    assert SCHEMA_DASHBOARD == [
+        "ts", "btc_price", "market_price_up", "market_price_down",
+        "fair_base", "fair_enh",
+    ]

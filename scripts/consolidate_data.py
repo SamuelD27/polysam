@@ -17,6 +17,48 @@ DEFAULT_OUT_DIR = DATA_DIR / "consolidated"
 ASSETS = ("btc", "doge", "eth", "sol", "xrp")
 DB_PATHS = {asset: DATA_DIR / f"{asset}5m.db" for asset in ASSETS}
 
+SCHEMA_MARKETS = [
+    "condition_id", "slug", "asset", "title", "start_date", "end_date",
+    "volume", "liquidity", "closed", "active",
+    "yes_token_id", "no_token_id",
+    "outcome_price_yes", "outcome_price_no", "resolved_outcome",
+    "btc_price_at_start", "btc_price_at_end",
+]
+
+SCHEMA_TRADES = [
+    "asset", "source", "trade_id", "wallet", "condition_id", "slug",
+    "side", "outcome", "size", "price", "usdc_value", "fee_rate_bps",
+    "match_time", "transaction_hash", "timestamp",
+]
+
+SCHEMA_PRICE_HISTORIES = [
+    "asset", "condition_id", "timestamp", "yes_price", "no_price",
+]
+
+SCHEMA_ORDERBOOKS = [
+    "asset", "source", "condition_id", "slug", "side", "snapshot_time", "ts_ns",
+    "event_type", "best_bid", "best_ask", "spread", "depth_10c",
+    "bids_json", "asks_json",
+    "asset_id", "canonical_tick", "effective_tick",
+    "remote_hash", "local_hash", "reason",
+]
+
+SCHEMA_SPOT = [
+    "asset", "source", "granularity", "timestamp",
+    "open", "high", "low", "close", "volume", "price", "size",
+]
+
+SCHEMA_TRADERS = [
+    "asset", "wallet", "total_trades", "total_volume_usdc", "win_rate",
+    "avg_trade_size", "first_trade_time", "last_trade_time",
+    "favorite_side", "favorite_outcome",
+]
+
+SCHEMA_DASHBOARD = [
+    "ts", "btc_price", "market_price_up", "market_price_down",
+    "fair_base", "fair_enh",
+]
+
 
 def slug_to_asset(slug: str | None) -> str | None:
     """Map a market slug to its underlying asset, or None if unknown."""
