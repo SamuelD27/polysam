@@ -152,7 +152,7 @@ verify_tunnel() {
 run_in_ns() {
     # Run a command as samsam inside the polybot netns with conda activated.
     sudo -E ip netns exec "$NS" sudo -E -u samsam \
-        --preserve-env=HOME,PATH,CONDA_PREFIX,CONDA_DEFAULT_ENV,VIRTUAL_ENV,POLYMARKET_MODE,POLYMARKET_DRY_RUN \
+        --preserve-env=HOME,PATH,CONDA_PREFIX,CONDA_DEFAULT_ENV,VIRTUAL_ENV,POLYMARKET_MODE,POLYMARKET_DRY_RUN,WALKED_VWAP_EXIT_ENABLE,WALKED_VWAP_EXIT_STALENESS_S,WALKED_VWAP_EXIT_PARTIAL_OK,WALKED_VWAP_EXIT_FALLBACK_MID \
         env HOME=/home/samsam \
         "$@"
 }
