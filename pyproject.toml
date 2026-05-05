@@ -9,7 +9,15 @@ extend-exclude = [
     "rtds_monitor.py",
     "web_monitor.py",
     "orderbook_monitor.py",
+    # Python TUI: legacy rich.Layout dashboard (default launch path) and
+    # the frozen Textual rewrite + its tests. Per tui/README.md the
+    # Textual TUI is frozen pending the ratatui Rust replacement;
+    # format-fixing frozen code produces churn for no operational
+    # benefit. Revisit if the Rust path is abandoned and the Textual
+    # dashboard becomes the sole TUI.
     "tui/python/dashboard_legacy.py",
+    "tui/python/dashboard.py",
+    "tui/tests",
 ]
 
 [tool.ruff.lint]
