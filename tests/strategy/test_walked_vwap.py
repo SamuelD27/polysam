@@ -1193,3 +1193,151 @@ def test_wrapper_stashes_books_each_tick():
         books=None,
     )
     assert s2.profit_grabber._latest_books is None
+
+
+# ── Phase 4C: WALKED_VWAP_SIZE_ON_WALKED_EDGE — size from walked edge ────────
+
+
+def _walked_vwap_pass_through_fixture(monkeypatch, *, yes_asks, requested_shares, mid_quote):
+    """Helper: build a strategy where the parent emits a fake ENTER, gate
+    runs, returning the augmented action. Returns (strategy, action)."""
+    s, mb = _make_strategy_with_books(yes_asks=yes_asks)
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.MIN_TOP_OF_BOOK_SHARES_RATIO",
+        0.0,
+    )
+
+    def fake_parent(self_, *a, **k):
+        action = {
+            "action": "ENTER",
+            "side": "Up",
+            "entry_price": mid_quote,
+            "edge": 0.20,
+            "size_usdc": requested_shares * mid_quote,
+            "size_shares": requested_shares,
+            "fair": 0.50,
+            "market": mid_quote,
+            "time_zone": "sweet_spot",
+        }
+        s._open_position = {
+            "side": "Up",
+            "entry_price": mid_quote,
+            "size_usdc": action["size_usdc"],
+            "size_shares": requested_shares,
+            "strike": 110_000.0,
+            "entry_time": time.time(),
+            "edge": 0.20,
+        }
+        s._position_source = "edge"
+        return action
+
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.WalkedVWAPStrategy._run_parent_on_tick",
+        fake_parent,
+    )
+
+    out = s.on_tick(
+        btc_price=110_000,
+        market_price_up=mid_quote,
+        sigma=0.5,
+        t_zero=time.time() - 130,
+        market_price_ts=time.time(),
+        books=mb,
+    )
+    return s, out
+
+
+def test_size_recompute_off_preserves_parent_size_shares(monkeypatch):
+    """Default SIZE_ON_WALKED_EDGE=0: shares stay at parent's pre-gate value.
+
+    Multi-level book where walked VWAP > mid; parent's size_shares is
+    derived from mid edge. With the flag off, the gate must NOT re-derive
+    size — the action's size_shares must match what the fake parent emitted.
+    """
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.SIZE_ON_WALKED_EDGE",
+        False,
+    )
+    requested = 175.0
+    s, action = _walked_vwap_pass_through_fixture(
+        monkeypatch,
+        yes_asks=[
+            {"price": "0.30", "size": "50"},
+            {"price": "0.40", "size": "200"},
+        ],
+        requested_shares=requested,
+        mid_quote=0.30,
+    )
+    assert action["action"] == "ENTER"
+    # Flag off: size_shares stays at the parent's emission (mid-edge derived).
+    assert action["size_shares"] == pytest.approx(requested)
+    # Parent's _open_position must also retain that size — synced to walked
+    # entry_price but not re-derived count.
+    assert s._open_position["size_shares"] == pytest.approx(requested)
+
+
+def test_size_recompute_on_shrinks_size_when_walked_edge_smaller(monkeypatch):
+    """Flag on + thin book where walked_edge < mid_edge: size_shares shrinks.
+
+    Setup: parent says fair=0.50, mid=0.30 → mid_edge=0.20 (saturated to
+    EDGE_MAX). Book: top 50 @ 0.30, then 200 @ 0.40. With 175 requested
+    shares, effective_VWAP straddles both levels — walked_edge much
+    smaller than 0.20. With the flag on, size_shares must shrink
+    accordingly. With the flag off (other test), size_shares stays at 175.
+    """
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.SIZE_ON_WALKED_EDGE",
+        True,
+    )
+    requested = 175.0
+    s, action = _walked_vwap_pass_through_fixture(
+        monkeypatch,
+        yes_asks=[
+            {"price": "0.30", "size": "50"},
+            {"price": "0.40", "size": "200"},
+        ],
+        requested_shares=requested,
+        mid_quote=0.30,
+    )
+    assert action["action"] == "ENTER"
+    # Flag on: size shrinks because walked_edge << mid_edge.
+    assert action["size_shares"] < requested
+    # And the strategy's open-position dict is synced.
+    assert s._open_position["size_shares"] == pytest.approx(action["size_shares"])
+    # size_usdc must reflect the new share count at effective_VWAP.
+    eff = action["effective_VWAP"]
+    assert action["size_usdc"] == pytest.approx(action["size_shares"] * eff)
+
+
+def test_size_recompute_on_matches_compute_position_size_formula(monkeypatch):
+    """Flag on: action.size_shares equals what compute_position_size returns
+    for (walked_edge, eff_vwap, MAX_RISK) — the rewrite is independent of
+    the parent's size emission. Confirms the recompute uses the strategy's
+    own max_risk and the same linear-interp formula.
+    """
+    from active_bots.base_strategy import EDGE_MAX, EDGE_MIN, compute_position_size
+
+    monkeypatch.setattr(
+        "active_bots.walked_vwap_strategy.SIZE_ON_WALKED_EDGE",
+        True,
+    )
+    s, action = _walked_vwap_pass_through_fixture(
+        monkeypatch,
+        yes_asks=[
+            {"price": "0.30", "size": "50"},
+            {"price": "0.40", "size": "200"},
+        ],
+        requested_shares=175.0,
+        mid_quote=0.30,
+    )
+    assert action["action"] == "ENTER"
+    walked_edge = action["walked_edge"]
+    eff_vwap = action["effective_VWAP"]
+    expected_usdc, expected_shares = compute_position_size(
+        walked_edge,
+        eff_vwap,
+        edge_min=EDGE_MIN,
+        edge_max=EDGE_MAX,
+        max_risk=s.time_strategy.max_risk,
+    )
+    assert action["size_shares"] == pytest.approx(expected_shares)

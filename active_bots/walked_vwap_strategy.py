@@ -22,6 +22,7 @@ import time as _time
 from decimal import Decimal
 from typing import Any
 
+from .base_strategy import EDGE_MAX, EDGE_MIN, MAX_RISK, compute_position_size
 from .enhanced_strategy import MARKET_DURATION, ProfitGrabber
 from .execution.fees import CATEGORIES, fee_usdc
 from .execution.live_book_state import (
@@ -52,6 +53,16 @@ EXIT_PARTIAL_OK = os.environ.get("WALKED_VWAP_EXIT_PARTIAL_OK", "0").strip() in 
     "True",
 )
 EXIT_FALLBACK_MID = os.environ.get("WALKED_VWAP_EXIT_FALLBACK_MID", "1").strip() in (
+    "1",
+    "true",
+    "True",
+)
+
+# Phase 4C — recompute size_shares from the walked edge (fair - effective_VWAP)
+# instead of inheriting the parent's pre-walk mid-edge sizing. When the book
+# is thin, walked_edge << mid_edge; without this knob the trade keeps the mid
+# share count and just realises a smaller per-share edge. Default off (0).
+SIZE_ON_WALKED_EDGE = os.environ.get("WALKED_VWAP_SIZE_ON_WALKED_EDGE", "0").strip() in (
     "1",
     "true",
     "True",
@@ -399,6 +410,28 @@ class WalkedVWAPStrategy(RefinedStrategy):
         # Down-size if partial allowed
         if walk.classification == "partial" and WALKED_VWAP_PARTIAL_OK:
             action["size_shares"] = walk.filled_shares
+
+        # Phase 4C: optionally re-derive size_shares from the walked edge.
+        # Parent computed size from compute_position_size(mid_edge, ...);
+        # this rewrites it using the same linear interpolation but with
+        # walked_edge (= fair - effective_VWAP). For a BUY, eff_vwap >= mid
+        # always (book walk + fee), so walked_edge <= mid_edge and the new
+        # size is <= parent's. Uses the strategy's max_risk (per
+        # TimeBasedStrategy / BaseStrategy) so portfolio sizing and
+        # PORTFOLIO_SIZE_USDC env overrides are respected.
+        if SIZE_ON_WALKED_EDGE:
+            walked_max_risk = float(
+                getattr(getattr(self, "time_strategy", None), "max_risk", MAX_RISK)
+            )
+            walked_size_usdc, walked_size_shares = compute_position_size(
+                walked_edge,
+                eff_vwap,
+                edge_min=EDGE_MIN,
+                edge_max=EDGE_MAX,
+                max_risk=walked_max_risk,
+            )
+            if walked_size_shares > 0:
+                action["size_shares"] = walked_size_shares
 
         # Replace the parent's mid-quoted entry with the realistic per-share cost
         # (effective_VWAP = walked book + bell-curve fee). This makes downstream
