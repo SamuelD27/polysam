@@ -224,3 +224,62 @@ def test_write_markets_dedups_and_merges_resolutions(tmp_path):
     # No resolution → resolution-only fields blank
     assert bbb["btc_price_at_start"] == ""
     assert bbb["btc_price_at_end"] == ""
+
+
+def _make_trades_db(path: Path, *, trades=(), ws_trades=()):
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE trades (
+        trade_id TEXT, wallet TEXT, condition_id TEXT, slug TEXT,
+        side TEXT, outcome TEXT, size REAL, price REAL,
+        usdc_value REAL, fee_rate_bps REAL,
+        match_time TEXT, transaction_hash TEXT)""")
+    cur.execute("""CREATE TABLE ws_trades (
+        timestamp TEXT, slug TEXT, side TEXT, outcome TEXT,
+        price REAL, size REAL, source TEXT)""")
+    cur.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", trades)
+    cur.executemany("INSERT INTO ws_trades VALUES (?,?,?,?,?,?,?)", ws_trades)
+    con.commit()
+    con.close()
+
+
+def test_write_trades_rest_and_ws_unified(tmp_path):
+    from scripts.consolidate_data import write_trades
+
+    db = tmp_path / "btc5m.db"
+    _make_trades_db(
+        db,
+        trades=[
+            ("0xT1", "0xWALLET", "0xCID", "btc-updown-5m-1",
+             "BUY", "Up", 1.5, 0.55, 0.825, 0.0, "1773148903", "0xTX1"),
+        ],
+        ws_trades=[
+            ("1773149000", "btc-updown-5m-1", "SELL", "Down", 0.42, 2.0, "ws"),
+        ],
+    )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_trades({"btc": db}, out_dir)
+
+    rows = list(csv.DictReader((out_dir / "trades.csv").open()))
+    assert len(rows) == 2
+
+    rest_row = next(r for r in rows if r["source"] == "rest")
+    assert rest_row["asset"] == "btc"
+    assert rest_row["trade_id"] == "0xT1"
+    assert rest_row["wallet"] == "0xWALLET"
+    assert rest_row["transaction_hash"] == "0xTX1"
+    assert rest_row["match_time"] == "1773148903"
+    assert rest_row["timestamp"] == ""  # NULL for REST
+
+    ws_row = next(r for r in rows if r["source"] == "ws")
+    assert ws_row["asset"] == "btc"
+    assert ws_row["trade_id"] == ""  # NULL for WS
+    assert ws_row["wallet"] == ""
+    assert ws_row["transaction_hash"] == ""
+    assert ws_row["match_time"] == ""
+    assert ws_row["timestamp"] == "1773149000"
+    assert ws_row["price"] == "0.42"
+    assert ws_row["size"] == "2.0"
+    assert ws_row["slug"] == "btc-updown-5m-1"

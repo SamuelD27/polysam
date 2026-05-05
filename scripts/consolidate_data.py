@@ -170,6 +170,57 @@ def write_markets(db_paths: dict[str, Path], out_dir: Path) -> int:
     return n
 
 
+def write_trades(db_paths: dict[str, Path], out_dir: Path) -> int:
+    """Write trades.csv (REST + WS unified across all assets)."""
+    out_path = out_dir / "trades.csv"
+    n = 0
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCHEMA_TRADES)
+        w.writeheader()
+        for asset, db_path in db_paths.items():
+            con = _open_db(db_path)
+            if con is None:
+                continue
+            try:
+                # REST trades
+                try:
+                    for r in con.execute("SELECT * FROM trades"):
+                        w.writerow({
+                            "asset": asset, "source": "rest",
+                            "trade_id": r["trade_id"], "wallet": r["wallet"],
+                            "condition_id": r["condition_id"], "slug": r["slug"],
+                            "side": r["side"], "outcome": r["outcome"],
+                            "size": r["size"], "price": r["price"],
+                            "usdc_value": r["usdc_value"], "fee_rate_bps": r["fee_rate_bps"],
+                            "match_time": r["match_time"],
+                            "transaction_hash": r["transaction_hash"],
+                            "timestamp": None,
+                        })
+                        n += 1
+                except sqlite3.OperationalError:
+                    pass
+                # WS trades
+                try:
+                    for r in con.execute("SELECT * FROM ws_trades"):
+                        w.writerow({
+                            "asset": asset, "source": "ws",
+                            "trade_id": None, "wallet": None,
+                            "condition_id": None, "slug": r["slug"],
+                            "side": r["side"], "outcome": r["outcome"],
+                            "size": r["size"], "price": r["price"],
+                            "usdc_value": None, "fee_rate_bps": None,
+                            "match_time": None, "transaction_hash": None,
+                            "timestamp": r["timestamp"],
+                        })
+                        n += 1
+                except sqlite3.OperationalError:
+                    pass
+            finally:
+                con.close()
+    print(f"  trades.csv: {n} rows")
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
