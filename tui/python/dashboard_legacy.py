@@ -57,6 +57,7 @@ class TailerSnapshot:
     base_actions: tuple[dict, ...]
     enh_actions: tuple[dict, ...]
     refined_actions: tuple[dict, ...]
+    walked_actions: tuple[dict, ...]
     unified_actions: tuple[dict, ...]
     events: tuple[dict, ...]
 
@@ -291,10 +292,12 @@ def _compute_stats(stats: dict) -> dict:
 
 
 def build_comparison_banner(d: dict) -> Panel:
-    """Compact 2-line banner showing BASE + ENHANCED paper-benchmark stats."""
+    """Compact 3-line banner showing BASE + ENHANCED + REFINED benchmark stats."""
     base = _compute_stats((d.get("base") or {}).get("stats", {}) or {})
     enh = _compute_stats((d.get("enhanced") or {}).get("stats", {}) or {})
+    refined = _compute_stats((d.get("refined") or {}).get("stats", {}) or {})
     enh_extra = (d.get("enhanced") or {}).get("extra", {}) or {}
+    refined_extra = (d.get("refined") or {}).get("extra", {}) or {}
 
     t = Table.grid(expand=True, padding=(0, 1))
     t.add_column(justify="left",  width=12)
@@ -305,8 +308,9 @@ def build_comparison_banner(d: dict) -> Panel:
     t.add_column(justify="left")              # extras
 
     for label, s, extra in (
-        ("BASE",     base, None),
-        ("ENHANCED", enh,  enh_extra),
+        ("BASE",     base,    None),
+        ("ENHANCED", enh,     enh_extra),
+        ("REFINED",  refined, refined_extra),
     ):
         name_cell = Text(f"{label}", style="bold")
         name_cell.append("  paper", style="dim")
@@ -338,8 +342,8 @@ def build_comparison_banner(d: dict) -> Panel:
                  border_style="grey50", title_align="left")
 
 
-def build_refined_panel(blob: dict, d: dict,
-                        actions: tuple[dict, ...] | deque[dict]) -> Panel:
+def build_main_strategy_panel(blob: dict, d: dict,
+                              actions: tuple[dict, ...] | deque[dict]) -> Panel:
     """The main strategy panel. Bigger and more detailed than the benchmarks."""
     stats = blob.get("stats", {}) or {}
     extra = blob.get("extra", {}) or {}
@@ -528,14 +532,16 @@ def build_refined_panel(blob: dict, d: dict,
               border_style="grey37", title_align="left"),
         orders_panel,
     )
-    title = "[bold bright_cyan]REFINED[/] [yellow](main strategy — live-capable)[/]"
+    title = "[bold bright_cyan]WALKED_VWAP[/] [yellow](main strategy — live-capable)[/]"
     return Panel(body, title=title, border_style="bright_cyan",
                  title_align="left", padding=(0, 1))
 
 
 def build_extras_panel(d: dict) -> Panel:
-    """Refined-strategy detailed extras (squeeze removed — always off)."""
-    extra = d.get("refined", {}).get("extra", {}) or {}
+    """Walked-VWAP-strategy detailed extras."""
+    extra = d.get("walked_vwap", {}).get("extra", {}) or {}
+    last_edge = extra.get("last_walked_edge")
+    edge_str = f"{last_edge:+.4f}" if isinstance(last_edge, (int, float)) else "–"
     tbl = Table.grid(expand=True, padding=(0, 2))
     tbl.add_column(justify="left")
     tbl.add_column(justify="left")
@@ -550,10 +556,10 @@ def build_extras_panel(d: dict) -> Panel:
     tbl.add_row(
         Text("edge trades", style="dim"),
         str(extra.get("edge_trades", 0)),
-        Text("config", style="dim"),
-        "TP_MIN=0.08  TP_ABS=0.15  squeeze=off",
+        Text("rejects", style="dim"),
+        f"{extra.get('reject_count', 0)}  last_walked_edge={edge_str}",
     )
-    return Panel(tbl, title="[bold]refined extras[/]",
+    return Panel(tbl, title="[bold]walked_vwap extras[/]",
                  border_style="bright_cyan", title_align="left")
 
 
@@ -603,8 +609,10 @@ def _render_sparkline(prices: deque[float], width: int) -> Text:
 
 def _render_stream_line(a: dict) -> Text:
     strat = a.get("strategy") or ""
-    if strat == "refined":
-        prefix = Text("[R]", style="bright_cyan")
+    if strat == "walked_vwap":
+        prefix = Text("[W]", style="bright_cyan")
+    elif strat == "refined":
+        prefix = Text("[R]", style="grey70")
     elif strat == "enhanced":
         prefix = Text("[E]", style="cyan")
     elif strat == "base":
@@ -649,9 +657,9 @@ def render(d: dict, log_lines: list[str], snap: TailerSnapshot,
     layout = Layout(name="root")
     layout.split(
         Layout(build_header(d), size=3, name="header"),
-        Layout(build_comparison_banner(d), size=4, name="banner"),
-        Layout(build_refined_panel(d.get("refined", {}) or {}, d,
-                                   snap.refined_actions), name="main"),
+        Layout(build_comparison_banner(d), size=5, name="banner"),
+        Layout(build_main_strategy_panel(d.get("walked_vwap", {}) or {}, d,
+                                         snap.walked_actions), name="main"),
         Layout(build_extras_panel(d), size=4, name="extras"),
         Layout(name="footer", size=14),
     )
@@ -671,6 +679,7 @@ class EventsTailer:
         self.base_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.enh_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.refined_actions: deque[dict] = deque(maxlen=ACTION_CAP)
+        self.walked_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self.unified_actions: deque[dict] = deque(maxlen=ACTION_CAP)
         self._pos = 0
 
@@ -685,6 +694,8 @@ class EventsTailer:
             self.enh_actions.append(action)
         elif strat == "refined":
             self.refined_actions.append(action)
+        elif strat == "walked_vwap":
+            self.walked_actions.append(action)
         self.unified_actions.append(action)
 
     def update(self) -> None:
@@ -716,6 +727,7 @@ class EventsTailer:
             base_actions=tuple(self.base_actions),
             enh_actions=tuple(self.enh_actions),
             refined_actions=tuple(self.refined_actions),
+            walked_actions=tuple(self.walked_actions),
             unified_actions=tuple(self.unified_actions),
             events=tuple(self.events),
         )
