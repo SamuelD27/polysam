@@ -502,10 +502,10 @@ this gate fired 16 of these in 10.9 hours, all `empty_book`.
 | `WALKED_VWAP_EXIT_STALENESS_S`  | walked_vwap_strategy.py:51 / env      | 30      | Exit-gate stale-book threshold       |
 | `WALKED_VWAP_EXIT_PARTIAL_OK`   | walked_vwap_strategy.py:52 / env      | 0       | Accept partial exit fills            |
 | `WALKED_VWAP_EXIT_FALLBACK_MID` | walked_vwap_strategy.py:55 / env      | 1       | Bad-book fallback policy             |
-| `SL_ABSOLUTE_AGAINST`           | enhanced_strategy.py:198 / env        | unset   | Hard SL cap, mirror of `TP_ABSOLUTE_FAVOR`. Default unset = off. |
-| `SL_DECAY_ENABLE`               | enhanced_strategy.py:204 / env        | 0       | Time-decay on adaptive SL, mirror of `adaptive_tp` decay. Default off. |
-| `SL_DELTA_DECAY_FLOOR`          | enhanced_strategy.py:205 / env        | 0.05    | Floor of the SL decay curve (only consulted when `SL_DECAY_ENABLE=1`). |
-| `WALKED_VWAP_SIZE_ON_WALKED_EDGE` | walked_vwap_strategy.py:60 / env    | 0       | Recompute `size_shares` from the walked edge instead of mid edge. |
+| `SL_ABSOLUTE_AGAINST`           | enhanced_strategy.py:206 / env        | unset   | Hard SL cap, mirror of `TP_ABSOLUTE_FAVOR`. Default unset = off. |
+| `SL_DECAY_ENABLE`               | enhanced_strategy.py:215 / env        | 0       | Time-decay on adaptive SL, mirror of `adaptive_tp` decay. Default off. |
+| `SL_DELTA_DECAY_FLOOR`          | enhanced_strategy.py:216 / env        | 0.05    | Floor of the SL decay curve (only consulted when `SL_DECAY_ENABLE=1`). |
+| `WALKED_VWAP_SIZE_ON_WALKED_EDGE` | walked_vwap_strategy.py:65 / env    | 0       | Recompute `size_shares` from the walked edge instead of mid edge. |
 
 ---
 

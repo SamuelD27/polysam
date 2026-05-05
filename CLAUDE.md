@@ -159,10 +159,10 @@ wins and STRATEGY.md must follow.
 
 | Env var                            | Default | Source file:line                  | Meaning                                       |
 |------------------------------------|---------|-----------------------------------|-----------------------------------------------|
-| `SL_ABSOLUTE_AGAINST`              | unset   | `enhanced_strategy.py:198`        | Hard SL cap (mirror of `TP_ABSOLUTE_FAVOR`). When set, SL fires if `delta_against >= this` regardless of adaptive curve. |
-| `SL_DECAY_ENABLE`                  | 0       | `enhanced_strategy.py:204`        | Enable time-decay on adaptive SL (mirror of TP decay). At entry returns the un-decayed adaptive_sl; at T=0 returns floor. |
-| `SL_DELTA_DECAY_FLOOR`             | 0.05    | `enhanced_strategy.py:205`        | Floor for the SL decay curve when `SL_DECAY_ENABLE=1` |
-| `WALKED_VWAP_SIZE_ON_WALKED_EDGE`  | 0       | `walked_vwap_strategy.py:60`      | Recompute `size_shares` from the walked edge instead of mid edge. Reduces position size when book is thin. |
+| `SL_ABSOLUTE_AGAINST`              | unset   | `enhanced_strategy.py:206`        | Hard SL cap (mirror of `TP_ABSOLUTE_FAVOR`). When set, SL fires if `delta_against >= this` regardless of adaptive curve. |
+| `SL_DECAY_ENABLE`                  | 0       | `enhanced_strategy.py:215`        | Enable time-decay on adaptive SL (mirror of TP decay). At entry returns the un-decayed adaptive_sl; at T=0 returns floor. |
+| `SL_DELTA_DECAY_FLOOR`             | 0.05    | `enhanced_strategy.py:216`        | Floor for the SL decay curve when `SL_DECAY_ENABLE=1` |
+| `WALKED_VWAP_SIZE_ON_WALKED_EDGE`  | 0       | `walked_vwap_strategy.py:65`      | Recompute `size_shares` from the walked edge instead of mid edge. Reduces position size when book is thin. |
 
 ### Operational / executor knobs
 
