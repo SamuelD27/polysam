@@ -137,3 +137,90 @@ def test_ladder_metrics_one_sided():
     assert m["best_ask"] is None
     assert m["spread"] is None
     assert m["depth_10c"] == pytest.approx(1.0)
+
+
+import csv
+import sqlite3
+from pathlib import Path
+
+
+def _make_test_db(path: Path, *, markets: list[tuple] = (), resolutions: list[tuple] = ()) -> None:
+    """Create a minimal SQLite DB matching the production schema for testing."""
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE markets (
+        condition_id TEXT PRIMARY KEY, slug TEXT, title TEXT,
+        start_date TEXT, end_date TEXT, volume REAL, liquidity REAL,
+        closed INTEGER, active INTEGER,
+        yes_token_id TEXT, no_token_id TEXT,
+        outcome_price_yes REAL, outcome_price_no REAL,
+        resolved_outcome TEXT)""")
+    cur.execute("""CREATE TABLE resolutions (
+        condition_id TEXT PRIMARY KEY, slug TEXT,
+        start_date TEXT, end_date TEXT,
+        resolved_outcome TEXT, outcome_price_yes REAL, outcome_price_no REAL,
+        volume REAL, btc_price_at_start REAL, btc_price_at_end REAL)""")
+    cur.executemany(
+        "INSERT INTO markets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        markets,
+    )
+    cur.executemany(
+        "INSERT INTO resolutions VALUES (?,?,?,?,?,?,?,?,?,?)",
+        resolutions,
+    )
+    con.commit()
+    con.close()
+
+
+def test_write_markets_dedups_and_merges_resolutions(tmp_path):
+    from scripts.consolidate_data import write_markets
+
+    btc_db = tmp_path / "btc5m.db"
+    eth_db = tmp_path / "eth5m.db"
+    # Same condition_id appears in both; the closed=1, higher-volume row wins.
+    _make_test_db(
+        btc_db,
+        markets=[
+            ("0xAAA", "btc-updown-5m-1", "BTC market", "s1", "e1",
+             100.0, 10.0, 0, 1, "yes_aaa", "no_aaa", 0.0, 0.0, None),
+        ],
+        resolutions=[
+            ("0xAAA", "btc-updown-5m-1", "s1", "e1",
+             "Up", 1.0, 0.0, 200.0, 70000.0, 71000.0),
+        ],
+    )
+    _make_test_db(
+        eth_db,
+        markets=[
+            # Same condition_id, but closed=1 with higher volume — should win.
+            ("0xAAA", "btc-updown-5m-1", "BTC market", "s1", "e1",
+             200.0, 10.0, 1, 0, "yes_aaa", "no_aaa", 1.0, 0.0, "Up"),
+            # Eth-only market, no resolution.
+            ("0xBBB", "eth-updown-5m-2", "ETH market", "s2", "e2",
+             50.0, 5.0, 0, 1, "yes_bbb", "no_bbb", 0.0, 0.0, None),
+        ],
+    )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_markets({"btc": btc_db, "eth": eth_db}, out_dir)
+
+    rows = list(csv.DictReader((out_dir / "markets.csv").open()))
+    by_id = {r["condition_id"]: r for r in rows}
+    assert set(by_id) == {"0xAAA", "0xBBB"}
+
+    aaa = by_id["0xAAA"]
+    # eth row wins (closed=1 trumps closed=0)
+    assert aaa["asset"] == "eth"
+    assert aaa["closed"] == "1"
+    assert aaa["volume"] == "200.0"
+    # Resolution data merged in (from btc DB, since the resolutions table only existed there)
+    assert aaa["btc_price_at_start"] == "70000.0"
+    assert aaa["btc_price_at_end"] == "71000.0"
+    assert aaa["resolved_outcome"] == "Up"
+
+    bbb = by_id["0xBBB"]
+    assert bbb["asset"] == "eth"
+    # No resolution → resolution-only fields blank
+    assert bbb["btc_price_at_start"] == ""
+    assert bbb["btc_price_at_end"] == ""

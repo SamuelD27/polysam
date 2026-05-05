@@ -7,6 +7,8 @@ Usage: python scripts/consolidate_data.py [--out-dir DIR]
 from __future__ import annotations
 
 import argparse
+import csv
+import sqlite3
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -90,6 +92,82 @@ def slug_to_asset(slug: str | None) -> str | None:
         if s.startswith(f"{asset}-"):
             return asset
     return None
+
+
+def _open_db(path: Path) -> sqlite3.Connection | None:
+    """Open a SQLite DB read-only. Return None if missing."""
+    if not path.exists():
+        print(f"  [skip] missing: {path}")
+        return None
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _is_more_complete(new_row: sqlite3.Row, old_row: sqlite3.Row) -> bool:
+    """Prefer rows where closed=1, then higher volume."""
+    new_closed = (new_row["closed"] or 0) > 0
+    old_closed = (old_row["closed"] or 0) > 0
+    if new_closed != old_closed:
+        return new_closed
+    new_vol = new_row["volume"] or 0.0
+    old_vol = old_row["volume"] or 0.0
+    return new_vol > old_vol
+
+
+def write_markets(db_paths: dict[str, Path], out_dir: Path) -> int:
+    """Write markets.csv (markets + resolutions merged, deduped across DBs)."""
+    candidates: dict[str, tuple[str, sqlite3.Row]] = {}  # condition_id -> (asset, row)
+    resolutions: dict[str, sqlite3.Row] = {}
+
+    for asset, db_path in db_paths.items():
+        con = _open_db(db_path)
+        if con is None:
+            continue
+        try:
+            for row in con.execute("SELECT * FROM markets"):
+                cid = row["condition_id"]
+                existing = candidates.get(cid)
+                if existing is None or _is_more_complete(row, existing[1]):
+                    candidates[cid] = (asset, row)
+            try:
+                for row in con.execute("SELECT * FROM resolutions"):
+                    resolutions[row["condition_id"]] = row
+            except sqlite3.OperationalError:
+                pass  # resolutions table missing in some DBs
+        finally:
+            con.close()
+
+    out_path = out_dir / "markets.csv"
+    n = 0
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCHEMA_MARKETS)
+        w.writeheader()
+        for cid, (asset, m) in candidates.items():
+            r = resolutions.get(cid)
+            row_out = {
+                "condition_id": cid,
+                "slug": m["slug"],
+                "asset": asset,
+                "title": m["title"],
+                "start_date": m["start_date"],
+                "end_date": m["end_date"],
+                "volume": m["volume"],
+                "liquidity": m["liquidity"],
+                "closed": m["closed"],
+                "active": m["active"],
+                "yes_token_id": m["yes_token_id"],
+                "no_token_id": m["no_token_id"],
+                "outcome_price_yes": m["outcome_price_yes"],
+                "outcome_price_no": m["outcome_price_no"],
+                "resolved_outcome": (r["resolved_outcome"] if r else m["resolved_outcome"]),
+                "btc_price_at_start": (r["btc_price_at_start"] if r else None),
+                "btc_price_at_end": (r["btc_price_at_end"] if r else None),
+            }
+            w.writerow(row_out)
+            n += 1
+    print(f"  markets.csv: {n} rows")
+    return n
 
 
 def main() -> int:
