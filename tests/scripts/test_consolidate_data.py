@@ -316,3 +316,46 @@ def test_write_price_histories_concats_with_asset(tmp_path):
     btc_row = next(r for r in rows if r["asset"] == "btc")
     assert btc_row["condition_id"] == "0xC1"
     assert btc_row["yes_price"] == "0.5"
+
+
+def _make_orderbooks_db(path: Path, *, rows=()):
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE orderbooks (
+        condition_id TEXT, side TEXT, bids TEXT, asks TEXT,
+        best_bid REAL, best_ask REAL, spread REAL,
+        depth_10c REAL, snapshot_time TEXT)""")
+    cur.executemany("INSERT INTO orderbooks VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    con.commit()
+    con.close()
+
+
+def test_write_orderbooks_rest_only(tmp_path):
+    from scripts.consolidate_data import write_orderbooks_rest
+
+    btc_db = tmp_path / "btc5m.db"
+    bids_json = '[{"price": "0.50", "size": "100"}]'
+    asks_json = '[{"price": "0.51", "size": "200"}]'
+    _make_orderbooks_db(btc_db, rows=[
+        ("0xCID", "yes", bids_json, asks_json, 0.50, 0.51, 0.01, 300.0, "2026-04-24T07:10:19Z"),
+    ])
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_orderbooks_rest({"btc": btc_db}, out_dir)
+
+    rows = list(csv.DictReader((out_dir / "orderbooks.csv").open()))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["asset"] == "btc"
+    assert r["source"] == "rest"
+    assert r["event_type"] == "rest_snapshot"
+    assert r["bids_json"] == bids_json
+    assert r["asks_json"] == asks_json
+    assert r["best_bid"] == "0.5"
+    assert r["snapshot_time"] == "2026-04-24T07:10:19Z"
+    # WS-only fields blank
+    assert r["ts_ns"] == ""
+    assert r["asset_id"] == ""
+    assert r["canonical_tick"] == ""
+    assert r["remote_hash"] == ""

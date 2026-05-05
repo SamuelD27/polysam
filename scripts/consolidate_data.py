@@ -248,6 +248,53 @@ def write_price_histories(db_paths: dict[str, Path], out_dir: Path) -> int:
     return n
 
 
+def write_orderbooks_rest(db_paths: dict[str, Path], out_dir: Path) -> int:
+    """Open orderbooks.csv in 'w' mode and stream the REST half from SQLite.
+
+    The book_feed walker (Task 11) appends to this file in 'a' mode.
+    """
+    out_path = out_dir / "orderbooks.csv"
+    n = 0
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCHEMA_ORDERBOOKS)
+        w.writeheader()
+        for asset, db_path in db_paths.items():
+            con = _open_db(db_path)
+            if con is None:
+                continue
+            try:
+                for r in con.execute("SELECT * FROM orderbooks"):
+                    w.writerow({
+                        "asset": asset,
+                        "source": "rest",
+                        "condition_id": r["condition_id"],
+                        "slug": None,
+                        "side": r["side"],
+                        "snapshot_time": r["snapshot_time"],
+                        "ts_ns": None,
+                        "event_type": "rest_snapshot",
+                        "best_bid": r["best_bid"],
+                        "best_ask": r["best_ask"],
+                        "spread": r["spread"],
+                        "depth_10c": r["depth_10c"],
+                        "bids_json": r["bids"],
+                        "asks_json": r["asks"],
+                        "asset_id": None,
+                        "canonical_tick": None,
+                        "effective_tick": None,
+                        "remote_hash": None,
+                        "local_hash": None,
+                        "reason": None,
+                    })
+                    n += 1
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                con.close()
+    print(f"  orderbooks.csv (rest): {n} rows")
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
