@@ -359,3 +359,58 @@ def test_write_orderbooks_rest_only(tmp_path):
     assert r["asset_id"] == ""
     assert r["canonical_tick"] == ""
     assert r["remote_hash"] == ""
+
+
+def _make_spot_db(path: Path, *, spot=(), ws_spot=()):
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE spot (
+        timestamp INTEGER PRIMARY KEY, open REAL, high REAL,
+        low REAL, close REAL, volume REAL)""")
+    cur.execute("""CREATE TABLE ws_spot (
+        timestamp TEXT, price REAL, size REAL)""")
+    cur.executemany("INSERT INTO spot VALUES (?,?,?,?,?,?)", spot)
+    cur.executemany("INSERT INTO ws_spot VALUES (?,?,?)", ws_spot)
+    con.commit()
+    con.close()
+
+
+def test_write_spot_unified(tmp_path):
+    from scripts.consolidate_data import write_spot
+
+    db = tmp_path / "btc5m.db"
+    _make_spot_db(
+        db,
+        spot=[(1773000000, 70000.0, 70100.0, 69900.0, 70050.0, 12.5)],
+        ws_spot=[
+            ("1773000300", 70075.5, 0.1),
+            ("2026-04-24T07:10:19", 70080.0, 0.05),  # iso string
+        ],
+    )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_spot({"btc": db}, out_dir)
+
+    rows = list(csv.DictReader((out_dir / "spot.csv").open()))
+    assert len(rows) == 3
+
+    rest_row = next(r for r in rows if r["source"] == "rest")
+    assert rest_row["granularity"] == "5m"
+    assert rest_row["timestamp"] == "1773000000"
+    assert rest_row["open"] == "70000.0"
+    assert rest_row["close"] == "70050.0"
+    assert rest_row["price"] == ""  # NULL for REST
+    assert rest_row["size"] == ""
+
+    ws_rows = [r for r in rows if r["source"] == "ws"]
+    assert len(ws_rows) == 2
+    # Numeric string parsed
+    numeric_ts = next(r for r in ws_rows if r["price"] == "70075.5")
+    assert numeric_ts["timestamp"] == "1773000300"
+    # ISO string parsed via fromisoformat
+    iso_ts = next(r for r in ws_rows if r["price"] == "70080.0")
+    from datetime import datetime, timezone
+    expected = int(datetime.fromisoformat("2026-04-24T07:10:19").replace(tzinfo=timezone.utc).timestamp())
+    assert iso_ts["timestamp"] == str(expected)
+    assert iso_ts["open"] == ""  # NULL for WS

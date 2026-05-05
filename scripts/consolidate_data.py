@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -292,6 +293,77 @@ def write_orderbooks_rest(db_paths: dict[str, Path], out_dir: Path) -> int:
             finally:
                 con.close()
     print(f"  orderbooks.csv (rest): {n} rows")
+    return n
+
+
+def _parse_ws_timestamp(ts) -> int | str | None:
+    """Parse a ws_spot.timestamp value to integer Unix seconds.
+
+    Accepts:
+      - integer or float (returned as int)
+      - numeric strings (e.g. "1773000300") → int
+      - ISO8601 strings (e.g. "2026-04-24T07:10:19") → int Unix UTC seconds
+    Falls back to the original string on parse failure.
+    """
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        return int(ts)
+    s = str(ts)
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (TypeError, ValueError):
+        return s
+
+
+def write_spot(db_paths: dict[str, Path], out_dir: Path) -> int:
+    """Write spot.csv (5m candles + WS ticks unified)."""
+    out_path = out_dir / "spot.csv"
+    n = 0
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCHEMA_SPOT)
+        w.writeheader()
+        for asset, db_path in db_paths.items():
+            con = _open_db(db_path)
+            if con is None:
+                continue
+            try:
+                # 5m candles
+                try:
+                    for r in con.execute("SELECT * FROM spot"):
+                        w.writerow({
+                            "asset": asset, "source": "rest", "granularity": "5m",
+                            "timestamp": r["timestamp"],
+                            "open": r["open"], "high": r["high"], "low": r["low"],
+                            "close": r["close"], "volume": r["volume"],
+                            "price": None, "size": None,
+                        })
+                        n += 1
+                except sqlite3.OperationalError:
+                    pass
+                # WS ticks
+                try:
+                    for r in con.execute("SELECT * FROM ws_spot"):
+                        w.writerow({
+                            "asset": asset, "source": "ws", "granularity": "tick",
+                            "timestamp": _parse_ws_timestamp(r["timestamp"]),
+                            "open": None, "high": None, "low": None,
+                            "close": None, "volume": None,
+                            "price": r["price"], "size": r["size"],
+                        })
+                        n += 1
+                except sqlite3.OperationalError:
+                    pass
+            finally:
+                con.close()
+    print(f"  spot.csv: {n} rows")
     return n
 
 
