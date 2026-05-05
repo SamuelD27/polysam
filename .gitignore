@@ -228,3 +228,8 @@ tui/**/target/
 
 # Git worktrees (parallel-execution scratch dirs)
 .worktrees/
+
+# macOS junk
+.DS_Store
+._*
+

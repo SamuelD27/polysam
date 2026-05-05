@@ -1,0 +1,57 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "experiments",
+    ".worktrees",
+    "scrap",
+    "scrape.py",
+    "rtds_monitor.py",
+    "web_monitor.py",
+    "orderbook_monitor.py",
+    "tui/python/dashboard_legacy.py",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear (subset)
+    "W",   # pycodestyle warnings
+]
+ignore = [
+    "E501",  # line too long — long math comments OK; keep formatter authoritative
+    "E731",  # lambda assignment
+    "B008",  # mutable default — used in a few legacy daemon spots
+    "B904",  # raise from — noisy on existing daemon error handling
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = false
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests",
+    "active_bots/tests",
+]
+# Stop pytest from descending into experiments/ (37 stale fork copies of
+# tests/) and tui/tests/ (separate test root). Those still run via their
+# own root-cd'd invocations; they just don't pollute the global suite.
+norecursedirs = [
+    "experiments",
+    ".worktrees",
+    "tui",
+    "scrap",
+    "build",
+    "dist",
+    "__pycache__",
+    ".git",
+]
+asyncio_mode = "strict"
+filterwarnings = [
+    "ignore::DeprecationWarning:websockets.*",
+]
