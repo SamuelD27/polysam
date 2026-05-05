@@ -529,3 +529,63 @@ def test_append_book_feed_to_orderbooks(tmp_path):
     book = next(r for r in rows if r["event_type"] == "book")
     assert json.loads(book["bids_json"]) == [{"price": "0.49", "size": "5"}]
     assert book["best_bid"] == "0.49"
+
+
+def test_write_daemon_events_two_pass(tmp_path):
+    from scripts.consolidate_data import write_daemon_events
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text("\n".join([
+        json.dumps({"ts": 1.0, "type": "session_start", "pid": 1234}),
+        json.dumps({"ts": 2.0, "type": "startup", "mode": "paper", "max_trade_size": 100.0}),
+        json.dumps({"ts": 3.0, "type": "market_rollover", "slug": "btc-updown-5m-1", "strike": 75000.0}),
+    ]) + "\n")
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    n = write_daemon_events(events_path, out_dir)
+    assert n == 3
+
+    with (out_dir / "daemon_events.csv").open() as f:
+        reader = csv.DictReader(f)
+        cols = reader.fieldnames
+        rows = list(reader)
+    # Key union should include keys from all events
+    assert "ts" in cols
+    assert "type" in cols
+    assert "pid" in cols
+    assert "mode" in cols
+    assert "max_trade_size" in cols
+    assert "slug" in cols
+    assert "strike" in cols
+    # ts and type should lead
+    assert cols[0] == "ts"
+    assert cols[1] == "type"
+    # Each row populates only its own keys; others blank
+    sess = next(r for r in rows if r["type"] == "session_start")
+    assert sess["pid"] == "1234"
+    assert sess["mode"] == ""
+    assert sess["strike"] == ""
+
+    boot = next(r for r in rows if r["type"] == "startup")
+    assert boot["mode"] == "paper"
+    assert boot["max_trade_size"] == "100.0"
+    assert boot["pid"] == ""
+
+
+def test_write_daemon_events_serializes_nested(tmp_path):
+    from scripts.consolidate_data import write_daemon_events
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        json.dumps({"ts": 1.0, "type": "x", "payload": {"a": 1, "b": [2, 3]}}) + "\n"
+    )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_daemon_events(events_path, out_dir)
+
+    rows = list(csv.DictReader((out_dir / "daemon_events.csv").open()))
+    assert len(rows) == 1
+    # Nested object JSON-serialized
+    assert json.loads(rows[0]["payload"]) == {"a": 1, "b": [2, 3]}

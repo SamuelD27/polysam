@@ -496,6 +496,61 @@ def _book_feed_row(rec: dict) -> dict | None:
     }
 
 
+def write_daemon_events(events_path: Path, out_dir: Path) -> int:
+    """Write daemon_events.csv from events.jsonl with a two-pass key union."""
+    out_path = out_dir / "daemon_events.csv"
+    if not events_path.exists():
+        print(f"  [skip] missing: {events_path}")
+        return 0
+
+    # Pass 1: collect key union
+    keys: list[str] = []
+    seen: set[str] = set()
+    # Always lead with ts, type
+    for k in ("ts", "type"):
+        keys.append(k)
+        seen.add(k)
+    with events_path.open() as f:
+        for line_no, raw in enumerate(f, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"  [warn] events.jsonl:{line_no} bad JSON: {e}")
+                continue
+            for k in rec:
+                if k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+
+    # Pass 2: write
+    n = 0
+    with out_path.open("w", newline="") as f_out, events_path.open() as f_in:
+        w = csv.DictWriter(f_out, fieldnames=keys)
+        w.writeheader()
+        for line_no, raw in enumerate(f_in, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            row = {}
+            for k in keys:
+                v = rec.get(k)
+                if isinstance(v, (dict, list)):
+                    row[k] = json.dumps(v)
+                else:
+                    row[k] = v
+            w.writerow(row)
+            n += 1
+    print(f"  daemon_events.csv: {n} rows ({len(keys)} columns)")
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
