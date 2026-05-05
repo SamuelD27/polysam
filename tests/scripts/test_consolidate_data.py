@@ -613,3 +613,143 @@ def test_write_dashboard_history(tmp_path):
     assert len(rows) == 2
     assert rows[0]["btc_price"] == "70000.0"
     assert rows[0]["fair_enh"] == "0.57"
+
+
+def test_main_end_to_end(tmp_path, capsys, monkeypatch):
+    """End-to-end smoke test: build minimal fixtures and run main()."""
+    from scripts import consolidate_data as cd
+
+    # Build a single-asset fixture DB with one row in each table.
+    db_dir = tmp_path / "data"
+    db_dir.mkdir()
+    db = db_dir / "btc5m.db"
+    con = sqlite3.connect(db)
+    cur = con.cursor()
+    cur.executescript("""
+        CREATE TABLE markets (
+            condition_id TEXT PRIMARY KEY, slug TEXT, title TEXT,
+            start_date TEXT, end_date TEXT, volume REAL, liquidity REAL,
+            closed INTEGER, active INTEGER,
+            yes_token_id TEXT, no_token_id TEXT,
+            outcome_price_yes REAL, outcome_price_no REAL,
+            resolved_outcome TEXT);
+        CREATE TABLE trades (
+            trade_id TEXT, wallet TEXT, condition_id TEXT, slug TEXT,
+            side TEXT, outcome TEXT, size REAL, price REAL,
+            usdc_value REAL, fee_rate_bps REAL,
+            match_time TEXT, transaction_hash TEXT);
+        CREATE TABLE ws_trades (
+            timestamp TEXT, slug TEXT, side TEXT, outcome TEXT,
+            price REAL, size REAL, source TEXT);
+        CREATE TABLE price_histories (
+            condition_id TEXT, timestamp INTEGER,
+            yes_price REAL, no_price REAL);
+        CREATE TABLE orderbooks (
+            condition_id TEXT, side TEXT, bids TEXT, asks TEXT,
+            best_bid REAL, best_ask REAL, spread REAL,
+            depth_10c REAL, snapshot_time TEXT);
+        CREATE TABLE spot (
+            timestamp INTEGER PRIMARY KEY, open REAL, high REAL,
+            low REAL, close REAL, volume REAL);
+        CREATE TABLE ws_spot (
+            timestamp TEXT, price REAL, size REAL);
+        CREATE TABLE resolutions (
+            condition_id TEXT PRIMARY KEY, slug TEXT,
+            start_date TEXT, end_date TEXT,
+            resolved_outcome TEXT, outcome_price_yes REAL, outcome_price_no REAL,
+            volume REAL, btc_price_at_start REAL, btc_price_at_end REAL);
+        CREATE TABLE traders (
+            wallet TEXT PRIMARY KEY, total_trades INTEGER,
+            total_volume_usdc REAL, win_rate REAL, avg_trade_size REAL,
+            first_trade_time TEXT, last_trade_time TEXT,
+            favorite_side TEXT, favorite_outcome TEXT);
+    """)
+    cur.execute("INSERT INTO markets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("0xCID", "btc-updown-5m-1", "title", "s", "e",
+                 100.0, 10.0, 0, 1, "yes", "no", 0.0, 0.0, None))
+    cur.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("0xT1", "0xW", "0xCID", "btc-updown-5m-1",
+                 "BUY", "Up", 1.0, 0.5, 0.5, 0.0, "1773000000", "0xTX"))
+    cur.execute("INSERT INTO ws_trades VALUES (?,?,?,?,?,?,?)",
+                ("1773000060", "btc-updown-5m-1", "SELL", "Down", 0.4, 1.0, "ws"))
+    cur.execute("INSERT INTO price_histories VALUES (?,?,?,?)",
+                ("0xCID", 1773000000, 0.5, 0.5))
+    cur.execute("INSERT INTO orderbooks VALUES (?,?,?,?,?,?,?,?,?)",
+                ("0xCID", "yes", "[]", "[]", None, None, None, None, "2026-04-24T07:10:19Z"))
+    cur.execute("INSERT INTO spot VALUES (?,?,?,?,?,?)",
+                (1773000000, 70000.0, 70100.0, 69900.0, 70050.0, 12.5))
+    cur.execute("INSERT INTO ws_spot VALUES (?,?,?)",
+                ("1773000300", 70075.5, 0.1))
+    cur.execute("INSERT INTO traders VALUES (?,?,?,?,?,?,?,?,?)",
+                ("0xW", 100, 5000.0, 0.55, 50.0, "1773000000", "1773100000", "BUY", "Up"))
+    con.commit()
+    con.close()
+
+    # Daemon-state fixture: events + dashboard + book_feed
+    daemon_dir = tmp_path / "daemon_state"
+    daemon_dir.mkdir()
+    (daemon_dir / "events.jsonl").write_text(
+        json.dumps({"ts": 1.0, "type": "session_start", "pid": 1}) + "\n"
+    )
+    (daemon_dir / "dashboard_history.jsonl").write_text(
+        json.dumps({"ts": 1.0, "btc_price": 70000.0,
+                    "market_price_up": 0.6, "market_price_down": 0.4,
+                    "fair_base": 0.55, "fair_enh": 0.57}) + "\n"
+    )
+    bf_dir = daemon_dir / "book_feed" / "2026-05-01"
+    bf_dir.mkdir(parents=True)
+    with gzip.open(bf_dir / "btc-updown-5m-1.jsonl.gz", "wt") as f:
+        f.write(json.dumps({
+            "type": "snapshot", "ts_ns": 1, "asset_id": "AID",
+            "slug": "btc-updown-5m-1", "side": "yes", "condition_id": "0xCID",
+            "canonical_tick": "0.01", "effective_tick": "0.01",
+            "bids": [{"price": "0.50", "size": "100"}],
+            "asks": [{"price": "0.51", "size": "200"}],
+        }) + "\n")
+
+    out_dir = tmp_path / "consolidated"
+
+    # Monkeypatch module-level paths to point at our fixture.
+    monkeypatch.setattr(cd, "DATA_DIR", db_dir)
+    monkeypatch.setattr(cd, "DAEMON_STATE_DIR", daemon_dir)
+    monkeypatch.setattr(cd, "DB_PATHS", {a: db_dir / f"{a}5m.db" for a in cd.ASSETS})
+
+    rc = cd.main(["--out-dir", str(out_dir)])
+    assert rc == 0
+
+    for name in [
+        "markets.csv", "trades.csv", "price_histories.csv",
+        "orderbooks.csv", "spot.csv", "traders.csv",
+        "daemon_events.csv", "dashboard_history.csv",
+    ]:
+        assert (out_dir / name).exists(), f"missing {name}"
+    # Spot-check row counts
+    assert len(list(csv.DictReader((out_dir / "trades.csv").open()))) == 2  # 1 rest + 1 ws
+    assert len(list(csv.DictReader((out_dir / "orderbooks.csv").open()))) == 2  # 1 rest + 1 ws
+    captured = capsys.readouterr().out
+    assert "Consolidation summary" in captured
+
+
+def test_main_idempotent_rebuild(tmp_path, monkeypatch):
+    """Running main() twice should produce identical output."""
+    from scripts import consolidate_data as cd
+
+    # Empty fixtures (no DBs, no daemon_state files).
+    db_dir = tmp_path / "data"
+    db_dir.mkdir()
+    daemon_dir = tmp_path / "daemon_state"
+    daemon_dir.mkdir()
+    out_dir = tmp_path / "consolidated"
+
+    monkeypatch.setattr(cd, "DATA_DIR", db_dir)
+    monkeypatch.setattr(cd, "DAEMON_STATE_DIR", daemon_dir)
+    monkeypatch.setattr(cd, "DB_PATHS", {a: db_dir / f"{a}5m.db" for a in cd.ASSETS})
+
+    cd.main(["--out-dir", str(out_dir)])
+    first_run = {}
+    for p in out_dir.glob("*.csv"):
+        first_run[p.name] = p.read_bytes()
+
+    cd.main(["--out-dir", str(out_dir)])
+    for p in out_dir.glob("*.csv"):
+        assert p.read_bytes() == first_run[p.name], f"{p.name} differs after rerun"

@@ -576,13 +576,85 @@ def write_dashboard_history(src_path: Path, out_dir: Path) -> int:
     return n
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    args = parser.parse_args()
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output directory: {args.out_dir}")
+    args = parser.parse_args(argv)
+    out_dir: Path = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Truncate any pre-existing 8 CSVs (idempotent rebuild).
+    for name in [
+        "markets.csv", "trades.csv", "price_histories.csv",
+        "orderbooks.csv", "spot.csv", "traders.csv",
+        "daemon_events.csv", "dashboard_history.csv",
+    ]:
+        p = out_dir / name
+        if p.exists():
+            p.unlink()
+
+    # Resolve current paths (module globals — supports monkeypatching in tests).
+    db_paths = {asset: DATA_DIR / f"{asset}5m.db" for asset in ASSETS}
+    daemon_dir = DAEMON_STATE_DIR
+
+    print(f"Output directory: {out_dir}")
+    counts: dict[str, int] = {}
+
+    print("Writing markets.csv ...")
+    counts["markets.csv"] = write_markets(db_paths, out_dir)
+
+    print("Writing trades.csv ...")
+    counts["trades.csv"] = write_trades(db_paths, out_dir)
+
+    print("Writing price_histories.csv ...")
+    counts["price_histories.csv"] = write_price_histories(db_paths, out_dir)
+
+    print("Writing orderbooks.csv (REST half) ...")
+    rest_n = write_orderbooks_rest(db_paths, out_dir)
+    print("Appending orderbooks.csv (book_feed) ...")
+    ws_n = append_book_feed_to_orderbooks(daemon_dir / "book_feed", out_dir)
+    counts["orderbooks.csv"] = rest_n + ws_n
+
+    print("Writing spot.csv ...")
+    counts["spot.csv"] = write_spot(db_paths, out_dir)
+
+    print("Writing traders.csv ...")
+    counts["traders.csv"] = write_traders(db_paths, out_dir)
+
+    print("Writing daemon_events.csv ...")
+    counts["daemon_events.csv"] = write_daemon_events(daemon_dir / "events.jsonl", out_dir)
+
+    print("Writing dashboard_history.csv ...")
+    counts["dashboard_history.csv"] = write_dashboard_history(
+        daemon_dir / "dashboard_history.jsonl", out_dir
+    )
+
+    # Summary
+    print("\n=== Consolidation summary ===")
+    total_rows = 0
+    total_size = 0
+    for name in [
+        "markets.csv", "trades.csv", "price_histories.csv",
+        "orderbooks.csv", "spot.csv", "traders.csv",
+        "daemon_events.csv", "dashboard_history.csv",
+    ]:
+        p = out_dir / name
+        size = p.stat().st_size if p.exists() else 0
+        rows = counts.get(name, 0)
+        total_rows += rows
+        total_size += size
+        print(f"  {name:<26} {rows:>12} rows  {_human_bytes(size):>10}")
+    print(f"  {'Total':<26} {total_rows:>12} rows  {_human_bytes(total_size):>10}")
+
     return 0
+
+
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
 
 
 if __name__ == "__main__":
