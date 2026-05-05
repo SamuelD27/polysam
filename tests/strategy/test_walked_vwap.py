@@ -6,6 +6,7 @@ Tests are organized by phase:
 - Gate (B4): each reject reason fires under the right condition.
 - Partial-fill (B5): WALKED_VWAP_PARTIAL_OK flag behaviour.
 """
+
 from __future__ import annotations
 
 import time
@@ -69,7 +70,9 @@ def test_walked_vwap_for_action_up():
     no = LiveBookState(tick_size=0.01)
     mb = MarketBooks(yes=yes, no=no)
     res = s._walked_vwap_for_entry(
-        side="Up", requested_shares=10.0, books=mb,
+        side="Up",
+        requested_shares=10.0,
+        books=mb,
     )
     # 8 @ 0.42 + 2 @ 0.43 = 10 shares; VWAP = 0.422
     assert res.classification == "full"
@@ -88,7 +91,9 @@ def test_walked_vwap_for_action_down():
     )
     mb = MarketBooks(yes=yes, no=no)
     res = s._walked_vwap_for_entry(
-        side="Down", requested_shares=10.0, books=mb,
+        side="Down",
+        requested_shares=10.0,
+        books=mb,
     )
     # 5 @ 0.58 + 5 @ 0.59 = 10 shares; VWAP = (5*0.58 + 5*0.59)/10 = 0.585
     assert res.classification == "full"
@@ -144,17 +149,24 @@ def test_post_fee_effective_vwap_at_extremes():
 
 def _make_strategy_with_books(
     *,
-    yes_asks=None, yes_bids=None,
-    no_asks=None, no_bids=None,
-    yes_ts_ms=1000, no_ts_ms=1000,
+    yes_asks=None,
+    yes_bids=None,
+    no_asks=None,
+    no_bids=None,
+    yes_ts_ms=1000,
+    no_ts_ms=1000,
 ):
     yes = LiveBookState(tick_size=0.01)
     yes.apply_snapshot(
-        bids=yes_bids or [], asks=yes_asks or [], ts_ms=yes_ts_ms,
+        bids=yes_bids or [],
+        asks=yes_asks or [],
+        ts_ms=yes_ts_ms,
     )
     no = LiveBookState(tick_size=0.01)
     no.apply_snapshot(
-        bids=no_bids or [], asks=no_asks or [], ts_ms=no_ts_ms,
+        bids=no_bids or [],
+        asks=no_asks or [],
+        ts_ms=no_ts_ms,
     )
     return WalkedVWAPStrategy(), MarketBooks(yes=yes, no=no)
 
@@ -178,10 +190,11 @@ def test_gate_rejects_stale_market_price(monkeypatch):
     s, mb = _make_strategy_with_books(
         yes_asks=[{"price": "0.30", "size": "100"}],
     )
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time() - 60,  # stale by 60s, threshold 30s
         books=mb,
@@ -193,10 +206,11 @@ def test_gate_rejects_stale_market_price(monkeypatch):
 
 def test_gate_rejects_no_book_subscription(monkeypatch):
     s = WalkedVWAPStrategy()
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=None,
@@ -207,10 +221,11 @@ def test_gate_rejects_no_book_subscription(monkeypatch):
 
 def test_gate_rejects_empty_book(monkeypatch):
     s, mb = _make_strategy_with_books(yes_asks=[])  # YES asks empty
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -225,10 +240,11 @@ def test_gate_rejects_insufficient_top_of_book(monkeypatch):
     s, mb = _make_strategy_with_books(
         yes_asks=[{"price": "0.30", "size": "5"}],
     )
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -247,7 +263,9 @@ def test_gate_rejects_insufficient_walked_edge(monkeypatch):
     action.update({"entry_price": 0.49, "fair": 0.50, "size_shares": 50.0})
     monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: action)
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.49, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.49,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -261,10 +279,11 @@ def test_gate_passes_when_all_checks_satisfy(monkeypatch):
     s, mb = _make_strategy_with_books(
         yes_asks=[{"price": "0.30", "size": "1000"}],
     )
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -286,15 +305,18 @@ def test_gate_rejects_nan_walked_vwap(monkeypatch):
     yes = LiveBookState(tick_size=0.01)
     # Manually corrupt the asks list to simulate NaN-poisoned WS data
     yes.apply_snapshot(
-        bids=[], asks=[{"price": "0.30", "size": "1000"}], ts_ms=1000,
+        bids=[],
+        asks=[{"price": "0.30", "size": "1000"}],
+        ts_ms=1000,
     )
     yes.asks = [(float("nan"), 1000.0)]
     no = LiveBookState(tick_size=0.01)
     mb = MarketBooks(yes=yes, no=no)
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -312,10 +334,11 @@ def test_partial_fill_off_rejects(monkeypatch):
     s, mb = _make_strategy_with_books(
         yes_asks=[{"price": "0.30", "size": "5"}],  # 5 shares avail, want 16.67
     )
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -331,10 +354,11 @@ def test_partial_fill_on_downsizes(monkeypatch):
     s, mb = _make_strategy_with_books(
         yes_asks=[{"price": "0.30", "size": "5"}],
     )
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -346,6 +370,7 @@ def test_partial_fill_on_downsizes(monkeypatch):
 
 # ── entry_price overwrite + entry_price_mid preservation ────────────────────
 
+
 def test_gate_pass_overwrites_entry_price_with_effective_vwap(monkeypatch):
     """On gate-pass the action's entry_price is overwritten with effective_VWAP
     (book-walk + bell-curve fees) so dry-run / live PnL reflects realizable
@@ -353,10 +378,11 @@ def test_gate_pass_overwrites_entry_price_with_effective_vwap(monkeypatch):
     s, mb = _make_strategy_with_books(
         yes_asks=[{"price": "0.30", "size": "1000"}],
     )
-    monkeypatch.setattr(s, "_run_parent_on_tick",
-                        lambda *a, **k: _refined_would_enter_action())
+    monkeypatch.setattr(s, "_run_parent_on_tick", lambda *a, **k: _refined_would_enter_action())
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -370,9 +396,7 @@ def test_gate_pass_overwrites_entry_price_with_effective_vwap(monkeypatch):
     assert out["entry_price"] == pytest.approx(out["effective_VWAP"])
     assert out["entry_price"] > out["entry_price_mid"]
     # size_usdc is recomputed against the new (higher) per-share cost
-    assert out["size_usdc"] == pytest.approx(
-        out["size_shares"] * out["effective_VWAP"]
-    )
+    assert out["size_usdc"] == pytest.approx(out["size_shares"] * out["effective_VWAP"])
 
 
 def test_paper_executor_carries_entry_price_mid_and_pnl_mid():
@@ -386,8 +410,8 @@ def test_paper_executor_carries_entry_price_mid_and_pnl_mid():
     action = {
         "action": "ENTER",
         "side": "Up",
-        "entry_price": 0.32,        # post-gate, walked
-        "entry_price_mid": 0.30,    # pre-gate, parent's mid quote
+        "entry_price": 0.32,  # post-gate, walked
+        "entry_price_mid": 0.30,  # pre-gate, parent's mid quote
         "size_usdc": 32.0,
         "size_shares": 100.0,
         "edge": 0.20,
@@ -432,8 +456,12 @@ def test_paper_executor_entries_without_mid_omit_pnl_mid():
     ex = PaperExecutor()
     ctx = MarketCtx(slug="s", t_zero=1000, strike=110_000.0)
     action = {
-        "action": "ENTER", "side": "Up", "entry_price": 0.30,
-        "size_usdc": 30.0, "size_shares": 100.0, "edge": 0.20,
+        "action": "ENTER",
+        "side": "Up",
+        "entry_price": 0.30,
+        "size_usdc": 30.0,
+        "size_shares": 100.0,
+        "edge": 0.20,
     }
     entry = ex.enter(action, ctx, now=1776860000.0)
     assert entry is not None
@@ -442,7 +470,10 @@ def test_paper_executor_entries_without_mid_omit_pnl_mid():
     assert "entry_price_mid" not in pos
 
     exit_action = {
-        "action": "EXIT_TP", "exit_price": 0.40, "pnl": 9.0, "hold_time_s": 60.0,
+        "action": "EXIT_TP",
+        "exit_price": 0.40,
+        "pnl": 9.0,
+        "hold_time_s": 60.0,
     }
     res = ex.exit(pos, exit_action, ctx, now=1776860100.0, btc_price=109_000.0)
     assert res is not None
@@ -453,6 +484,7 @@ def test_paper_executor_entries_without_mid_omit_pnl_mid():
 
 
 # ── parent-position sync (Commit 4 fix) ─────────────────────────────────────
+
 
 def test_gate_pass_syncs_parent_open_position_with_effective_vwap(monkeypatch):
     """Regression: the gate-pass branch must mutate self._open_position so
@@ -467,6 +499,7 @@ def test_gate_pass_syncs_parent_open_position_with_effective_vwap(monkeypatch):
             {"price": "0.32", "size": "200"},
         ],
     )
+
     # Stub the parent so it returns a real ENTER action AND populates
     # self._open_position the way EnhancedStrategy.on_tick does on its real
     # entry path (line 634).
@@ -476,7 +509,7 @@ def test_gate_pass_syncs_parent_open_position_with_effective_vwap(monkeypatch):
         # the mid-quoted entry as the position before returning the action.
         s._open_position = {
             "side": action["side"],
-            "entry_price": action["entry_price"],   # mid quote (0.30)
+            "entry_price": action["entry_price"],  # mid quote (0.30)
             "size_usdc": action["size_usdc"],
             "size_shares": action["size_shares"],
             "strike": 110_000.0,
@@ -485,13 +518,16 @@ def test_gate_pass_syncs_parent_open_position_with_effective_vwap(monkeypatch):
         }
         s._position_source = "edge"
         return action
+
     monkeypatch.setattr(
         "active_bots.walked_vwap_strategy.WalkedVWAPStrategy._run_parent_on_tick",
         fake_parent,
     )
 
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -505,9 +541,7 @@ def test_gate_pass_syncs_parent_open_position_with_effective_vwap(monkeypatch):
     assert s._open_position is not None
     assert s._open_position["entry_price"] == pytest.approx(eff)
     assert s._open_position["size_shares"] == pytest.approx(out["size_shares"])
-    assert s._open_position["size_usdc"] == pytest.approx(
-        out["size_shares"] * eff
-    )
+    assert s._open_position["size_usdc"] == pytest.approx(out["size_shares"] * eff)
 
 
 def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
@@ -531,7 +565,8 @@ def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
     )
     # Override MIN_TOP_OF_BOOK_SHARES_RATIO so 50-share top is enough to gate.
     monkeypatch.setattr(
-        "active_bots.walked_vwap_strategy.MIN_TOP_OF_BOOK_SHARES_RATIO", 0.0,
+        "active_bots.walked_vwap_strategy.MIN_TOP_OF_BOOK_SHARES_RATIO",
+        0.0,
     )
 
     requested_shares = 175.0
@@ -551,7 +586,7 @@ def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
         }
         s._open_position = {
             "side": "Up",
-            "entry_price": mid_quote,           # parent stores mid
+            "entry_price": mid_quote,  # parent stores mid
             "size_usdc": action["size_usdc"],
             "size_shares": requested_shares,
             "strike": 110_000.0,
@@ -567,7 +602,9 @@ def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
     )
 
     enter_action = s.on_tick(
-        btc_price=110_000, market_price_up=mid_quote, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=mid_quote,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -575,8 +612,7 @@ def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
     assert enter_action["action"] == "ENTER"
     eff_vwap = enter_action["effective_VWAP"]
     assert eff_vwap > mid_quote + 0.04, (
-        f"need a meaningful spread for this test; got eff={eff_vwap} "
-        f"vs mid={mid_quote}"
+        f"need a meaningful spread for this test; got eff={eff_vwap} vs mid={mid_quote}"
     )
 
     # Simulate a TP-favourable market move and run ProfitGrabber against the
@@ -586,7 +622,8 @@ def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
     exit_market_up = 0.70
     exit_action = pg.check_exit(
         s._open_position,
-        btc_price=110_000.0, sigma=0.5,
+        btc_price=110_000.0,
+        sigma=0.5,
         t_zero=time.time() - 200,
         market_price_up=exit_market_up,
         market_price_ts=time.time(),
@@ -597,13 +634,9 @@ def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
     # Walked-PnL formula: (exit - eff) * shares - SPREAD_COST * shares
     SPREAD_COST = 0.01
     expected_walked = (
-        (exit_market_up - eff_vwap) * requested_shares
-        - SPREAD_COST * requested_shares
-    )
-    expected_mid = (
-        (exit_market_up - mid_quote) * requested_shares
-        - SPREAD_COST * requested_shares
-    )
+        exit_market_up - eff_vwap
+    ) * requested_shares - SPREAD_COST * requested_shares
+    expected_mid = (exit_market_up - mid_quote) * requested_shares - SPREAD_COST * requested_shares
     assert pnl_walked == pytest.approx(expected_walked)
     # The whole point of dual PnL: walked < mid when fees + book walk push
     # eff above mid. A regression that forgets the sync would make pnl_walked
@@ -615,6 +648,7 @@ def test_gate_pass_pnl_uses_walked_entry_not_mid(monkeypatch):
 
 
 # ── parent-position phantom-clear on reject (Commit 5 fix) ──────────────────
+
 
 def test_gate_reject_clears_parent_phantom_open_position(monkeypatch):
     """Regression: when the gate rejects, the parent's self._open_position
@@ -645,13 +679,16 @@ def test_gate_reject_clears_parent_phantom_open_position(monkeypatch):
         }
         s._position_source = "edge"
         return action
+
     monkeypatch.setattr(
         "active_bots.walked_vwap_strategy.WalkedVWAPStrategy._run_parent_on_tick",
         fake_parent,
     )
 
     out = s.on_tick(
-        btc_price=110_000, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -702,20 +739,25 @@ def _make_position(
 
 def _make_books(
     *,
-    yes_bids=None, yes_asks=None,
-    no_bids=None, no_asks=None,
-    yes_ts_ms=None, no_ts_ms=None,
+    yes_bids=None,
+    yes_asks=None,
+    no_bids=None,
+    no_asks=None,
+    yes_ts_ms=None,
+    no_ts_ms=None,
 ):
     """Build a MarketBooks with fresh ts_ms by default."""
     now_ms = int(time.time() * 1000)
     yes = LiveBookState(tick_size=0.01)
     yes.apply_snapshot(
-        bids=yes_bids or [], asks=yes_asks or [],
+        bids=yes_bids or [],
+        asks=yes_asks or [],
         ts_ms=yes_ts_ms if yes_ts_ms is not None else now_ms,
     )
     no = LiveBookState(tick_size=0.01)
     no.apply_snapshot(
-        bids=no_bids or [], asks=no_asks or [],
+        bids=no_bids or [],
+        asks=no_asks or [],
         ts_ms=no_ts_ms if no_ts_ms is not None else now_ms,
     )
     return MarketBooks(yes=yes, no=no)
@@ -737,7 +779,10 @@ def test_exit_gate_disabled_passes_through(monkeypatch):
     t_zero = time.time() - 100.0  # plenty of time left, not in force window
 
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
         market_price_up=0.45,  # mid would TP at 0.45
         market_price_ts=time.time(),
     )
@@ -765,7 +810,10 @@ def test_exit_walked_vwap_up_position(monkeypatch):
     t_zero = time.time() - 100.0
 
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
         market_price_up=0.60,  # mid says 0.60 — much higher than walked 0.50
         market_price_ts=time.time(),
     )
@@ -800,7 +848,10 @@ def test_exit_walked_vwap_down_position(monkeypatch):
     # with 1 - eff = 1 - 0.4955 = 0.5045, so parent's realizable = 1 - 0.5045
     # = 0.4955 → still triggers TP since 0.4955 > 0.30 + 0.01.
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
         market_price_up=0.40,
         market_price_ts=time.time(),
     )
@@ -825,8 +876,12 @@ def test_exit_translation_symmetry(monkeypatch):
     pos_up = _make_position(side="Up", entry_price=0.20, size_shares=100.0, edge=0.20)
     t_zero = time.time() - 100.0
     out_up = pg_up.check_exit(
-        pos_up, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
-        market_price_up=0.50, market_price_ts=time.time(),
+        pos_up,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
+        market_price_up=0.50,
+        market_price_ts=time.time(),
     )
 
     # Down side: NO bids at 0.45 → eff identical → 1 - eff fed to parent →
@@ -837,8 +892,12 @@ def test_exit_translation_symmetry(monkeypatch):
     )
     pos_dn = _make_position(side="Down", entry_price=0.20, size_shares=100.0, edge=0.20)
     out_dn = pg_dn.check_exit(
-        pos_dn, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
-        market_price_up=0.50, market_price_ts=time.time(),
+        pos_dn,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
+        market_price_up=0.50,
+        market_price_ts=time.time(),
     )
 
     assert out_up is not None and out_dn is not None
@@ -854,7 +913,9 @@ def test_exit_force_window_partial_accepted(monkeypatch):
 
     # Force-window window=120s; t_zero such that time_remaining=60s < 120s.
     pg = WalkedExitProfitGrabber(
-        tp_delta_min=0.01, tp_absolute_favor=0.0, force_exit_before_s=120.0,
+        tp_delta_min=0.01,
+        tp_absolute_favor=0.0,
+        force_exit_before_s=120.0,
     )
     # Only 50 shares at 0.40 in YES bids; want to sell 100 → partial.
     pg._latest_books = _make_books(
@@ -866,7 +927,10 @@ def test_exit_force_window_partial_accepted(monkeypatch):
     t_zero = time.time() - (MARKET_DURATION - 60.0)
 
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
         market_price_up=0.55,
         market_price_ts=time.time(),
     )
@@ -886,7 +950,9 @@ def test_exit_force_window_empty_book_fallback_mid(monkeypatch):
     monkeypatch.setattr("active_bots.walked_vwap_strategy.EXIT_FALLBACK_MID", True)
 
     pg = WalkedExitProfitGrabber(
-        tp_delta_min=0.01, tp_absolute_favor=0.0, force_exit_before_s=120.0,
+        tp_delta_min=0.01,
+        tp_absolute_favor=0.0,
+        force_exit_before_s=120.0,
     )
     pg._latest_books = _make_books()  # all empty
 
@@ -894,7 +960,10 @@ def test_exit_force_window_empty_book_fallback_mid(monkeypatch):
     t_zero = time.time() - (MARKET_DURATION - 60.0)  # 60s remaining → in force window
 
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
         market_price_up=0.55,
         market_price_ts=time.time(),
     )
@@ -923,7 +992,10 @@ def test_exit_stale_book_fallback_mid(monkeypatch):
     t_zero = time.time() - 100.0  # not in force window
 
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
         market_price_up=0.55,
         market_price_ts=time.time(),
     )
@@ -951,7 +1023,10 @@ def test_exit_stale_book_no_fallback_holds(monkeypatch):
     t_zero = time.time() - 100.0
 
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
         market_price_up=0.55,
         market_price_ts=time.time(),
     )
@@ -966,7 +1041,8 @@ def test_exit_nan_walked_vwap_falls_back(monkeypatch):
     # Build a book with NaN-poisoned bids (mirror line 291 corruption pattern).
     yes = LiveBookState(tick_size=0.01)
     yes.apply_snapshot(
-        bids=[{"price": "0.50", "size": "1000"}], asks=[],
+        bids=[{"price": "0.50", "size": "1000"}],
+        asks=[],
         ts_ms=int(time.time() * 1000),
     )
     yes.bids = [(float("nan"), 1000.0)]
@@ -981,8 +1057,12 @@ def test_exit_nan_walked_vwap_falls_back(monkeypatch):
     pg = WalkedExitProfitGrabber(tp_delta_min=0.01, tp_absolute_favor=0.0)
     pg._latest_books = mb
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
-        market_price_up=0.55, market_price_ts=time.time(),
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
+        market_price_up=0.55,
+        market_price_ts=time.time(),
     )
     assert out is not None
     assert out["action"] == "EXIT_TP"
@@ -993,8 +1073,12 @@ def test_exit_nan_walked_vwap_falls_back(monkeypatch):
     pg2 = WalkedExitProfitGrabber(tp_delta_min=0.01, tp_absolute_favor=0.0)
     pg2._latest_books = mb
     out2 = pg2.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
-        market_price_up=0.55, market_price_ts=time.time(),
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
+        market_price_up=0.55,
+        market_price_ts=time.time(),
     )
     assert out2 is None
 
@@ -1016,7 +1100,10 @@ def test_exit_partial_disallowed_fallback_mid(monkeypatch):
     t_zero = time.time() - 100.0  # not in force window
 
     out = pg.check_exit(
-        pos, btc_price=110_000.0, sigma=0.5, t_zero=t_zero,
+        pos,
+        btc_price=110_000.0,
+        sigma=0.5,
+        t_zero=t_zero,
         market_price_up=0.55,
         market_price_ts=time.time(),
     )
@@ -1064,9 +1151,7 @@ def test_wrapper_swaps_profit_grabber():
     # Champion tunings flow from RefinedStrategy class constants through the
     # parent's profit_grabber → swapped subclass.
     assert pg.tp_delta_min == pytest.approx(RefinedStrategy.DEFAULT_TP_DELTA_MIN)
-    assert pg.tp_absolute_favor == pytest.approx(
-        RefinedStrategy.DEFAULT_TP_ABSOLUTE_FAVOR
-    )
+    assert pg.tp_absolute_favor == pytest.approx(RefinedStrategy.DEFAULT_TP_ABSOLUTE_FAVOR)
     # Force-window default comes from the FORCE_EXIT_BEFORE_S env knob via
     # ProfitGrabber.__init__ — confirm the swap preserved it (whatever its
     # current value is) rather than resetting it to the bare default.
@@ -1088,7 +1173,9 @@ def test_wrapper_stashes_books_each_tick():
     )
     # First tick with books → stashed.
     s.on_tick(
-        btc_price=110_000.0, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000.0,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=mb,
@@ -1098,10 +1185,11 @@ def test_wrapper_stashes_books_each_tick():
     # Next tick with books=None → overwritten.
     s2 = WalkedVWAPStrategy()
     s2.on_tick(
-        btc_price=110_000.0, market_price_up=0.30, sigma=0.5,
+        btc_price=110_000.0,
+        market_price_up=0.30,
+        sigma=0.5,
         t_zero=time.time() - 130,
         market_price_ts=time.time(),
         books=None,
     )
     assert s2.profit_grabber._latest_books is None
-
