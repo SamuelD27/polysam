@@ -166,6 +166,18 @@ if [[ "$MODE" == "preflight" ]]; then
     exit $?
 fi
 
+# ── Refresh the CLOB's balance/allowance cache (no on-chain tx) ──────────
+# Hits /balance-allowance/update so the server re-reads on-chain state.
+# Used when scripts/check_v2_allowances.py shows on-chain approvals are
+# present but onboard_check / get_balance_allowance reports $0.
+if [[ "$MODE" == "refresh_cache" ]]; then
+    ensure_ns
+    verify_tunnel
+    echo "[launch] running V2 balance-cache refresh inside ns=$NS"
+    run_in_ns "$(which python3)" "$PROJECT_DIR/scripts/refresh_v2_balance_cache.py"
+    exit $?
+fi
+
 # ── Dashboard picker: DASHBOARD=legacy|textual|rust (legacy default) ─────
 # legacy  = pre-Textual rich.Layout dashboard at tui/python/dashboard_legacy.py
 #           (stable, default, what you had before the Textual rewrite)
