@@ -94,3 +94,46 @@ def test_schema_dashboard_columns():
         "ts", "btc_price", "market_price_up", "market_price_down",
         "fair_base", "fair_enh",
     ]
+
+
+from scripts.consolidate_data import compute_ladder_metrics
+
+
+def test_ladder_metrics_basic():
+    bids = [{"price": "0.50", "size": "100"}, {"price": "0.49", "size": "50"}]
+    asks = [{"price": "0.51", "size": "200"}, {"price": "0.52", "size": "75"}]
+    m = compute_ladder_metrics(bids, asks)
+    assert m["best_bid"] == 0.50
+    assert m["best_ask"] == 0.51
+    assert m["spread"] == pytest.approx(0.01)
+
+
+def test_ladder_metrics_depth_10c():
+    bids = [
+        {"price": "0.50", "size": "100"},
+        {"price": "0.45", "size": "50"},   # within 10c
+        {"price": "0.40", "size": "999"},  # outside
+        {"price": "0.41", "size": "1"},    # within 10c (0.50-0.41=0.09)
+    ]
+    asks = [
+        {"price": "0.51", "size": "10"},
+        {"price": "0.55", "size": "20"},   # within 10c
+        {"price": "0.62", "size": "999"},  # outside
+    ]
+    m = compute_ladder_metrics(bids, asks)
+    # bids within 10c of 0.50: 100 + 50 + 1 = 151
+    # asks within 10c of 0.51: 10 + 20 = 30
+    assert m["depth_10c"] == pytest.approx(151 + 30)
+
+
+def test_ladder_metrics_empty():
+    m = compute_ladder_metrics([], [])
+    assert m == {"best_bid": None, "best_ask": None, "spread": None, "depth_10c": None}
+
+
+def test_ladder_metrics_one_sided():
+    m = compute_ladder_metrics([{"price": "0.5", "size": "1"}], [])
+    assert m["best_bid"] == 0.5
+    assert m["best_ask"] is None
+    assert m["spread"] is None
+    assert m["depth_10c"] == pytest.approx(1.0)

@@ -60,6 +60,27 @@ SCHEMA_DASHBOARD = [
 ]
 
 
+def compute_ladder_metrics(bids: list[dict] | None, asks: list[dict] | None) -> dict:
+    """Compute best_bid, best_ask, spread, and depth_10c from a ladder.
+
+    Returns dict with keys: best_bid, best_ask, spread, depth_10c.
+    Values may be None when the corresponding side is empty.
+    depth_10c sums sizes within 10c of best_bid (bid side) plus within 10c of best_ask (ask side).
+    """
+    bid_pairs = [(float(b["price"]), float(b["size"])) for b in (bids or [])]
+    ask_pairs = [(float(a["price"]), float(a["size"])) for a in (asks or [])]
+    best_bid = max((p for p, _ in bid_pairs), default=None)
+    best_ask = min((p for p, _ in ask_pairs), default=None)
+    spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
+    depth_bid = sum(s for p, s in bid_pairs if best_bid is not None and (best_bid - p) < 0.10 - 1e-9)
+    depth_ask = sum(s for p, s in ask_pairs if best_ask is not None and (p - best_ask) < 0.10 - 1e-9)
+    if best_bid is None and best_ask is None:
+        depth_10c = None
+    else:
+        depth_10c = depth_bid + depth_ask
+    return {"best_bid": best_bid, "best_ask": best_ask, "spread": spread, "depth_10c": depth_10c}
+
+
 def slug_to_asset(slug: str | None) -> str | None:
     """Map a market slug to its underlying asset, or None if unknown."""
     if not slug:
