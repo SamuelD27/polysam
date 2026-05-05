@@ -814,3 +814,38 @@ def test_book_feed_skips_truncated_gz(tmp_path):
     # The bad file may yield 0, 1, or even produce an EOFError mid-line;
     # what matters is that the run completed and good files were preserved.
     assert n >= 2
+
+
+def test_book_feed_skips_corrupted_zlib_block(tmp_path):
+    """A .jsonl.gz with a corrupted compression block must also be skipped."""
+    from scripts.consolidate_data import (
+        write_orderbooks_rest, append_book_feed_to_orderbooks,
+    )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_orderbooks_rest({}, out_dir)
+
+    feed_dir = tmp_path / "book_feed" / "2026-05-01"
+    feed_dir.mkdir(parents=True)
+
+    good_file = feed_dir / "btc-updown-5m-1.jsonl.gz"
+    with gzip.open(good_file, "wt") as f:
+        f.write(json.dumps({
+            "type": "snapshot", "ts_ns": 1, "asset_id": "AID",
+            "slug": "btc-updown-5m-1", "side": "yes", "condition_id": "0xCID_OK",
+            "bids": [{"price": "0.5", "size": "1"}],
+            "asks": [{"price": "0.6", "size": "1"}],
+        }) + "\n")
+
+    # Build a "corrupted" gz: valid 10-byte gzip header followed by garbage
+    # compressed bytes. This triggers zlib.error rather than EOFError.
+    bad_file = feed_dir / "btc-updown-5m-2.jsonl.gz"
+    bad_file.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" + b"\xff" * 64)
+
+    n = append_book_feed_to_orderbooks(tmp_path / "book_feed", out_dir)
+
+    rows = list(csv.DictReader((out_dir / "orderbooks.csv").open()))
+    cids = {r["condition_id"] for r in rows}
+    assert "0xCID_OK" in cids
+    assert n >= 1
