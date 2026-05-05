@@ -448,3 +448,84 @@ def test_write_traders(tmp_path):
     assert r["wallet"] == "0xWALLET1"
     assert r["total_trades"] == "100"
     assert r["win_rate"] == "0.55"
+
+
+import gzip
+import json
+
+
+def test_append_book_feed_to_orderbooks(tmp_path):
+    from scripts.consolidate_data import (
+        write_orderbooks_rest, append_book_feed_to_orderbooks,
+    )
+
+    # Step 1: write the REST half (creates orderbooks.csv with header).
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    write_orderbooks_rest({}, out_dir)  # no DBs → header-only
+
+    # Step 2: build a synthetic book_feed/<date>/<slug>.jsonl.gz fixture.
+    feed_dir = tmp_path / "book_feed" / "2026-05-01"
+    feed_dir.mkdir(parents=True)
+    snapshot_record = {
+        "type": "snapshot", "reason": "initial",
+        "ts_ns": 1777864005346867486,
+        "asset_id": "AID1",
+        "slug": "btc-updown-5m-1777864200",
+        "side": "yes",
+        "condition_id": "0xCID",
+        "canonical_tick": "0.01", "effective_tick": "0.01",
+        "bids": [{"price": "0.50", "size": "100"}],
+        "asks": [{"price": "0.51", "size": "200"}],
+        "remote_hash": "rh1", "local_hash": "lh1",
+    }
+    book_record = {
+        "type": "book",
+        "ts_ns": 1777864010000000000,
+        "asset_id": "AID1",
+        "slug": "btc-updown-5m-1777864200",
+        "side": "yes",
+        "condition_id": "0xCID",
+        "canonical_tick": "0.01",
+        "raw": {
+            "bids": [{"price": "0.49", "size": "5"}],
+            "asks": [{"price": "0.52", "size": "10"}],
+            "event_type": "book",
+        },
+    }
+    feed_file = feed_dir / "btc-updown-5m-1777864200.jsonl.gz"
+    with gzip.open(feed_file, "wt") as f:
+        f.write(json.dumps(snapshot_record) + "\n")
+        f.write(json.dumps(book_record) + "\n")
+
+    # Step 3: append.
+    n = append_book_feed_to_orderbooks(tmp_path / "book_feed", out_dir)
+    assert n == 2
+
+    rows = list(csv.DictReader((out_dir / "orderbooks.csv").open()))
+    assert len(rows) == 2
+
+    snap = next(r for r in rows if r["event_type"] == "snapshot")
+    assert snap["asset"] == "btc"
+    assert snap["source"] == "ws_book_feed"
+    assert snap["slug"] == "btc-updown-5m-1777864200"
+    assert snap["side"] == "yes"
+    assert snap["condition_id"] == "0xCID"
+    assert snap["asset_id"] == "AID1"
+    assert snap["canonical_tick"] == "0.01"
+    assert snap["effective_tick"] == "0.01"
+    assert snap["remote_hash"] == "rh1"
+    assert snap["local_hash"] == "lh1"
+    assert snap["reason"] == "initial"
+    assert snap["ts_ns"] == "1777864005346867486"
+    # snapshot_time should be ISO8601 UTC
+    assert snap["snapshot_time"].startswith("2026-")
+    # Bids/asks JSON preserved
+    assert json.loads(snap["bids_json"]) == [{"price": "0.50", "size": "100"}]
+    # Derived metrics
+    assert snap["best_bid"] == "0.5"
+    assert snap["best_ask"] == "0.51"
+
+    book = next(r for r in rows if r["event_type"] == "book")
+    assert json.loads(book["bids_json"]) == [{"price": "0.49", "size": "5"}]
+    assert book["best_bid"] == "0.49"

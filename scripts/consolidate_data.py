@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -399,6 +401,99 @@ def write_traders(db_paths: dict[str, Path], out_dir: Path) -> int:
                 con.close()
     print(f"  traders.csv: {n} rows")
     return n
+
+
+def append_book_feed_to_orderbooks(book_feed_root: Path, out_dir: Path) -> int:
+    """Append the WS half of orderbooks.csv from book_feed/<date>/*.jsonl.gz files.
+
+    Expects orderbooks.csv to already exist (created by write_orderbooks_rest).
+    """
+    out_path = out_dir / "orderbooks.csv"
+    if not book_feed_root.exists():
+        print(f"  [skip] missing: {book_feed_root}")
+        return 0
+
+    n = 0
+    with out_path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SCHEMA_ORDERBOOKS)
+        for date_dir in sorted(book_feed_root.iterdir()):
+            if not date_dir.is_dir():
+                continue
+            if date_dir.name == "logs":
+                continue
+            for gz_file in sorted(date_dir.glob("*.jsonl.gz")):
+                try:
+                    with gzip.open(gz_file, "rt") as gz:
+                        for line_no, raw_line in enumerate(gz, start=1):
+                            line = raw_line.strip()
+                            if not line:
+                                continue
+                            try:
+                                rec = json.loads(line)
+                            except json.JSONDecodeError as e:
+                                print(f"  [warn] {gz_file}:{line_no} bad JSON: {e}")
+                                continue
+                            row = _book_feed_row(rec)
+                            if row is None:
+                                continue
+                            w.writerow(row)
+                            n += 1
+                except OSError as e:
+                    print(f"  [warn] failed to read {gz_file}: {e}")
+    print(f"  orderbooks.csv (ws_book_feed): {n} rows appended")
+    return n
+
+
+def _book_feed_row(rec: dict) -> dict | None:
+    """Convert one parsed book_feed record into a SCHEMA_ORDERBOOKS row.
+
+    Returns None to skip the record.
+    """
+    rec_type = rec.get("type")
+    if rec_type == "snapshot":
+        bids = rec.get("bids") or []
+        asks = rec.get("asks") or []
+    elif rec_type == "book":
+        raw = rec.get("raw") or {}
+        bids = raw.get("bids") or []
+        asks = raw.get("asks") or []
+    else:
+        # price_change, last_trade_price, tick_size_change — no full ladder
+        return None
+
+    metrics = compute_ladder_metrics(bids, asks)
+    ts_ns = rec.get("ts_ns")
+    snapshot_time = None
+    if ts_ns is not None:
+        try:
+            dt = datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=timezone.utc)
+            snapshot_time = dt.isoformat()
+        except (OSError, OverflowError, ValueError):
+            snapshot_time = None
+    slug = rec.get("slug") or ""
+    asset = slug_to_asset(slug)
+    return {
+        "asset": asset,
+        "source": "ws_book_feed",
+        "condition_id": rec.get("condition_id"),
+        "slug": slug,
+        "side": rec.get("side"),
+        "snapshot_time": snapshot_time,
+        "ts_ns": ts_ns,
+        "event_type": rec_type,
+        "best_bid": metrics["best_bid"],
+        "best_ask": metrics["best_ask"],
+        "spread": metrics["spread"],
+        "depth_10c": metrics["depth_10c"],
+        "bids_json": json.dumps(bids),
+        "asks_json": json.dumps(asks),
+        "asset_id": rec.get("asset_id"),
+        "canonical_tick": rec.get("canonical_tick"),
+        "effective_tick": rec.get("effective_tick"),
+        "remote_hash": rec.get("remote_hash"),
+        "local_hash": rec.get("local_hash"),
+        "reason": rec.get("reason"),
+    }
 
 
 def main() -> int:
