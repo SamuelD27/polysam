@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from active_bots.execution.executor import EntryResult, ExitResult, MarketCtx
+    from active_bots.execution.live_book_state import MarketBooks
 
 
 # Action discriminators recognised by Trader.execute. The Strategy ABC
@@ -144,7 +145,7 @@ class Trader(ABC):
         now: float | None = None,
         btc_price: float | None = None,
         source: str = "edge",
-        books: Any = None,
+        books: MarketBooks | None = None,
     ) -> ExecutionResult:
         """Translate a Decision into an order or settlement.
 

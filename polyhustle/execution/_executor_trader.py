@@ -24,6 +24,7 @@ from polyhustle.execution.trader import (
 
 if TYPE_CHECKING:
     from active_bots.execution.executor import Executor, MarketCtx
+    from active_bots.execution.live_book_state import MarketBooks
 
 
 class _ExecutorTrader(Trader):
@@ -47,7 +48,7 @@ class _ExecutorTrader(Trader):
         now: float | None = None,
         btc_price: float | None = None,
         source: str = "edge",
-        books: Any = None,  # noqa: ARG002 — ignored; PaperTrader override consumes it
+        books: MarketBooks | None = None,  # noqa: ARG002 — reserved for the PaperTrader rewrite (Task 3 of the realistic-paper-and-replay plan); ignored by all current subclasses
     ) -> ExecutionResult:
         """Dispatch one decision to the underlying executor.
 
