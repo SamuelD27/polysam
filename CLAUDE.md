@@ -384,3 +384,120 @@ When adding a new entry zone, exit gate, or fee model, in order:
 
 For larger work, write a plan under `docs/superpowers/plans/`
 (`YYYY-MM-DD-<topic>.md`). Existing plans there are good templates.
+
+---
+
+## 14. Package layout (`polyhustle/`)
+
+The modular-architecture refactor introduced a `polyhustle/` package that
+splits the daemon's monolithic loop into three layers connected by typed
+interfaces. Strategy class bodies still live in `active_bots/` during the
+transition; `polyhustle/strategies/` are shim re-exports.
+
+```
+polyhustle/
+├── __init__.py
+├── data/
+│   ├── provider.py        # DataProvider ABC + frozen MarketTick dataclass
+│   ├── live.py            # LiveDataProvider — wraps daemon's WS feeds + DaemonState
+│   ├── paper.py           # PaperDataProvider — alias of live (paper differs in trader, not data)
+│   └── replay.py          # ReplayDataProvider — Session C stub
+├── strategies/
+│   ├── strategy_abc.py    # Strategy ABC: on_tick / reset / has_position
+│   ├── base.py            # shim: re-exports active_bots.base_strategy.BaseStrategy
+│   ├── enhanced.py        # shim
+│   ├── refined.py         # shim
+│   └── walked_vwap.py     # shim
+├── execution/
+│   ├── trader.py          # Trader ABC + Decision + ExecutionResult dataclasses
+│   ├── _executor_trader.py # shared dispatch base — action → enter/exit/resolve
+│   ├── live_trader.py     # wraps active_bots.execution.live_executor.LiveExecutor
+│   ├── paper_trader.py    # wraps PaperExecutor — each instance owns its own wallet
+│   ├── dryrun_trader.py   # wraps DryRunExecutor — live-shape paper fills, no POST
+│   ├── reconciler.py      # shim re-export
+│   └── risk_manager.py    # shim re-export
+├── orchestrator.py        # the run loop — single-instrument; supports N traders with isolated wallets
+└── cli.py                 # `python -m polyhustle.cli --config <json>` entry point
+```
+
+Top-level `launch` script is the user-facing entry point. Today it
+shells to `launch_daemon.sh`; Session B replaces it with a menu.
+
+The legacy `daemon_base_v1.py` continues to work unchanged — it is
+the import target for `polyhustle/data/live.py` and
+`polyhustle/cli.py`'s live-mode trader build. Eventual retirement of
+the legacy daemon happens once the new path has soaked in production.
+
+---
+
+## 15. Adding a new strategy
+
+Three steps:
+
+1. **Subclass `Strategy`** in a new file under
+   `polyhustle/strategies/<name>.py`. Implement `on_tick` / `reset` /
+   `has_position`. The class body can live there directly, or — if the
+   strategy is a tweak on an existing one — re-export a class from
+   `active_bots/` (the existing four classes use this shim pattern
+   during the refactor).
+2. **Register it in `polyhustle/cli.py`**. Add the entry to
+   `STRATEGY_REGISTRY` so the JSON config's
+   `main_strategy` / `comparison_strategies` / `benchmarks` accept the
+   name.
+3. **Update `STRATEGY.md`**. New section under §1, knob entries in §5,
+   lineage in §8 if applicable. Don't skip this — `STRATEGY.md` is the
+   source of truth for strategy mechanics; the cheat-sheet table here
+   in CLAUDE.md cross-references it.
+
+Beyond that the existing checklist from §13 applies (default-off flag,
+tests both ways, replay-parity, conventional commits, paper-validate
+before live).
+
+The legacy daemon's strategy dispatch (`daemon_base_v1.py` lines 33-40
+imports + `strategy_loop` lines 1095-1124) does NOT auto-update from
+the registry — that remains a manual edit until the legacy entry point
+is retired.
+
+---
+
+## 16. Documentation rule — Plain-language summary
+
+Every NEW markdown file under `docs/` or `reports/` must start with a
+`## Plain-language summary` section of 3-6 sentences explaining the
+document for a non-technical reader, BEFORE the technical body. The
+summary answers: what is this document, who is it for, what would
+change if its conclusions were acted on?
+
+The rule applies to:
+- Every new doc file added to `docs/` or `reports/`.
+- Any existing doc file Claude edits substantively (i.e. structural
+  changes, not typo fixes or knob-table updates).
+
+The rule does NOT apply to:
+- Chat-style replies in conversations (technical first; plain-language
+  on request).
+- Existing doc files that aren't being edited — DO NOT bulk-add
+  summaries to all 50+ existing docs.
+- Code comments, docstrings, or commit messages.
+
+Format example::
+
+    # R3.0 — Sweep results
+
+    ## Plain-language summary
+
+    This document records the outcome of a 256-combination flag sweep
+    against the R2.2 capture. We tested whether tightening or loosening
+    five book-quality / risk-management knobs would have closed the
+    walked_vwap strategy's $12 loss. The headline finding: the
+    `MIN_TOP_OF_BOOK_SHARES_RATIO` knob is the largest lever, but it
+    needs validation against a higher-vol capture before promoting any
+    default. No code defaults are changed by this document; it informs
+    the `tune/quant-defaults` branch.
+
+    ## 1. Methodology
+    ...
+
+The summary lets the operator (and future readers) decide in 30
+seconds whether to read the technical body. Documents that miss this
+section get rejected at code review.
