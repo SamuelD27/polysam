@@ -36,7 +36,6 @@ import warnings
 from active_bots.execution.dry_run_executor import DryRunExecutor
 from polyhustle.execution._executor_trader import _ExecutorTrader
 
-
 _INSTANTIATION_WARNING = (
     "DryrunTrader produces live-shape fills without signing. "
     "To sign-without-post, an unsigned-sign path must be added to "
