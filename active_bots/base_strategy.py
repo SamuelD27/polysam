@@ -10,6 +10,8 @@ import math
 import time
 from typing import Any
 
+from polyhustle.strategies.strategy_abc import Strategy
+
 from .pricing.constants import SECONDS_PER_YEAR
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -158,7 +160,7 @@ def resolve_trade(
 # ── BaseStrategy ───────────────────────────────────────────────────────────
 
 
-class BaseStrategy:
+class BaseStrategy(Strategy):
     """Stateful base strategy for a single BTC 5m binary option market.
 
     Call on_tick() with each price update. The strategy will:

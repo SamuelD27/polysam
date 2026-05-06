@@ -13,6 +13,8 @@ import os
 import time
 from typing import Any
 
+from polyhustle.strategies.strategy_abc import Strategy
+
 from .base_strategy import (
     EDGE_MAX,
     EDGE_MIN,
@@ -620,7 +622,7 @@ class SqueezeDetector:
 # ── Combined Strategy ───────────────────────────────���──────────────────────
 
 
-class EnhancedStrategy:
+class EnhancedStrategy(Strategy):
     """Combined strategy with all 3 enhancements.
 
     Priority on each tick:
