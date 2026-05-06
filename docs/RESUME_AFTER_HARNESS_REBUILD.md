@@ -16,6 +16,16 @@ git-level state, not a live cross-reference into the source tree.
 
 Three lines of work are open. None merged, none lost.
 
+> **Latent on_tick signature note (added 2026-05-06 post-merge):** All
+> non-walked strategies (`BaseStrategy`, `EnhancedStrategy`,
+> `RefinedStrategy`) trigger the Orchestrator's on_tick signature
+> fallback because they do not accept the canonical `(market_price_ts,
+> *, books)` form. Harmless under the legacy daemon (which never passes
+> `books` to those strategies); the warn-once is the right permanent
+> affordance. Will be cleaned up trivially (one-line `**kwargs` per
+> strategy) when the Orchestrator becomes the sole dispatch path after
+> Sessions B and C complete.
+
 ### 1.1 `feat/quant-flags-phase5` — 11 commits, 270 tests, ruff clean, NOT merged
 
 Branch base: `Sam-Dev` after the Phase 4 cleanup branch fast-forwarded into it. Branch tip at hand-off: `510f759`. The 11 commits in chronological order:
