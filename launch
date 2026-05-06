@@ -431,12 +431,137 @@ PY
     esac
 }
 
-# Steps filled in C3-C4
-step4_execution_mode()  { :; }
-step5_optional_params() { :; }
-step6_save_preset()     { :; }
-step7_confirm()         { :; }
-step8_launch()          { :; }
+# shellcheck disable=SC2034  # consumed by write_config_json in C4
+step4_execution_mode() {
+    # Comparison and replay force the execution mode — no operator choice.
+    if [[ "$CONFIG_MODE" == "comparison" ]]; then
+        CONFIG_EXECUTION_MODE="live_dryrun"
+        return 0
+    fi
+    if [[ "$CONFIG_MODE" == "replay" ]]; then
+        CONFIG_EXECUTION_MODE="replay"
+        return 0
+    fi
+    if tui_test_mode; then
+        CONFIG_EXECUTION_MODE="${LAUNCH_TEST_EXECUTION_MODE:-paper}"
+        return 0
+    fi
+    local choice rc
+    set +e
+    choice=$(tui_menu \
+        "Execution mode" \
+        "How orders are routed. Esc to back up." \
+        16 78 3 \
+        "live_real"     "  Posts orders to Polymarket CLOB (needs polybot netns)" \
+        "live_dryrun"   "  Live websockets + signs orders, NO POST" \
+        "paper"         "  Websockets + simulated fills (no signing)")
+    rc=$?
+    set -e
+    case "$rc" in
+        0) CONFIG_EXECUTION_MODE="$choice"; return 0 ;;
+        1) return 2 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Optional-params spec — three parallel arrays kept in lock-step.
+# PARAM_NAMES       lowercase JSON key (uppercased into env by polyhustle.cli)
+# PARAM_PROMPTS     short description shown in the inputbox
+# PARAM_DEFAULTS    pre-filled default value (empty string = "unset")
+#
+# When the operator's value matches the default, the key is omitted from
+# the JSON params dict — the daemon falls back to its env-default. This
+# keeps saved presets readable: they only carry the knobs the operator
+# actually changed.
+PARAM_NAMES=(
+    max_trade_size_usdc
+    max_daily_loss_usdc
+    sigma_haircut
+    sl_absolute_against
+    sl_decay_enable
+    position_size_edge_cap
+    walked_vwap_partial_ok
+    min_top_of_book_shares_ratio
+)
+PARAM_PROMPTS=(
+    "MAX_TRADE_SIZE_USDC — per-trade ceiling (USDC). Default 5."
+    "MAX_DAILY_LOSS_USDC — daily loss circuit breaker. Default 50."
+    "SIGMA_HAIRCUT — multiplicative σ adjustment (1.0=no-op, <1.0 shrinks σ → wider |d2|). Default 1.0."
+    "SL_ABSOLUTE_AGAINST — hard SL cap (blank=unset, default off)."
+    "SL_DECAY_ENABLE — time-decay on adaptive SL (0=off, 1=on). Default 0."
+    "POSITION_SIZE_EDGE_CAP — linear-interp input cap (blank=unset, no cap)."
+    "WALKED_VWAP_PARTIAL_OK — accept partial entry fills (0=reject, 1=accept). Default 0."
+    "MIN_TOP_OF_BOOK_SHARES_RATIO — top-size floor multiplier. Default 1.0."
+)
+PARAM_DEFAULTS=(
+    "5"
+    "50"
+    "1.0"
+    ""
+    "0"
+    ""
+    "0"
+    "1.0"
+)
+
+# shellcheck disable=SC2034  # CONFIG_PARAMS consumed by write_config_json in C4
+step5_optional_params() {
+    if tui_test_mode; then
+        local i=0
+        for name in "${PARAM_NAMES[@]}"; do
+            local upper="LAUNCH_TEST_PARAM_${name^^}"
+            if [[ -n "${!upper+set}" ]]; then
+                CONFIG_PARAMS[$name]="${!upper}"
+            fi
+            i=$((i + 1))
+        done
+        return 0
+    fi
+
+    local n=${#PARAM_NAMES[@]}
+    local i=0
+    while [[ "$i" -lt "$n" ]]; do
+        local name="${PARAM_NAMES[$i]}"
+        local prompt="${PARAM_PROMPTS[$i]}"
+        local default="${PARAM_DEFAULTS[$i]}"
+        local val rc
+        set +e
+        val=$(tui_inputbox \
+            "Param $((i + 1)) of $n: $name" \
+            "$prompt"$'\n\n(Enter to keep default, Esc to back up.)' \
+            12 78 \
+            "$default")
+        rc=$?
+        set -e
+        case "$rc" in
+            0)
+                if [[ "$val" != "$default" ]]; then
+                    CONFIG_PARAMS[$name]="$val"
+                else
+                    unset "CONFIG_PARAMS[$name]"
+                fi
+                i=$((i + 1))
+                ;;
+            *)
+                # Esc / Cancel — back up within step 5; if at first
+                # prompt, signal "back to step 4" to the outer driver.
+                if [[ "$i" -eq 0 ]]; then
+                    return 1
+                fi
+                # Drop the previous prompt's saved value so the operator
+                # gets the default again on re-entry.
+                local prev="${PARAM_NAMES[$((i - 1))]}"
+                unset "CONFIG_PARAMS[$prev]"
+                i=$((i - 1))
+                ;;
+        esac
+    done
+    return 0
+}
+
+step6_save_preset()     { :; }   # filled in C4
+step7_confirm()         { :; }   # filled in C4
+step8_launch()          { :; }   # filled in C4
 
 write_config_json() {
     # Assemble the global CONFIG_* state into "$TEMP_CONFIG".
