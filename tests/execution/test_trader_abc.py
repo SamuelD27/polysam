@@ -61,6 +61,11 @@ def test_paper_trader_satisfies_abc():
 
 
 def test_paper_trader_enter_returns_entry_result():
+    # gate_passed=True signals the walked-VWAP gate already produced the
+    # fill upstream — pass-through avoids the wrapper's book-walk
+    # (which would otherwise reject with paper_no_fill since no MarketBooks
+    # is provided here). This test exercises pure dispatch, not the fill
+    # realism path; the latter is covered by test_paper_trader_fill_realism.
     t = PaperTrader()
     ctx = MarketCtx(slug="btc-updown-5m-1", t_zero=1, strike=110_000.0)
     decision = Decision(
@@ -70,7 +75,7 @@ def test_paper_trader_enter_returns_entry_result():
         size_shares=10.0,
         size_usdc=4.20,
         edge=0.15,
-        meta={"fair": 0.50, "market": 0.38},
+        meta={"fair": 0.50, "market": 0.38, "gate_passed": True},
     )
     res = t.execute(decision, ctx, source="edge", now=100.0)
     assert isinstance(res, ExecutionResult)
@@ -90,6 +95,8 @@ def test_paper_trader_exit_requires_position():
 
 
 def test_paper_trader_resolve_returns_exit_result():
+    # gate_passed=True: pass-through entry without book-walking. See
+    # test_paper_trader_enter_returns_entry_result for rationale.
     t = PaperTrader()
     ctx = MarketCtx(slug="btc-updown-5m-1", t_zero=1, strike=110_000.0)
     enter = t.execute(
@@ -100,7 +107,7 @@ def test_paper_trader_resolve_returns_exit_result():
             size_shares=10.0,
             size_usdc=4.20,
             edge=0.15,
-            meta={},
+            meta={"gate_passed": True},
         ),
         ctx,
         source="edge",
@@ -136,6 +143,8 @@ def test_paper_trader_walked_vwap_reject_returns_rejected():
 
 def test_paper_trader_exit_sl_with_position():
     """EXIT_SL with a position dispatches to executor.exit."""
+    # gate_passed=True: pass-through entry without book-walking. See
+    # test_paper_trader_enter_returns_entry_result for rationale.
     t = PaperTrader()
     ctx = MarketCtx(slug="btc-updown-5m-1", t_zero=1, strike=110_000.0)
     enter = t.execute(
@@ -146,7 +155,7 @@ def test_paper_trader_exit_sl_with_position():
             size_shares=10.0,
             size_usdc=4.20,
             edge=0.15,
-            meta={},
+            meta={"gate_passed": True},
         ),
         ctx,
         source="edge",
