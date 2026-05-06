@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import time
@@ -32,6 +31,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCH_SCRIPT = REPO_ROOT / "launch"
+LAUNCH_DAEMON_SCRIPT = REPO_ROOT / "launch_daemon.sh"
 TEMP_RE = re.compile(r"/tmp/polyhustle-launch-\d+\.json")
 
 
@@ -331,3 +331,217 @@ def test_help_exits_zero():
     assert "launch — keyboard-driven launcher" in result.stdout
     assert "--preset" in result.stdout
     assert "Prerequisites" in result.stdout
+
+
+# ─────────── launch_daemon.sh smoke tests ───────────────────────────
+# These exercise the legacy capture-producing wrapper with stub daemon
+# and stub scraper so the wrapper logic (preflight, manifest, traps)
+# runs without spawning real trading code. The single test-mode
+# divergence is LAUNCH_DAEMON_PROJECT_DIR_OVERRIDE — an env-var that
+# points the script at a temp dir holding stub daemon_base_v1.py +
+# scripts/scrape_book.py. Everything else runs the production code
+# path.
+
+def _stub_project_dir(tmp_path: Path) -> Path:
+    """Build a fake $PROJECT_DIR with stub daemon + scraper scripts.
+
+    The stubs sleep so they're alive long enough for the wrapper to
+    pid-write the manifest. The wrapper doesn't care what the spawned
+    python actually does — it records pid, waits, and traps cleanup.
+    """
+    proj = tmp_path / "project"
+    proj.mkdir()
+    (proj / "daemon_base_v1.py").write_text(
+        "import time, sys\nsys.stderr.write('stub daemon up\\n')\ntime.sleep(60)\n"
+    )
+    scripts = proj / "scripts"
+    scripts.mkdir()
+    (scripts / "scrape_book.py").write_text(
+        "import time, sys\nsys.stderr.write('stub scraper up\\n')\ntime.sleep(60)\n"
+    )
+    # The wrapper's preflight requires a daemon_state/ dir to gauge disk
+    # space against. Make it.
+    (proj / "daemon_state").mkdir()
+    (proj / "daemon_state" / "scrapes").mkdir()
+    (proj / "daemon_state" / "book_feed").mkdir()
+    return proj
+
+
+def _legacy_env(proj: Path) -> dict[str, str]:
+    """Build the env for invoking launch_daemon.sh against a stub project."""
+    env = os.environ.copy()
+    env["LAUNCH_DAEMON_PROJECT_DIR_OVERRIDE"] = str(proj)
+    # Skip conda activation — assume the test runner is already in
+    # polymarket-env (otherwise the dependency-import check fails the
+    # same way it would fail in production).
+    env.setdefault("CONDA_DEFAULT_ENV", "polymarket-env")
+    return env
+
+
+def test_launch_daemon_paper_writes_manifest_skeleton(tmp_path):
+    """launch_daemon.sh paper produces a manifest with the expected fields.
+
+    Spawns the legacy wrapper against a stub project dir, waits up to
+    10s for the manifest to appear, asserts shape, then SIGINTs and
+    confirms cleanup runs (manifest gets stop_ts patched in).
+    """
+    proj = _stub_project_dir(tmp_path)
+    proc = subprocess.Popen(
+        ["bash", str(LAUNCH_DAEMON_SCRIPT), "paper"],
+        env=_legacy_env(proj),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=str(proj),
+        start_new_session=True,
+    )
+    scrapes = proj / "daemon_state" / "scrapes"
+    deadline = time.time() + 15.0
+    manifest = None
+    while time.time() < deadline and manifest is None:
+        for d in scrapes.iterdir() if scrapes.is_dir() else []:
+            mf = d / "manifest.json"
+            if mf.exists() and mf.stat().st_size > 0:
+                manifest = mf
+                break
+        if manifest is None:
+            time.sleep(0.1)
+    if manifest is None:
+        proc.kill()
+        out, err = proc.communicate(timeout=5)
+        pytest.fail(
+            f"manifest never appeared. stdout={out!r}\nstderr={err!r}"
+        )
+
+    m = json.loads(manifest.read_text())
+    # At launch the manifest carries open-ended state (stop_ts null,
+    # exit codes null) and the live pid + session metadata.
+    assert m["mode"] == "paper", m
+    assert m["session_id"] == manifest.parent.name
+    assert m["launch_ts_utc"]  # non-empty
+    assert m["launch_ts_ns"] > 0
+    assert m["stop_ts_utc"] is None
+    assert m["stop_ts_ns"] is None
+    assert m["daemon_exit_code"] is None
+    assert m["scraper_exit_code"] is None
+    assert m["daemon_pid"] is not None
+    assert m["scraper_pid"] is not None
+    assert m["netns"] is None  # paper mode
+    assert m["events_jsonl_path"].endswith("events.jsonl")
+    assert m["daemon_log_path"].endswith("daemon.log")
+    assert "git_sha" in m
+    assert "git_branch" in m
+
+    # Cleanup: SIGINT the process group, expect the trap to update the
+    # manifest with stop_ts and exit codes.
+    os.killpg(proc.pid, signal.SIGINT)
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+        pytest.fail("launch_daemon.sh did not exit within 20s of SIGINT")
+
+    m_final = json.loads(manifest.read_text())
+    assert m_final["stop_ts_utc"] is not None, m_final
+    assert m_final["stop_ts_ns"] is not None
+    assert m_final["daemon_exit_code"] in {"sigterm", "sigkill", "already_dead"}
+    assert m_final["scraper_exit_code"] in {"sigterm", "sigkill", "already_dead", "none"}
+
+
+def test_launch_daemon_aborts_on_running_scraper_pid(tmp_path):
+    """Preflight gate fires when an existing scraper pidfile points at a live pid.
+
+    Spec says the preflight aborts with exit 4. Plant a scraper.pid
+    file in a fake prior-session dir whose contents = the test runner's
+    own pid (kill -0 self → success), then invoke the wrapper.
+    """
+    proj = _stub_project_dir(tmp_path)
+    # Plant a fake prior-session dir with a live scraper.pid.
+    prior = proj / "daemon_state" / "scrapes" / "1999-01-01T00-00-00Z"
+    prior.mkdir()
+    # Use the test runner's own pid — guaranteed alive (we're it).
+    (prior / "scraper.pid").write_text(f"{os.getpid()}\n")
+
+    result = subprocess.run(
+        ["bash", str(LAUNCH_DAEMON_SCRIPT), "paper"],
+        env=_legacy_env(proj),
+        capture_output=True, text=True, timeout=15,
+        cwd=str(proj),
+    )
+    assert result.returncode == 4, (
+        f"expected exit 4 (scraper-pid abort), got {result.returncode}.\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert "ABORT" in result.stderr
+    assert "scraper" in result.stderr.lower()
+    # The live pidfile must NOT have been removed (only stale ones are
+    # rm'd by preflight). Confirm it's still there.
+    assert (prior / "scraper.pid").exists()
+
+
+def test_launch_daemon_removes_stale_scraper_pidfile(tmp_path):
+    """Preflight removes a stale scraper.pid (dead pid) and proceeds.
+
+    Plant a scraper.pid pointing at PID 1 minus a far-into-the-future
+    offset so it's almost certainly not alive. The wrapper should
+    silently rm it and continue to the manifest emit.
+    """
+    proj = _stub_project_dir(tmp_path)
+    prior = proj / "daemon_state" / "scrapes" / "1999-01-01T00-00-00Z"
+    prior.mkdir()
+    # PIDs over 4_000_000 are out of range on Linux (default
+    # kernel.pid_max=4_194_303); kill -0 on it returns ESRCH.
+    stale_pidfile = prior / "scraper.pid"
+    stale_pidfile.write_text("4000001\n")
+
+    proc = subprocess.Popen(
+        ["bash", str(LAUNCH_DAEMON_SCRIPT), "paper"],
+        env=_legacy_env(proj),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=str(proj),
+        start_new_session=True,
+    )
+    # Wait up to 10s for the manifest to appear (== preflight passed).
+    scrapes = proj / "daemon_state" / "scrapes"
+    deadline = time.time() + 10.0
+    manifest = None
+    while time.time() < deadline and manifest is None:
+        for d in scrapes.iterdir():
+            if d.name == prior.name:
+                continue  # the planted dir
+            mf = d / "manifest.json"
+            if mf.exists() and mf.stat().st_size > 0:
+                manifest = mf
+                break
+        if manifest is None:
+            time.sleep(0.1)
+
+    # Now SIGINT and confirm a clean exit. Whether or not we found a
+    # manifest within 10s, the wrapper should exit cleanly.
+    os.killpg(proc.pid, signal.SIGINT)
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+        pytest.fail("launch_daemon.sh did not exit within 20s of SIGINT")
+
+    assert manifest is not None, (
+        "preflight didn't proceed past the stale-pid check — "
+        "either the rm failed or the daemon never spawned"
+    )
+    # Stale pidfile should be gone.
+    assert not stale_pidfile.exists()
+
+
+def test_launch_daemon_removed_subcommands_exit_nonzero(tmp_path):
+    """status / attach / preflight / refresh_cache stubs exit 1 with hint."""
+    proj = _stub_project_dir(tmp_path)
+    for sub in ["status", "attach", "preflight", "refresh_cache"]:
+        result = subprocess.run(
+            ["bash", str(LAUNCH_DAEMON_SCRIPT), sub],
+            env=_legacy_env(proj),
+            capture_output=True, text=True, timeout=5,
+            cwd=str(proj),
+        )
+        assert result.returncode == 1, f"{sub}: expected exit 1, got {result.returncode}"
+        assert "no longer dispatched" in result.stderr, f"{sub}: missing hint"

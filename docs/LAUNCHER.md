@@ -210,30 +210,45 @@ content as long as it parses against `LaunchConfig.from_dict()`.
 
 ---
 
-## 5. Migrating from launch_daemon.sh
+## 5. When to use which
 
-| Old invocation                        | New invocation                                            |
+Two entry points coexist:
+
+- **`launch_daemon.sh paper` / `live` / `live dryrun`** — capture-
+  producing sessions. Spawns the L2 book scraper, writes
+  `daemon_state/scrapes/<session_id>/manifest.json`, runs tunnel
+  verify (live only), gates on stale daemon / scraper PID / disk
+  space. Runs `daemon_base_v1.py`. Use this for sweep input, R2.2-
+  style analysis, anything reconcile.py needs to bracket on
+  `session_window_ns`.
+- **`launch`** — interactive non-capture operator work. Runs
+  `polyhustle.cli` (the modular daemon). Faster startup; does NOT
+  spawn the scraper, write a manifest, or verify the tunnel. Use
+  this for preset re-launches, comparison mode, replay walk-throughs.
+
+The two paths produce different on-disk artefacts. The migration
+plan is at `docs/POLYHUSTLE_CLI_ROADMAP.md`: when polyhustle.cli
+absorbs scraper integration, manifest emission, and tunnel verify,
+`launch_daemon.sh` becomes a thin shim and one path remains.
+
+## 6. Migrating from launch_daemon.sh subcommands
+
+| Old invocation                        | What replaced it                                          |
 |---------------------------------------|-----------------------------------------------------------|
-| `./launch_daemon.sh`                  | `launch` (interactive) or `launch --preset _legacy_default` |
-| `./launch_daemon.sh paper`            | `launch --preset _legacy_default`                         |
-| `./launch_daemon.sh live`             | `launch --preset _legacy_live`                            |
-| `./launch_daemon.sh live dry`         | `launch --preset _legacy_dryrun`                          |
-| `./launch_daemon.sh status`           | (removed) read `daemon_state/scrapes/` manifests directly |
-| `./launch_daemon.sh attach`           | (removed) run the dashboard binary directly               |
-| `./launch_daemon.sh preflight`        | (removed) run `python scripts/onboard_check.py` directly  |
-| `./launch_daemon.sh refresh_cache`    | (removed) run `python scripts/refresh_v2_balance_cache.py` directly |
-
-The `_legacy_*` presets reproduce the JSON config that `polyhustle.cli`
-needs for the matching execution mode. They do **not** reproduce the
-full feature set the legacy script bundled (L2 book scraper, TUI
-dashboard, session manifest, kill-stale-daemon sweep, netns
-preflight). Those features are subsumed gradually as `polyhustle.cli`
-grows; until then, operators who need them must continue invoking
-the underlying scripts directly.
+| `./launch_daemon.sh`                  | Still works. Capture-producing paper-mode session.        |
+| `./launch_daemon.sh paper`            | Still works. Same as above.                               |
+| `./launch_daemon.sh live`             | Still works. Capture-producing live, with tunnel verify.  |
+| `./launch_daemon.sh live dry`         | Still works (or `live dryrun`). Live, signs orders, no POST. |
+| `./launch_daemon.sh status`           | (removed) read `daemon_state/scrapes/<session>/manifest.json` directly, or check the active session's `manifest.json` for `stop_ts_utc == null`. |
+| `./launch_daemon.sh attach`           | (removed) run the dashboard binary directly: `python tui/python/dashboard_legacy.py` (legacy rich.Layout) or `python tui/python/dashboard.py` (Textual). |
+| `./launch_daemon.sh preflight`        | (removed) run `python scripts/onboard_check.py` directly (inside the netns: `sudo ip netns exec polybot sudo -u samsam env HOME=/home/samsam python scripts/onboard_check.py`). |
+| `./launch_daemon.sh refresh_cache`    | (removed) run `python scripts/refresh_v2_balance_cache.py` directly (same netns wrapper as preflight). |
+| (no auto TUI)                         | Auto-spawn of a TUI dashboard was removed. Run one manually alongside the daemon if you want one attached. |
+| (no auto web GUI)                     | Auto-spawn of `scripts/live_dashboard.py` (port 3006) was removed. Run it manually if you want it. |
 
 ---
 
-## 6. Headless tests
+## 7. Headless tests
 
 The launcher honours two env vars for testability:
 
@@ -265,7 +280,7 @@ is on. Tests are at `tests/launcher/test_launch_menu.py`.
 
 ---
 
-## 7. Trap behaviour and SIGINT cleanup
+## 8. Trap behaviour and SIGINT cleanup
 
 - **Clean exit** (menu cancelled, daemon completed normally): the EXIT
   trap removes `/tmp/polyhustle-launch-<pid>.json`.
@@ -278,7 +293,7 @@ is on. Tests are at `tests/launcher/test_launch_menu.py`.
 
 ---
 
-## 8. Where the contract lives
+## 9. Where the contract lives
 
 | Concern                               | Source of truth                                |
 |---------------------------------------|------------------------------------------------|

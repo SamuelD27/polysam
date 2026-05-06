@@ -531,3 +531,41 @@ Format example::
 The summary lets the operator (and future readers) decide in 30
 seconds whether to read the technical body. Documents that miss this
 section get rejected at code review.
+
+---
+
+## 17. When to use `launch` vs `launch_daemon.sh`
+
+Two entry points coexist while polyhustle.cli grows the wrapper-layer
+features (scraper, manifest, tunnel verify) the legacy script provides.
+The bright-line rule:
+
+| You're doing                                     | Use                                  |
+|--------------------------------------------------|--------------------------------------|
+| Capture-producing session (R2.2-style analysis, sweep input, reconcile-comparable) | `./launch_daemon.sh paper` / `live` / `live dryrun` |
+| Interactive non-capture operator work (preset re-launch, comparison mode, replay walk-through) | `./launch` |
+
+The two paths produce different on-disk artefacts.
+`launch_daemon.sh` writes `daemon_state/scrapes/<session_id>/manifest.json`,
+spawns the L2 book scraper alongside the daemon, and (for live)
+verifies the polybot tunnel before launching. `launch` does none of
+that — it just shells `python -m polyhustle.cli --config <tmp>`.
+
+If your work depends on the manifest being on-disk afterward
+(replay menu, reconcile.py, sweep input), use `launch_daemon.sh`.
+If you don't need a manifest and want the menu's preset / comparison /
+replay UX, use `launch`.
+
+`launch_daemon.sh` runs `daemon_base_v1.py` (the legacy daemon) under
+the hood; `launch` runs `polyhustle.cli` (the modular daemon). When
+`docs/POLYHUSTLE_CLI_ROADMAP.md`'s three items land
+(scraper integration, manifest emission, tunnel verify),
+`launch_daemon.sh` becomes a thin shim over `launch --preset _legacy_*`
+and the path-consolidation completes.
+
+Removed in the 2026-05-06 cleanup pass:
+`launch_daemon.sh` no longer auto-spawns a TUI dashboard or the
+web GUI, and its `status` / `attach` / `preflight` / `refresh_cache`
+subcommands now print a "no longer dispatched here" message. The
+replacement workflow for each is in
+`docs/LAUNCHER.md` §"Migrating from launch_daemon.sh".
