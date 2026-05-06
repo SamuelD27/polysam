@@ -208,7 +208,7 @@ __marimo__/
 
 # Project-specific runtime artifacts
 daemon_state/
-data/
+/data/
 active_bots/plots/
 active_bots/backtest_*.csv
 daemon_state/KILL
