@@ -92,6 +92,13 @@ class ReplayDataProvider(DataProvider):
         self.markets: list[tuple[float, float, str, float]] = []
         # Per-slug RTDS price points: slug -> list[(ts, market_price_up)]
         self.rtds_by_slug: dict[str, list[tuple[float, float]]] = {}
+        # Pre-built ts-list caches for O(log n) bisect lookups without
+        # rebuilding the list on every call. Populated lazily on first
+        # access (or eagerly inside the relevant _load_* / _index_*).
+        self._btc_ts_list: list[float] = []
+        self._market_t_zeros: list[float] = []
+        self._rtds_ts_cache: dict[str, list[float]] = {}
+        self._books_ts_cache: dict[str, list[int]] = {}
         self._loaded = False
         self._stop = asyncio.Event()
 
@@ -116,10 +123,24 @@ class ReplayDataProvider(DataProvider):
         self.stop_ts_ns = int(self.manifest["stop_ts_ns"])
 
     def _load_book_feed(self) -> None:
-        """Read every book_feed/*.jsonl.gz and fold into per-slug records."""
+        """Read every book_feed/*.jsonl.gz and fold into per-slug records.
+
+        Performance: the book_feed dir is the scraper's CANONICAL
+        directory (rotated daily), so a 12-hour session-on-disk often
+        sits inside a 1.9 GB tree of files spanning many days. The
+        filename-window filter below short-circuits files whose 5-minute
+        market window does not overlap [launch_ts, stop_ts] — see
+        ``_slug_t_zero``. On the R2.2 capture this drops 3829 files to
+        ~290 (12h * 12 markets/h * yes+no factor). Without this filter
+        a naive load OOMs the box.
+        """
         bf = self.session_path / "book_feed"
         if not bf.exists():
             return
+        # Session window in epoch-seconds for filename-filter comparison.
+        t_lo_s = self.launch_ts_ns / 1e9
+        t_hi_s = self.stop_ts_ns / 1e9
+
         per_slug_yes: dict[str, list[tuple[int, dict]]] = {}
         per_slug_no: dict[str, list[tuple[int, dict]]] = {}
         for date_dir in sorted(bf.iterdir()):
@@ -129,6 +150,14 @@ class ReplayDataProvider(DataProvider):
                 if not f.name.endswith(".jsonl.gz"):
                     continue
                 slug = f.name[: -len(".jsonl.gz")]
+                # Filename-window filter: filename encodes the t_zero
+                # (e.g. btc-updown-5m-1777942500). Skip files whose
+                # 5-min window does not overlap the session window.
+                t_zero_s = self._slug_t_zero(slug)
+                if t_zero_s is not None:
+                    t_end_s = t_zero_s + 300.0
+                    if t_end_s < t_lo_s or t_zero_s > t_hi_s:
+                        continue
                 with gzip.open(f, "rt") as fh:
                     for line in fh:
                         try:
@@ -149,6 +178,22 @@ class ReplayDataProvider(DataProvider):
             self.books_by_slug[slug] = self._fold_into_market_books(
                 yes_records, no_records,
             )
+        # Pre-build ts caches so per-tick _books_at lookups don't
+        # rebuild the list each call (Step 3b in the perf-pass plan).
+        for slug, recs in self.books_by_slug.items():
+            self._books_ts_cache[slug] = [r.ts_ns for r in recs]
+
+    @staticmethod
+    def _slug_t_zero(slug: str) -> float | None:
+        """Parse the t_zero epoch seconds out of a slug like
+        ``btc-updown-5m-1777942500``. Returns None if unparseable."""
+        parts = slug.rsplit("-", 1)
+        if len(parts) != 2:
+            return None
+        try:
+            return float(parts[1])
+        except ValueError:
+            return None
 
     @staticmethod
     def _fold_into_market_books(
@@ -274,6 +319,9 @@ class ReplayDataProvider(DataProvider):
                 if self.btc_ticks:
                     break
         self.btc_ticks.sort(key=lambda x: x.ts)
+        # Pre-build the bisect ts list so _btc_at is O(log n) per call
+        # without rebuilding the list every tick.
+        self._btc_ts_list = [b.ts for b in self.btc_ticks]
 
     def _index_markets_and_rtds(self) -> None:
         """Build the (t_zero, t_end, slug, strike) sequence + per-slug RTDS."""
@@ -296,6 +344,13 @@ class ReplayDataProvider(DataProvider):
         self.markets.sort(key=lambda x: x[0])
         for slug in self.rtds_by_slug:
             self.rtds_by_slug[slug].sort(key=lambda x: x[0])
+        # Pre-build bisect caches so per-tick lookups don't rebuild
+        # parallel ts lists each call (Step 3b in the perf-pass plan).
+        self._market_t_zeros = [t for (t, _, _, _) in self.markets]
+        self._rtds_ts_cache = {
+            slug: [t for (t, _) in records]
+            for slug, records in self.rtds_by_slug.items()
+        }
 
     # Streaming
 
@@ -340,16 +395,26 @@ class ReplayDataProvider(DataProvider):
         )
 
     def _active_market(self, now: float) -> tuple[str | None, float, float]:
-        for t_zero, t_end, slug, strike in self.markets:
-            if t_zero <= now < t_end:
-                return slug, t_zero, strike
+        """Return the (slug, t_zero, strike) of the 5-min market that
+        covers ``now``, or (None, 0, 0) if none.
+
+        Uses a bisect over a cached list of t_zero values; markets are
+        non-overlapping 5-min windows so an O(log n) lookup is sound.
+        """
+        if not self.markets:
+            return None, 0.0, 0.0
+        i = bisect.bisect_right(self._market_t_zeros, now) - 1
+        if i < 0:
+            return None, 0.0, 0.0
+        t_zero, t_end, slug, strike = self.markets[i]
+        if t_zero <= now < t_end:
+            return slug, t_zero, strike
         return None, 0.0, 0.0
 
     def _btc_at(self, now: float) -> float | None:
         if not self.btc_ticks:
             return None
-        ts_list = [b.ts for b in self.btc_ticks]
-        i = bisect.bisect_right(ts_list, now) - 1
+        i = bisect.bisect_right(self._btc_ts_list, now) - 1
         if i < 0:
             return None
         return self.btc_ticks[i].btc_price
@@ -357,10 +422,12 @@ class ReplayDataProvider(DataProvider):
     def _market_price_at(
         self, slug: str, now: float,
     ) -> tuple[float | None, float | None]:
-        records = self.rtds_by_slug.get(slug, [])
+        records = self.rtds_by_slug.get(slug)
         if not records:
             return None, None
-        ts_list = [r[0] for r in records]
+        ts_list = self._rtds_ts_cache.get(slug)
+        if ts_list is None:
+            return None, None
         i = bisect.bisect_right(ts_list, now) - 1
         if i < 0:
             return None, None
@@ -370,7 +437,9 @@ class ReplayDataProvider(DataProvider):
         records = self.books_by_slug.get(slug)
         if not records:
             return None
-        ts_list = [r.ts_ns for r in records]
+        ts_list = self._books_ts_cache.get(slug)
+        if ts_list is None:
+            return None
         i = bisect.bisect_right(ts_list, ts_ns) - 1
         if i < 0:
             return None

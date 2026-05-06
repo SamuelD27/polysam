@@ -1,0 +1,8 @@
+{
+  "mode": "main",
+  "main_strategy": "walked_vwap",
+  "benchmarks": ["refined", "enhanced", "base"],
+  "execution_mode": "replay",
+  "replay_session": "/home/samsam/polymarket-hustle/daemon_state/scrapes/2026-05-05T12-50-04Z",
+  "params": {"max_trade_size_usdc": 5.0, "portfolio_size_usdc": 10}
+}

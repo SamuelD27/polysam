@@ -152,3 +152,54 @@ async def test_orchestrator_replay_mode_default_false():
     assert o.replay_mode is False
     await o.run()
     assert o.tick_count == 0
+
+
+@pytest.mark.slow
+def test_replay_r22_wall_clock_under_target(tmp_path):
+    """R2.2 capture replays in under the achieved-target wall clock.
+
+    Target is 60 s. Achieved on the GX10 box (2026-05-06) was ~32 s
+    end-to-end including process spin-up — see docs/REPLAY.md for the
+    full breakdown and the optimisations that got us there.
+
+    Skipped when the capture isn't on disk (worktrees that don't
+    symlink daemon_state through to the parent repo).
+    """
+    import asyncio
+    import os
+    import time
+    from pathlib import Path
+
+    from polyhustle.cli import LaunchConfig, run_async
+
+    capture = Path(
+        "/home/samsam/polymarket-hustle/daemon_state/scrapes/2026-05-05T12-50-04Z"
+    )
+    if not (capture / "manifest.json").exists():
+        pytest.skip("R2.2 capture not on disk")
+
+    # Replicate the CLI-time env override (compute_effective_max_risk
+    # respects PORTFOLIO_SIZE_USDC and skips the Polygon RPC dial).
+    os.environ.setdefault("PORTFOLIO_SIZE_USDC", "10")
+
+    cfg = LaunchConfig(
+        mode="main",
+        main_strategy="walked_vwap",
+        benchmarks=["refined", "enhanced", "base"],
+        execution_mode="replay",
+        replay_session=str(capture),
+        params={"max_trade_size_usdc": 5.0, "portfolio_size_usdc": 10},
+    )
+    t0 = time.time()
+    asyncio.run(run_async(cfg))
+    dt = time.time() - t0
+
+    # ACHIEVED_TARGET_S — see docs/REPLAY.md. Bump if the perf pass
+    # ever falls back to <60min; the assertion message points operators
+    # at the right place to investigate.
+    ACHIEVED_TARGET_S = 60.0
+    assert dt < ACHIEVED_TARGET_S, (
+        f"R2.2 replay took {dt:.1f}s; target {ACHIEVED_TARGET_S}s. "
+        f"If this regression is real, profile + adjust; if the target "
+        f"is loose, update both the assertion and docs/REPLAY.md."
+    )
