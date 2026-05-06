@@ -1,14 +1,219 @@
 #!/usr/bin/env bash
-# launch — user-facing entry point for the modular run.
+# launch — keyboard-driven launcher for the polyhustle daemon.
 #
-# This session's body is a thin shim that delegates to launch_daemon.sh
-# so the existing operator workflow keeps working unchanged. Session B
-# replaces the body with the menu-driven launcher described in the
-# refactor plan.
+# Walks the operator through TUI / mode / strategy / execution / param
+# choices, writes a JSON config that polyhustle.cli reads, then shells
+# out to `python -m polyhustle.cli --config <tmp>`.
 #
-# Forward all args verbatim. The user's `./launch_daemon.sh paper / live
-# / live dry / refresh_cache` invocations continue to work via this name.
+# Usage:
+#   launch                       # interactive menu
+#   launch --preset <name>       # skip menu, use saved preset
+#   launch --list-presets        # list saved presets and exit
+#   launch --help                # this help, then exit
+#
+# Prerequisites:
+#   - whiptail (default on Debian/Ubuntu/RHEL/Fedora) OR dialog.
+#     Install via `sudo apt install whiptail` if missing.
+#   - A Nerd Font in your terminal for the menu glyphs to render
+#     (https://www.nerdfonts.com/ — FiraCode Nerd Font is known to work).
+#     Without one the glyphs render as boxes; the menu still works.
+#
+# See docs/LAUNCHER.md for the full reference.
 
 set -euo pipefail
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-exec "${SCRIPT_DIR}/launch_daemon.sh" "$@"
+
+# ── Paths ────────────────────────────────────────────────────────────────
+# PROJECT_DIR / NS / POLY_DIR are exported once C4 wires up the launch
+# step; they're declared here to document the contract.
+# shellcheck disable=SC2034
+PROJECT_DIR="/home/samsam/polymarket-hustle"
+# shellcheck disable=SC2034
+NS="polybot"
+# shellcheck disable=SC2034
+POLY_DIR="/home/samsam/polymarket"
+PRESETS_DIR="$HOME/.polymarket-hustle/presets"
+TEMP_CONFIG="/tmp/polyhustle-launch-$$.json"
+# shellcheck disable=SC2034
+SHUTDOWN_TIMEOUT_S=5
+
+# ── TUI binary detection ─────────────────────────────────────────────────
+# whiptail is the default; fall back to dialog if available; bail out
+# loudly if neither is present. Both accept the same --menu / --checklist
+# / --inputbox / --yesno / --msgbox flag set, so the rest of the script
+# only ever calls "$TUI_CMD".
+# shellcheck disable=SC2034  # consumed by C2-C4 step_* functions
+TUI_CMD=""
+detect_tui_cmd() {
+    if command -v whiptail >/dev/null 2>&1; then
+        TUI_CMD="whiptail"
+    elif command -v dialog >/dev/null 2>&1; then
+        # shellcheck disable=SC2034
+        TUI_CMD="dialog"
+    else
+        cat >&2 <<'ERR'
+launch: neither whiptail nor dialog is installed.
+
+Install one of them:
+  Debian/Ubuntu:   sudo apt install whiptail
+  Fedora/RHEL:     sudo dnf install newt
+  Arch:            sudo pacman -S libnewt
+  (or `dialog` from the same package managers)
+
+Without a TUI binary the launcher cannot present its menus.
+ERR
+        exit 2
+    fi
+}
+
+# ── Preset directory bootstrap ───────────────────────────────────────────
+ensure_presets_dir() {
+    mkdir -p "$PRESETS_DIR"
+}
+
+print_help() {
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+list_presets() {
+    ensure_presets_dir
+    local count=0
+    for f in "$PRESETS_DIR"/*.json; do
+        [[ -e "$f" ]] || continue
+        local name
+        name=$(basename "$f" .json)
+        echo "$name"
+        count=$((count + 1))
+    done
+    if [[ "$count" -eq 0 ]]; then
+        echo "(no presets — run \`launch\` interactively and save one)"
+    fi
+}
+
+# ── Forward-declare the menu functions C2-C4 will fill in ────────────────
+# Each step writes into the global $CONFIG_* variables; write_config_json()
+# assembles them into the JSON written to "$TEMP_CONFIG".
+#
+# These globals are initialised here to document the contract; C2-C4
+# read and write them. shellcheck SC2034 (apparently-unused) is suppressed
+# because the use sites land in subsequent commits in this branch.
+
+# shellcheck disable=SC2034
+CONFIG_MODE=""
+# shellcheck disable=SC2034
+CONFIG_TUI_LAYOUT=""
+# shellcheck disable=SC2034
+CONFIG_MAIN_STRATEGY=""
+# shellcheck disable=SC2034
+CONFIG_BENCHMARKS=()
+# shellcheck disable=SC2034
+CONFIG_COMPARISON_STRATEGIES=()
+# shellcheck disable=SC2034
+CONFIG_EXECUTION_MODE=""
+# shellcheck disable=SC2034
+CONFIG_REPLAY_SESSION=""
+# shellcheck disable=SC2034
+declare -A CONFIG_PARAMS=()
+
+step1_tui_layout()      { :; }  # filled in C2
+step2_run_mode()        { :; }  # filled in C2
+step3_strategies()      { :; }  # filled in C2
+step4_execution_mode()  { :; }  # filled in C3
+step5_optional_params() { :; }  # filled in C3
+step6_save_preset()     { :; }  # filled in C4
+step7_confirm()         { :; }  # filled in C4
+step8_launch()          { :; }  # filled in C4
+
+write_config_json() {
+    # Assemble the global CONFIG_* state into "$TEMP_CONFIG".
+    # Filled in C4 — body here is a placeholder until the menu is wired.
+    : > "$TEMP_CONFIG"
+}
+
+load_preset() {
+    # Copy "$PRESETS_DIR/<name>.json" → "$TEMP_CONFIG" verbatim.
+    # Used by `launch --preset <name>` to skip the menu.
+    local name="$1"
+    local src="$PRESETS_DIR/$name.json"
+    if [[ ! -f "$src" ]]; then
+        echo "launch: preset '$name' not found at $src" >&2
+        echo "launch: run \`launch --list-presets\` to see saved presets." >&2
+        exit 3
+    fi
+    cp "$src" "$TEMP_CONFIG"
+}
+
+# ── Cleanup: SIGINT / SIGTERM / EXIT ─────────────────────────────────────
+DAEMON_PID=""
+CLEANUP_DONE=0
+cleanup() {
+    if [[ "$CLEANUP_DONE" == "1" ]]; then
+        return 0
+    fi
+    CLEANUP_DONE=1
+    if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "[launch] stopping daemon pid=$DAEMON_PID"
+        kill -TERM "$DAEMON_PID" 2>/dev/null || true
+        local waited=0
+        while kill -0 "$DAEMON_PID" 2>/dev/null && [[ "$waited" -lt "$SHUTDOWN_TIMEOUT_S" ]]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "[launch] daemon did not exit in ${SHUTDOWN_TIMEOUT_S}s; SIGKILL"
+            kill -KILL "$DAEMON_PID" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$TEMP_CONFIG"
+}
+trap cleanup EXIT HUP INT TERM
+
+# ── Arg parsing ──────────────────────────────────────────────────────────
+PRESET_NAME=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            print_help
+            exit 0
+            ;;
+        --list-presets)
+            list_presets
+            exit 0
+            ;;
+        --preset)
+            PRESET_NAME="${2:-}"
+            if [[ -z "$PRESET_NAME" ]]; then
+                echo "launch: --preset requires a name" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        --preset=*)
+            PRESET_NAME="${1#--preset=}"
+            shift
+            ;;
+        *)
+            echo "launch: unknown argument '$1'" >&2
+            echo "launch: try \`launch --help\`" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# ── Main ─────────────────────────────────────────────────────────────────
+ensure_presets_dir
+
+if [[ -n "$PRESET_NAME" ]]; then
+    load_preset "$PRESET_NAME"
+else
+    detect_tui_cmd
+    step1_tui_layout
+    step2_run_mode
+    step3_strategies
+    step4_execution_mode
+    step5_optional_params
+    step6_save_preset
+    step7_confirm
+    write_config_json
+fi
+
+step8_launch
