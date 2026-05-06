@@ -42,6 +42,7 @@ menu still works.
 | Run a single test file        | `pytest tests/strategy/test_walked_vwap.py -v`                           |
 | Lint check                    | `ruff check active_bots/ tests/ scripts/ daemon_base_v1.py`              |
 | Format                        | `ruff format active_bots/ tests/`                                        |
+| Run replay against a capture | `python -m polyhustle.cli --config <replay_config.json>` (see `docs/REPLAY.md`) |
 | Status / stop / log           | `./daemon_base_v1 status`, `./daemon_base_v1 stop`, `./daemon_base_v1 log` |
 
 Saved presets live at `~/.polymarket-hustle/presets/<name>.json`. The
@@ -198,6 +199,8 @@ wins and STRATEGY.md must follow.
 | `PORTFOLIO_SIZE_USDC`         | (auto-detect)          | `daemon_base_v1.py:238`              | Override portfolio total for size scaling     |
 | `MAX_BET_PCT`                 | (default in code)      | `daemon_base_v1.py:238`              | Max % of portfolio per bet                    |
 | `POLYGON_RPC_URL`             | https://polygon-rpc.com| `scripts/check_v2_allowances.py:59`  | Polygon JSON-RPC for allowance checks         |
+| `LATENCY_MULTIPLIER`          | 1.0                    | `polyhustle/execution/latency.py:34` | Scales every `LatencyModel.sample_one_way_ms` call at run time. Per spec §3.3, fixed-seed + multiplier sweep is the right knob to tune; `LATENCY_MULTIPLIER=2.0` doubles every sampled latency. Garbage values warn and fall back to 1.0; negatives raise. |
+| `PAPER_TRADER_FEE_CATEGORY`   | crypto (or `WALKED_VWAP_FEE_CATEGORY`) | `polyhustle/execution/paper_trader.py:82` | Fee bucket for the realistic paper-fill simulator (`crypto` / `finance` / `geopolitics`). Mirrors the walked-VWAP fee-category env. |
 
 When you add a new knob, update **all three** of: (a) the source-file
 docstring/constant block, (b) this table, (c) `STRATEGY.md §5` (strategy

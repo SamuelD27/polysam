@@ -555,6 +555,18 @@ current shape.
   file; would require either pre-cross pricing or multi-snapshot
   smoothing.
 
+  **Partially addressed (May 2026):** the new
+  `polyhustle/execution/latency.py` `LatencyModel` hierarchy
+  (`Zero` / `Fixed` / `Gaussian` / `Empirical`) is wired into
+  `PaperTrader` so the paper fill simulator stamps a sampled latency
+  on every fill (`fill_details.paper_latency_ms`). In v1 the sampled
+  value is recorded for downstream attribution but does not
+  time-shift the book lookup itself; that follow-up requires
+  extending the `MarketTick` / `DataProvider` contract with a
+  `books_at(t)` callable. The `LATENCY_MULTIPLIER` env var sweeps
+  the model at run time. See `docs/REPLAY.md` for the operator
+  guide.
+
 ---
 
 ## 7. Tags
