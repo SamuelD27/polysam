@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# launch — user-facing entry point for the modular run.
+#
+# This session's body is a thin shim that delegates to launch_daemon.sh
+# so the existing operator workflow keeps working unchanged. Session B
+# replaces the body with the menu-driven launcher described in the
+# refactor plan.
+#
+# Forward all args verbatim. The user's `./launch_daemon.sh paper / live
+# / live dry / refresh_cache` invocations continue to work via this name.
+
+set -euo pipefail
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+exec "${SCRIPT_DIR}/launch_daemon.sh" "$@"
