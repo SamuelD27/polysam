@@ -169,6 +169,7 @@ class Orchestrator:
         events: EventLogger,
         *,
         ctx_factory: MarketCtxFactory = default_market_ctx_factory,
+        replay_mode: bool = False,
     ) -> None:
         self._data = data_provider
         self._assignments = list(assignments)
@@ -182,6 +183,16 @@ class Orchestrator:
         # divergent class produces exactly one WARNING per Orchestrator
         # instance, not one per tick.
         self._signature_fallback_warned: set[tuple[type, str]] = set()
+        # Replay-mode flag — exposed for the CLI's discoverability so it
+        # knows whether to write replay_summary.json after run() returns.
+        # The orchestrator itself does not branch on this flag; the
+        # behaviour difference is delegated to the events object (an
+        # InMemoryEventLogger when replay_mode=True).
+        self.replay_mode = replay_mode
+        # tick_count exposed for both CLI summary output and Task 7's
+        # perf assertion (R2.2 < 60s). Incremented unconditionally at
+        # the top of _on_tick.
+        self.tick_count: int = 0
 
     @property
     def assignments(self) -> list[StrategyAssignment]:
@@ -212,6 +223,7 @@ class Orchestrator:
 
     def _on_tick(self, tick: MarketTick) -> None:
         """Process one tick: detect rollover, run each assignment."""
+        self.tick_count += 1
         ctx = self._ctx_factory(tick)
         if ctx is None:
             return

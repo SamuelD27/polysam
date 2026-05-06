@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,10 @@ from typing import Any
 from polyhustle.data.live import LiveDataProvider
 from polyhustle.data.paper import PaperDataProvider
 from polyhustle.data.replay import ReplayDataProvider
+from polyhustle.data.replay_summary import (
+    InMemoryEventLogger,
+    aggregate_summary,
+)
 from polyhustle.execution.dryrun_trader import DryrunTrader
 from polyhustle.execution.paper_trader import PaperTrader
 from polyhustle.orchestrator import Orchestrator, StrategyAssignment
@@ -111,6 +116,9 @@ def _build_trader(execution_mode: str):
     we don't duplicate the credential / VPN / autodetect logic.
     """
     if execution_mode == "paper":
+        return PaperTrader()
+    if execution_mode == "replay":
+        # Replay always uses paper fills — there's nothing to post against.
         return PaperTrader()
     if execution_mode == "live_dryrun":
         return DryrunTrader()
@@ -224,7 +232,14 @@ async def run_async(cfg: LaunchConfig) -> int:
 
     _daemon.setup_logging()
     _daemon.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    events = EventLogger(_daemon.EVENTS_FILE)
+
+    is_replay = cfg.execution_mode == "replay"
+    events: Any
+    if is_replay:
+        events = InMemoryEventLogger()
+    else:
+        events = EventLogger(_daemon.EVENTS_FILE)
+
     effective_max, source = _daemon.compute_effective_max_risk()
     risk_cfg = _daemon.RiskConfig(
         max_daily_loss_usdc=float(cfg.params.get("max_daily_loss_usdc", 300.0)),
@@ -249,12 +264,30 @@ async def run_async(cfg: LaunchConfig) -> int:
         assignments=assignments,
         risk=risk,
         events=events,
+        replay_mode=is_replay,
     )
 
+    t0 = time.time()
     try:
         await orch.run()
     finally:
         events.close()
+    runtime = time.time() - t0
+
+    if is_replay:
+        summary = aggregate_summary(events.events)
+        summary["runtime_seconds"] = round(runtime, 3)
+        summary["tick_count"] = orch.tick_count
+        if isinstance(provider, ReplayDataProvider):
+            summary["session_id"] = provider.session_id
+        out_path = (
+            Path(cfg.replay_session) / "replay_summary.json"
+            if cfg.replay_session and Path(cfg.replay_session).is_dir()
+            else Path("replay_summary.json")
+        )
+        out_path.write_text(json.dumps(summary, indent=2))
+        logger.info("Replay summary written to %s", out_path)
+
     return 0
 
 
