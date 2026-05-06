@@ -167,3 +167,17 @@ def test_paper_trader_exit_sl_with_position():
     )
     assert res.action == ACTION_EXIT_SL
     assert res.exit_ is not None
+
+
+def test_trader_execute_accepts_books_kwarg():
+    """Trader.execute must accept a `books` kwarg even when ignored."""
+    from active_bots.execution.live_book_state import MarketBooks
+    from active_bots.execution.paper_executor import PaperExecutor
+    from polyhustle.execution._executor_trader import _ExecutorTrader
+
+    trader = _ExecutorTrader(PaperExecutor())
+    ctx = MarketCtx(slug="x", t_zero=1, strike=100.0)
+    decision = Decision(action="UNKNOWN")  # no-op, just verifying signature
+    # Should not raise; books is ignored by _ExecutorTrader.
+    result = trader.execute(decision, ctx, books=MarketBooks(yes=None, no=None))
+    assert result.rejected is True  # unknown_action path

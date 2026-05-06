@@ -298,6 +298,7 @@ class Orchestrator:
             btc_price=tick.btc_price,
             now=tick.timestamp,
             source=action.get("source", "edge"),
+            books=tick.books,
         )
 
         ev = assignment.event_names
@@ -348,6 +349,7 @@ class Orchestrator:
                     position=assignment.position,
                     btc_price=tick.btc_price,
                     now=tick.timestamp,
+                    books=None,
                 )
                 if result.exit_ is not None:
                     trade = result.exit_.to_trade_dict()

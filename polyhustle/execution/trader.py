@@ -144,6 +144,7 @@ class Trader(ABC):
         now: float | None = None,
         btc_price: float | None = None,
         source: str = "edge",
+        books: Any = None,
     ) -> ExecutionResult:
         """Translate a Decision into an order or settlement.
 
@@ -157,6 +158,12 @@ class Trader(ABC):
             btc_price: spot needed for ``EXIT_*`` / ``RESOLVE`` PnL math.
             source: provenance label forwarded into the executor's
                 ``enter`` (``"edge"`` / ``"squeeze"`` / ``"base"``).
+            books: per-market book snapshot at decision time
+                (``active_bots.execution.live_book_state.MarketBooks``).
+                Consumed by ``PaperTrader`` for the realistic walked-VWAP
+                fill simulator; ignored by ``LiveTrader`` /
+                ``DryrunTrader`` / ``_ExecutorTrader`` (the executor sees
+                the live CLOB book directly).
         """
 
     @abstractmethod

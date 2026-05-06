@@ -47,6 +47,7 @@ class _ExecutorTrader(Trader):
         now: float | None = None,
         btc_price: float | None = None,
         source: str = "edge",
+        books: Any = None,  # noqa: ARG002 — ignored; PaperTrader override consumes it
     ) -> ExecutionResult:
         """Dispatch one decision to the underlying executor.
 

@@ -83,13 +83,16 @@ class FakeStrategy(Strategy):
 @dataclass
 class FakeTrader(Trader):
     mode: str = "paper"
-    calls: list[tuple[Decision, MarketCtx]] = field(default_factory=list)
+    calls: list[tuple[Decision, MarketCtx, dict]] = field(default_factory=list)
     next_results: list[ExecutionResult] = field(default_factory=list)
     reconcile_calls: int = 0
 
     def execute(self, decision, ctx, *, position=None, now=None,
-                btc_price=None, source="edge"):
-        self.calls.append((decision, ctx))
+                btc_price=None, source="edge", books=None):
+        self.calls.append((decision, ctx, {
+            "position": position, "now": now, "btc_price": btc_price,
+            "source": source, "books": books,
+        }))
         if self.next_results:
             return self.next_results.pop(0)
         return ExecutionResult(action=decision.action)
@@ -382,6 +385,43 @@ async def test_signature_fallback_dedup_per_class_not_per_instance(caplog):
     ]
     # Two assignments × two ticks = 4 fallback firings; dedup → 1 warning.
     assert len(fallback_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_passes_books_to_trader():
+    """Orchestrator forwards tick.books into trader.execute on entry actions."""
+    from active_bots.execution.live_book_state import LiveBookState, MarketBooks
+
+    s = FakeStrategy(actions=[_enter_action()])
+    t = FakeTrader(next_results=[ExecutionResult(action=ACTION_ENTER, entry=_entry_result())])
+    a = StrategyAssignment(name="walked_vwap", strategy=s, trader=t, role="trader")
+
+    yes = LiveBookState(tick_size=0.01, bids=[(0.42, 100.0)], asks=[(0.43, 100.0)],
+                       ts_ms=int(time.time() * 1000), has_baseline=True)
+    books = MarketBooks(yes=yes, no=None)
+
+    tick = MarketTick(
+        timestamp=time.time(),
+        btc_price=110_000.0,
+        market_price_up=0.42,
+        sigma=0.55,
+        t_zero=1_777_985_400.0,
+        strike=110_000.0,
+        slug="btc-updown-5m-1777985400",
+        books=books,
+        market_price_ts=time.time(),
+    )
+
+    o = Orchestrator(
+        data_provider=FakeDataProvider([tick]),
+        assignments=[a],
+        risk=FakeRisk(),
+        events=FakeEventLogger(),
+    )
+    await o.run()
+
+    assert len(t.calls) == 1
+    assert t.calls[0][2]["books"] is books
 
 
 @pytest.mark.asyncio
