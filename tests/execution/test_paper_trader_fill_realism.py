@@ -255,3 +255,74 @@ def test_passthrough_with_gate_passed_flag_alone():
                         now=time.time(), books=_books())
     assert result.entry is not None
     assert result.entry.entry_price == pytest.approx(0.43)
+
+
+@pytest.mark.slow
+def test_paper_trader_reproduces_r22_attribution_within_10pct():
+    """Re-derive the captured R2.2 fill-realism tax from events.jsonl
+    and confirm it matches reports/r2.2_walked_vwap_loss_attribution.md
+    within 10 %.
+
+    This is a unit-level shape check on the captured walked_vwap
+    entries — NOT a replay through the orchestrator. The end-to-end
+    replay-mode reproduction lands in tests/orchestrator/test_replay_mode.py
+    after Task 6 (replay mode).
+
+    Skipped when the R2.2 capture and events.jsonl are not on disk.
+    """
+    import json
+    from pathlib import Path
+
+    capture = Path(
+        "daemon_state/scrapes/2026-05-05T12-50-04Z/manifest.json"
+    )
+    if not capture.exists():
+        pytest.skip("R2.2 capture not on disk")
+
+    manifest = json.loads(capture.read_text())
+    t_start = manifest["launch_ts_ns"] / 1e9
+    t_end = manifest["stop_ts_ns"] / 1e9
+
+    events = Path("daemon_state/events.jsonl")
+    if not events.exists():
+        pytest.skip("events.jsonl not on disk")
+
+    captured = []
+    with events.open() as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = row.get("ts")
+            if ts is None or not (t_start <= ts <= t_end):
+                continue
+            if row.get("type") != "entry_filled":
+                continue
+            if row.get("strategy") != "walked_vwap":
+                continue
+            pos = row.get("position") or {}
+            mid = pos.get("entry_price_mid")
+            walked_eff = pos.get("entry_price")
+            shares = pos.get("size_shares")
+            if mid is None or walked_eff is None or shares is None:
+                continue
+            captured.append({
+                "mid": mid, "walked_eff": walked_eff, "shares": shares,
+            })
+
+    if len(captured) < 30:
+        pytest.skip(f"only {len(captured)} captured entries — need >=30 for ratio")
+
+    # Per-trade fill tax = (walked_eff − mid) × shares (positive on a BUY
+    # since walked_eff >= mid). The captured aggregate matches the
+    # $63.82 figure in reports/r2.2_walked_vwap_loss_attribution.md.
+    fill_tax = sum(
+        (c["walked_eff"] - c["mid"]) * c["shares"] for c in captured
+    )
+    expected_tax = 63.82
+    rel_err = abs(fill_tax - expected_tax) / expected_tax
+    assert rel_err < 0.10, (
+        f"R2.2 fill-realism tax reproduction off by {rel_err:.1%}: "
+        f"got ${fill_tax:.2f}, expected ${expected_tax:.2f}"
+    )
