@@ -209,8 +209,7 @@ __marimo__/
 # Project-specific runtime artifacts
 daemon_state/
 /data/
-active_bots/plots/
-active_bots/backtest_*.csv
+outputs/legacy_backtest/
 daemon_state/KILL
 experiments/_baseline/
 experiments/champion/
