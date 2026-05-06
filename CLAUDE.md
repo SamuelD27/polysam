@@ -24,16 +24,30 @@ operational knobs.
 
 All commands assume `conda activate polymarket-env` (Python 3.11.14).
 
+**Prerequisites for the launcher:** `whiptail` (default on
+Debian/Ubuntu/RHEL/Fedora; `sudo apt install whiptail` if missing) **or**
+`dialog`. A [Nerd Font](https://www.nerdfonts.com/) in the terminal
+makes the menu glyphs render — without one they show as boxes; the
+menu still works.
+
 | Goal                          | Command                                                                  |
 |-------------------------------|--------------------------------------------------------------------------|
-| Run paper daemon              | `./launch_daemon.sh paper`                                               |
-| Run live daemon (real money)  | `./launch_daemon.sh live`                                                |
-| Run live daemon — dry-run mode| `./launch_daemon.sh live dry`  (orders never POST; events still emit)    |
+| Interactive launch            | `./launch`                                                               |
+| Re-launch a saved preset      | `./launch --preset <name>`                                               |
+| List saved presets            | `./launch --list-presets`                                                |
+| Legacy paper daemon (cron)    | `./launch_daemon.sh paper` *(deprecated → forwards to `launch --preset _legacy_default`)* |
+| Legacy live daemon (cron)     | `./launch_daemon.sh live` *(deprecated → `launch --preset _legacy_live`)* |
+| Legacy live daemon — dry-run  | `./launch_daemon.sh live dry` *(deprecated → `launch --preset _legacy_dryrun`)* |
 | Run primary test suite        | `pytest tests/ active_bots/tests/`                                       |
 | Run a single test file        | `pytest tests/strategy/test_walked_vwap.py -v`                           |
 | Lint check                    | `ruff check active_bots/ tests/ scripts/ daemon_base_v1.py`              |
 | Format                        | `ruff format active_bots/ tests/`                                        |
 | Status / stop / log           | `./daemon_base_v1 status`, `./daemon_base_v1 stop`, `./daemon_base_v1 log` |
+
+Saved presets live at `~/.polymarket-hustle/presets/<name>.json`. The
+`_legacy_*` names are managed by the deprecation shim — write your own
+preset under a different name. Full menu walkthrough and migration
+table: `docs/LAUNCHER.md`.
 
 Observer-only mode (any non-walked strategy) happens automatically: when
 the daemon launches, only the strategy with `role="trader"` posts orders.
@@ -56,7 +70,8 @@ polymarket-hustle/
 │   └── tests/               — strategy-internal tests (max_risk, shutdown_timeout)
 ├── daemon_base_v1.py        — 1958-line headless daemon; orchestrates 4 strategies + 2 executors
 ├── daemon_base_v1           — bash control script (status / start / stop / log)
-├── launch_daemon.sh         — production launcher (paper/live, scraper, TUI bring-up)
+├── launch                   — keyboard-driven menu launcher (whiptail/dialog → polyhustle.cli)
+├── launch_daemon.sh         — DEPRECATED shim → forwards to `launch --preset _legacy_*` for cron compat
 ├── tests/                   — primary test suite: strategy / execution / daemon / scripts
 ├── scripts/                 — operational tools: consolidate_data, csv_to_parquet, onboard_check, etc.
 ├── scrap/                   — six-stage modular historical scraper (markets / spot / trades / books / …)
@@ -430,8 +445,13 @@ polyhustle/
 └── cli.py                 # `python -m polyhustle.cli --config <json>` entry point
 ```
 
-Top-level `launch` script is the user-facing entry point. Today it
-shells to `launch_daemon.sh`; Session B replaces it with a menu.
+Top-level `launch` script is the user-facing entry point. As of session B
+(2026-05-06) it is a keyboard-driven menu launcher (whiptail/dialog) that
+writes a JSON config consumed by `polyhustle.cli`. Saved presets live at
+`~/.polymarket-hustle/presets/`. The previous `./launch_daemon.sh` is now
+a deprecation shim that auto-installs `_legacy_*` presets and forwards to
+`launch --preset _legacy_<mode>` for cron-script compatibility. Full
+reference: `docs/LAUNCHER.md`.
 
 The legacy `daemon_base_v1.py` continues to work unchanged — it is
 the import target for `polyhustle/data/live.py` and
