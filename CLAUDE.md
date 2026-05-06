@@ -252,11 +252,21 @@ windows, force-exit at T-30s.
 
 ## 9. Testing posture
 
-Primary suite: `pytest tests/ active_bots/tests/`. 212 tests collected;
-211 pass; 1 pre-existing fragile test
-(`tests/execution/test_latency.py::test_fit_raises_not_fitted_on_real_events`)
-depends on local `daemon_state/events.jsonl` content and is unrelated to
-strategy logic.
+Primary suite: `pytest tests/ active_bots/tests/`. **272 tests
+collected on `refactor/modular-architecture`** (271 pass; 1 pre-existing
+fragile test
+`tests/execution/test_latency.py::test_fit_raises_not_fitted_on_real_events`
+that depends on local `daemon_state/events.jsonl` content and is
+unrelated to strategy logic). The 39-test increase from the historical
+233 baseline (Sam-Dev pre-refactor) covers
+`tests/data/`, `tests/orchestrator/`, the Strategy + Trader ABC suites,
+and the on_tick signature-fallback warn-once behaviour added by the
+refactor.
+
+The unmerged feature branches `feat/quant-flags-phase5` and
+`feat/quant-flags-phase5b` carry their own additional tests (Phase 5
+parity + sizing-cap coverage) — those land in the suite when those
+branches merge into Sam-Dev.
 
 Test layout:
 

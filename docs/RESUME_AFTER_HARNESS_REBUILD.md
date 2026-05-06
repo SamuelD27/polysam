@@ -85,6 +85,14 @@ Waits on the sweep producing numbers. Its job is to flip env defaults to "on" in
 
 One-paragraph spec lives in `reports/r2.2_sweep_design.md` §4. The R2.2 capture is genuinely later than `MASTER_REPORT`'s training window; if the whale identity list is frozen as of MASTER_REPORT's date, R2.2 IS a held-out test set. Acceptance criterion: OOS Sharpe ≥ 2.0 on the unchanged top-100 × thr=1000 × t=240s gate. **Analysis only — no code changes on this branch.** It's a strict prerequisite to any code implementing E01.
 
+### 1.6 `feat/dryrun-true-sign` — NOT opened
+
+Follow-up to the modular-architecture refactor. `polyhustle.execution.dryrun_trader.DryrunTrader` (added in 2026-05-06's `refactor/modular-architecture` branch) emits a runtime `RuntimeWarning` at `__init__` flagging that it produces live-shape fills *without actually signing*. Today's `DryRunExecutor` and `LiveExecutor.dry_run=True` both short-circuit before py-clob-client's `create_and_post_market_order`, so the signing pathway is not exercised in any current code path.
+
+The follow-up branch's job is to add a separable sign-without-post call path so DryrunTrader actually exercises the signing code (catching credential / EIP-712 / order-encoding regressions before they hit a live POST). It needs **explicit protected-file authorisation** to edit `active_bots/execution/live_executor.py` because the cleanest implementation reuses the existing `_post_market_order` plumbing with a flag that returns the signed args without calling `create_and_post_market_order`.
+
+Until that branch lands, the runtime warning is the operator-visible signal that DryrunTrader is paper-fills-with-live-metadata, not a true sign-test.
+
 ---
 
 ## 2. The R2.2 capture
