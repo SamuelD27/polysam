@@ -112,5 +112,7 @@ def test_market_tick_is_frozen():
         books=None,
         market_price_ts=0.0,
     )
-    with pytest.raises(Exception):  # FrozenInstanceError
+    from dataclasses import FrozenInstanceError
+
+    with pytest.raises(FrozenInstanceError):
         tick.btc_price = 2.0  # type: ignore[misc]
