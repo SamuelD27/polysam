@@ -89,23 +89,14 @@ list_presets() {
     fi
 }
 
-# ── Forward-declare the menu functions C2-C4 will fill in ────────────────
-# Each step writes into the global $CONFIG_* variables; write_config_json()
-# assembles them into the JSON written to "$TEMP_CONFIG".
-#
-# These globals are initialised here to document the contract; C2-C4
-# read and write them. shellcheck SC2034 (apparently-unused) is suppressed
-# because the use sites land in subsequent commits in this branch.
+# ── Config state ─────────────────────────────────────────────────────────
+# Each step writes into these globals; write_config_json() assembles
+# them into the JSON written to "$TEMP_CONFIG".
 
-# shellcheck disable=SC2034
 CONFIG_MODE=""
-# shellcheck disable=SC2034
 CONFIG_TUI_LAYOUT=""
-# shellcheck disable=SC2034
 CONFIG_MAIN_STRATEGY=""
-# shellcheck disable=SC2034
 CONFIG_BENCHMARKS=()
-# shellcheck disable=SC2034
 CONFIG_COMPARISON_STRATEGIES=()
 # shellcheck disable=SC2034
 CONFIG_EXECUTION_MODE=""
@@ -114,19 +105,385 @@ CONFIG_REPLAY_SESSION=""
 # shellcheck disable=SC2034
 declare -A CONFIG_PARAMS=()
 
-step1_tui_layout()      { :; }  # filled in C2
-step2_run_mode()        { :; }  # filled in C2
-step3_strategies()      { :; }  # filled in C2
-step4_execution_mode()  { :; }  # filled in C3
-step5_optional_params() { :; }  # filled in C3
-step6_save_preset()     { :; }  # filled in C4
-step7_confirm()         { :; }  # filled in C4
-step8_launch()          { :; }  # filled in C4
+# ── TUI helpers ──────────────────────────────────────────────────────────
+# whiptail and dialog write the user's selection to stderr by default and
+# the exit code tells us OK / Cancel / Esc. The fd-juggle (3>&1 1>&2 2>&3)
+# is the canonical pattern for capturing it on stdout via $(...).
+#
+# Exit codes for the wrapped binaries:
+#   0   — OK / Yes
+#   1   — Cancel / No
+#   255 — Esc
+# tui_* helpers preserve those. Step functions translate them into
+# 0=forward / 1=back / 2=cancel-launch as documented in run_menu_flow().
+#
+# POLYHUSTLE_LAUNCH_TEST_MODE=1 short-circuits every helper. whiptail
+# can't read --menu selections from stdin (unlike dialog's --input-fd),
+# so for headless tests we read from LAUNCH_TEST_* env vars. The literal
+# selection mechanism is a tooling detail; what matters is the launcher
+# producing the same JSON whether driven by a human or a test rig.
+
+tui_test_mode() {
+    [[ "${POLYHUSTLE_LAUNCH_TEST_MODE:-0}" == "1" ]]
+}
+
+tui_menu() {
+    # Args: title prompt height width list-height tag1 item1 [tag2 item2 …]
+    local title="$1" prompt="$2" h="$3" w="$4" lh="$5"
+    shift 5
+    "$TUI_CMD" --title "$title" --menu "$prompt" "$h" "$w" "$lh" "$@" 3>&1 1>&2 2>&3 3>&-
+}
+
+tui_checklist() {
+    # Args: title prompt height width list-height tag1 item1 status1 [...]
+    # --separate-output makes selections newline-separated (one tag per line)
+    # rather than the default space-separated quoted form, which is much
+    # easier to parse.
+    local title="$1" prompt="$2" h="$3" w="$4" lh="$5"
+    shift 5
+    "$TUI_CMD" --title "$title" --separate-output \
+        --checklist "$prompt" "$h" "$w" "$lh" "$@" 3>&1 1>&2 2>&3 3>&-
+}
+
+tui_inputbox() {
+    # Args: title prompt height width [default]
+    local title="$1" prompt="$2" h="$3" w="$4" default="${5:-}"
+    "$TUI_CMD" --title "$title" --inputbox "$prompt" "$h" "$w" "$default" \
+        3>&1 1>&2 2>&3 3>&-
+}
+
+tui_yesno() {
+    # Args: title prompt height width
+    local title="$1" prompt="$2" h="$3" w="$4"
+    "$TUI_CMD" --title "$title" --yesno "$prompt" "$h" "$w"
+}
+
+tui_msgbox() {
+    # Args: title message height width
+    local title="$1" message="$2" h="$3" w="$4"
+    "$TUI_CMD" --title "$title" --msgbox "$message" "$h" "$w"
+}
+
+# ── Step functions ───────────────────────────────────────────────────────
+# Convention:
+#   return 0 → forward to next step
+#   return 1 → back-up to previous step (Esc)
+#   return 2 → cancel launch entirely (Cancel button or test-mode requested)
+# Step 1's "back" exits the launcher (run_menu_flow handles this).
+
+step1_tui_layout() {
+    if tui_test_mode; then
+        CONFIG_TUI_LAYOUT="${LAUNCH_TEST_TUI_LAYOUT:-textual}"
+        if [[ "$CONFIG_TUI_LAYOUT" == "ratatui" ]]; then
+            CONFIG_TUI_LAYOUT="textual"  # silently fall back, same as interactive
+        fi
+        return 0
+    fi
+    local choice rc
+    set +e
+    choice=$(tui_menu \
+        "TUI layout" \
+        "Pick the dashboard implementation. Esc to go back, Ctrl-C to exit." \
+        15 70 3 \
+        "textual"  "  Python Textual dashboard (current default)" \
+        "ratatui"  "  Rust ratatui  [DEV]  not verified vs live daemon")
+    rc=$?
+    set -e
+    case "$rc" in
+        0)  ;;
+        1)  return 2 ;;   # Cancel
+        *)  return 1 ;;   # Esc
+    esac
+    if [[ "$choice" == "ratatui" ]]; then
+        tui_msgbox "ratatui [DEV]" \
+"The Rust ratatui dashboard is in development and not verified
+against the live daemon. Falling back to Python Textual.
+
+(To select Rust ratatui in production, build it under tui/ and
+flip the switch in launch_daemon.sh's pick_dashboard_cmd; this
+launcher does not yet wire the rust binary.)" \
+            12 70 || true
+        CONFIG_TUI_LAYOUT="textual"
+    else
+        CONFIG_TUI_LAYOUT="$choice"
+    fi
+    return 0
+}
+
+step2_run_mode() {
+    if tui_test_mode; then
+        CONFIG_MODE="${LAUNCH_TEST_RUN_MODE:-main}"
+        return 0
+    fi
+    local choice rc
+    set +e
+    choice=$(tui_menu \
+        "Run mode" \
+        "Pick what to run. Esc to go back." \
+        16 78 3 \
+        "main"        "  One trader strategy + optional benchmark observers" \
+        "comparison"  "  2-3 strategies as traders, separate paper wallets" \
+        "replay"      "  Replay a captured session through the strategies")
+    rc=$?
+    set -e
+    case "$rc" in
+        0) CONFIG_MODE="$choice"; return 0 ;;
+        1) return 2 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Step 3 dispatcher — picks 3a / 3b / 3c based on CONFIG_MODE.
+step3_strategies() {
+    case "$CONFIG_MODE" in
+        main)        step3a_main_strategy ;;
+        comparison)  step3b_comparison_strategies ;;
+        replay)      step3c_replay_capture ;;
+        *)           echo "[launch] step3: unknown mode $CONFIG_MODE" >&2; return 2 ;;
+    esac
+}
+
+# All four registered strategies; matches polyhustle.cli STRATEGY_REGISTRY.
+ALL_STRATEGIES=(walked_vwap refined enhanced base)
+
+step3a_main_strategy() {
+    if tui_test_mode; then
+        CONFIG_MAIN_STRATEGY="${LAUNCH_TEST_MAIN_STRATEGY:-walked_vwap}"
+        if [[ -n "${LAUNCH_TEST_BENCHMARKS:-}" ]]; then
+            IFS=',' read -r -a CONFIG_BENCHMARKS <<<"$LAUNCH_TEST_BENCHMARKS"
+            # "(none)" sentinel = empty array
+            if [[ "${CONFIG_BENCHMARKS[0]:-}" == "none" ]]; then
+                CONFIG_BENCHMARKS=()
+            fi
+        else
+            CONFIG_BENCHMARKS=(refined enhanced base)
+        fi
+        return 0
+    fi
+    local choice rc
+    set +e
+    choice=$(tui_menu \
+        "Main strategy" \
+        "The trader. Posts orders. Esc to back up." \
+        16 70 4 \
+        "walked_vwap"  "  WalkedVWAP   (current production default)" \
+        "refined"      "  Refined" \
+        "enhanced"     "  Enhanced" \
+        "base"         "  Base")
+    rc=$?
+    set -e
+    case "$rc" in
+        0) CONFIG_MAIN_STRATEGY="$choice" ;;
+        1) return 2 ;;
+        *) return 1 ;;
+    esac
+
+    # Benchmarks: multi-select from the remaining strategies, plus an
+    # explicit "none" sentinel so the operator can deliberately pick
+    # "no shadows" without having to un-tick everything.
+    local args=()
+    for s in "${ALL_STRATEGIES[@]}"; do
+        if [[ "$s" != "$CONFIG_MAIN_STRATEGY" ]]; then
+            args+=("$s" "  observer (shadow-trades, paper fills)" "ON")
+        fi
+    done
+    args+=("none" "  Run with no benchmark observers" "OFF")
+
+    local benches
+    set +e
+    benches=$(tui_checklist \
+        "Benchmark observers" \
+        "Space to toggle, Enter to confirm. Esc to back up." \
+        18 70 5 \
+        "${args[@]}")
+    rc=$?
+    set -e
+    case "$rc" in
+        0)
+            CONFIG_BENCHMARKS=()
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                [[ "$line" == "none" ]] && continue
+                CONFIG_BENCHMARKS+=("$line")
+            done <<<"$benches"
+            return 0
+            ;;
+        1) return 2 ;;
+        *) return 1 ;;
+    esac
+}
+
+step3b_comparison_strategies() {
+    if tui_test_mode; then
+        if [[ -n "${LAUNCH_TEST_COMPARISON_STRATEGIES:-}" ]]; then
+            IFS=',' read -r -a CONFIG_COMPARISON_STRATEGIES <<<"$LAUNCH_TEST_COMPARISON_STRATEGIES"
+        else
+            CONFIG_COMPARISON_STRATEGIES=(refined walked_vwap)
+        fi
+        return 0
+    fi
+    while true; do
+        local args=()
+        for s in "${ALL_STRATEGIES[@]}"; do
+            args+=("$s" "  trader (separate paper wallet)" "OFF")
+        done
+        local picked rc
+        set +e
+        picked=$(tui_checklist \
+            "Comparison: pick 2-3 strategies" \
+            "Each runs as a trader with its own simulated wallet (live_dryrun mode is forced, no real orders)." \
+            18 78 5 \
+            "${args[@]}")
+        rc=$?
+        set -e
+        case "$rc" in
+            0) ;;
+            1) return 2 ;;
+            *) return 1 ;;
+        esac
+        CONFIG_COMPARISON_STRATEGIES=()
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            CONFIG_COMPARISON_STRATEGIES+=("$line")
+        done <<<"$picked"
+        local n=${#CONFIG_COMPARISON_STRATEGIES[@]}
+        if [[ "$n" -ge 2 && "$n" -le 3 ]]; then
+            return 0
+        fi
+        tui_msgbox "Pick 2 or 3 strategies" \
+"Comparison mode needs at least 2 and at most 3 strategies.
+You picked $n. Try again." \
+            10 60 || true
+    done
+}
+
+step3c_replay_capture() {
+    local scrapes_dir="$PROJECT_DIR/daemon_state/scrapes"
+    if tui_test_mode; then
+        CONFIG_REPLAY_SESSION="${LAUNCH_TEST_REPLAY_SESSION:-}"
+        if [[ -z "$CONFIG_REPLAY_SESSION" ]]; then
+            echo "[launch] test mode: LAUNCH_TEST_REPLAY_SESSION not set" >&2
+            return 2
+        fi
+        return 0
+    fi
+    if [[ ! -d "$scrapes_dir" ]]; then
+        tui_msgbox "No captures" \
+"No replay captures found at $scrapes_dir.
+Run a live or paper session first to produce one." \
+            9 70 || true
+        return 2
+    fi
+
+    # Build (tag, label) pairs per session that has a manifest. Sort
+    # newest-first by directory name (ISO-8601 sort key). Skip in-progress
+    # sessions whose stop_ts is null — they aren't valid replay inputs.
+    local args=()
+    while IFS= read -r mfd; do
+        local mf="$mfd/manifest.json"
+        [[ -f "$mf" ]] || continue
+        local label
+        label=$(python3 - "$mf" <<'PY' 2>/dev/null
+import json, sys
+m = json.load(open(sys.argv[1]))
+sid = m.get("session_id", "?")
+mode = m.get("mode", "?")
+launch_ns = m.get("launch_ts_ns") or 0
+stop_ns = m.get("stop_ts_ns") or 0
+if stop_ns and launch_ns:
+    dur_h = (stop_ns - launch_ns) / 1e9 / 3600.0
+    dur = f"{dur_h:5.2f}h"
+else:
+    dur = "  ?  "
+print(f"  {mode:<12} {dur}  ({sid})")
+PY
+)
+        local sid
+        sid=$(basename "$mfd")
+        if [[ -n "$label" ]]; then
+            args+=("$sid" "$label")
+        fi
+    done < <(find "$scrapes_dir" -mindepth 1 -maxdepth 1 -type d | sort -r)
+
+    if [[ ${#args[@]} -eq 0 ]]; then
+        tui_msgbox "No captures" \
+"No completed captures with stop_ts under $scrapes_dir." \
+            9 70 || true
+        return 2
+    fi
+
+    local choice rc list_h
+    list_h=$(( ${#args[@]} / 2 ))
+    [[ "$list_h" -gt 12 ]] && list_h=12
+    [[ "$list_h" -lt 1  ]] && list_h=1
+    set +e
+    choice=$(tui_menu \
+        "Replay capture" \
+        "Pick a captured session to replay." \
+        20 78 "$list_h" \
+        "${args[@]}")
+    rc=$?
+    set -e
+    case "$rc" in
+        0) CONFIG_REPLAY_SESSION="$choice"; return 0 ;;
+        1) return 2 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Steps filled in C3-C4
+step4_execution_mode()  { :; }
+step5_optional_params() { :; }
+step6_save_preset()     { :; }
+step7_confirm()         { :; }
+step8_launch()          { :; }
 
 write_config_json() {
     # Assemble the global CONFIG_* state into "$TEMP_CONFIG".
     # Filled in C4 — body here is a placeholder until the menu is wired.
     : > "$TEMP_CONFIG"
+}
+
+# ── Step driver — Esc walks back, Cancel exits ───────────────────────────
+# Each step* function returns:
+#   0 → forward, 1 → back-up, 2 → cancel-launch.
+# Step 1's "back" exits the launcher cleanly with no config written.
+# Steps 4-7 are stubs in C2; they advance unconditionally until the
+# C3-C4 commits land their bodies.
+run_menu_flow() {
+    local goto=1
+    while true; do
+        local rc=0
+        case "$goto" in
+            1) step1_tui_layout      ;;
+            2) step2_run_mode        ;;
+            3) step3_strategies      ;;
+            4) step4_execution_mode  ;;
+            5) step5_optional_params ;;
+            6) step6_save_preset     ;;
+            7) step7_confirm         ;;
+            *) return 0              ;;
+        esac
+        rc=$?
+        case "$rc" in
+            0) goto=$((goto + 1)); [[ "$goto" -gt 7 ]] && return 0 ;;
+            1)
+                if [[ "$goto" -le 1 ]]; then
+                    echo "[launch] cancelled (Esc on step 1)"
+                    exit 0
+                fi
+                goto=$((goto - 1))
+                ;;
+            2)
+                echo "[launch] cancelled"
+                exit 0
+                ;;
+            *)
+                echo "[launch] step $goto returned unexpected rc=$rc; aborting" >&2
+                exit 1
+                ;;
+        esac
+    done
 }
 
 load_preset() {
@@ -205,14 +562,10 @@ ensure_presets_dir
 if [[ -n "$PRESET_NAME" ]]; then
     load_preset "$PRESET_NAME"
 else
-    detect_tui_cmd
-    step1_tui_layout
-    step2_run_mode
-    step3_strategies
-    step4_execution_mode
-    step5_optional_params
-    step6_save_preset
-    step7_confirm
+    if ! tui_test_mode; then
+        detect_tui_cmd
+    fi
+    run_menu_flow
     write_config_json
 fi
 
