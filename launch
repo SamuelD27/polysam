@@ -25,15 +25,12 @@ set -euo pipefail
 # ── Paths ────────────────────────────────────────────────────────────────
 # PROJECT_DIR / NS / POLY_DIR are exported once C4 wires up the launch
 # step; they're declared here to document the contract.
-# shellcheck disable=SC2034
 PROJECT_DIR="/home/samsam/polymarket-hustle"
-# shellcheck disable=SC2034
+CONDA_ENV="polymarket-env"
 NS="polybot"
-# shellcheck disable=SC2034
 POLY_DIR="/home/samsam/polymarket"
 PRESETS_DIR="$HOME/.polymarket-hustle/presets"
 TEMP_CONFIG="/tmp/polyhustle-launch-$$.json"
-# shellcheck disable=SC2034
 SHUTDOWN_TIMEOUT_S=5
 
 # ── TUI binary detection ─────────────────────────────────────────────────
@@ -365,6 +362,18 @@ step3c_replay_capture() {
             echo "[launch] test mode: LAUNCH_TEST_REPLAY_SESSION not set" >&2
             return 2
         fi
+        # The interactive flow doesn't ask for strategy in replay mode
+        # (cli falls back to defaults), but tests may want to assert on
+        # specific overrides — let them set MAIN_STRATEGY/BENCHMARKS.
+        if [[ -n "${LAUNCH_TEST_MAIN_STRATEGY:-}" ]]; then
+            CONFIG_MAIN_STRATEGY="$LAUNCH_TEST_MAIN_STRATEGY"
+        fi
+        if [[ -n "${LAUNCH_TEST_BENCHMARKS:-}" ]]; then
+            IFS=',' read -r -a CONFIG_BENCHMARKS <<<"$LAUNCH_TEST_BENCHMARKS"
+            if [[ "${CONFIG_BENCHMARKS[0]:-}" == "none" ]]; then
+                CONFIG_BENCHMARKS=()
+            fi
+        fi
         return 0
     fi
     if [[ ! -d "$scrapes_dir" ]]; then
@@ -559,14 +568,239 @@ step5_optional_params() {
     return 0
 }
 
-step6_save_preset()     { :; }   # filled in C4
-step7_confirm()         { :; }   # filled in C4
-step8_launch()          { :; }   # filled in C4
+step6_save_preset() {
+    # Always write the temp config first; preset save is optional.
+    write_config_json
+    if [[ ! -s "$TEMP_CONFIG" ]]; then
+        echo "[launch] write_config_json produced an empty file" >&2
+        return 2
+    fi
+    if tui_test_mode; then
+        local preset_name="${LAUNCH_TEST_SAVE_PRESET:-}"
+        if [[ -n "$preset_name" ]]; then
+            cp "$TEMP_CONFIG" "$PRESETS_DIR/$preset_name.json"
+        fi
+        return 0
+    fi
+    set +e
+    tui_yesno "Save preset?" \
+        "Save these choices for quick re-launch via \`launch --preset <name>\`?" \
+        9 70
+    local rc=$?
+    set -e
+    case "$rc" in
+        0)
+            local name rc2
+            set +e
+            name=$(tui_inputbox "Preset name" \
+                "Saved to $PRESETS_DIR/<name>.json" 10 70 "")
+            rc2=$?
+            set -e
+            if [[ "$rc2" -eq 0 && -n "$name" ]]; then
+                # Sanitise: only alphanumerics, dash, underscore.
+                if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+                    tui_msgbox "Invalid name" \
+                        "Preset names must match [A-Za-z0-9_.-]+. Skipping save." \
+                        8 70 || true
+                else
+                    cp "$TEMP_CONFIG" "$PRESETS_DIR/$name.json"
+                fi
+            fi
+            return 0
+            ;;
+        1) return 0 ;;   # No → skip save, advance to confirm
+        *) return 1 ;;   # Esc → back to step 5
+    esac
+}
+
+step7_confirm() {
+    if tui_test_mode; then
+        return 0
+    fi
+    local summary
+    summary=$(_render_summary)
+    local choice rc
+    set +e
+    choice=$(tui_menu "Confirm" \
+        "$summary"$'\n\nLaunch with these settings?' \
+        24 78 3 \
+        "launch"  "  Launch now" \
+        "edit"    "  Go back and edit (Esc)" \
+        "cancel"  "  Cancel without launching")
+    rc=$?
+    set -e
+    case "$rc" in
+        0)
+            case "$choice" in
+                launch) return 0 ;;
+                edit)   return 1 ;;
+                cancel) return 2 ;;
+            esac
+            ;;
+        1) return 2 ;;
+        *) return 1 ;;
+    esac
+}
+
+step8_launch() {
+    # Pre-launch invariants: temp config must exist and be non-empty.
+    if [[ ! -s "$TEMP_CONFIG" ]]; then
+        # Path-with-preset: load_preset ran instead of the menu and put
+        # content in $TEMP_CONFIG. If we got here and the file is empty,
+        # that's a bug worth surfacing.
+        echo "[launch] no config to launch (TEMP_CONFIG=$TEMP_CONFIG empty/missing)" >&2
+        exit 1
+    fi
+
+    # Test/dry-run path: print and return without spawning the daemon.
+    if [[ "${POLYHUSTLE_LAUNCH_DRY_RUN:-0}" == "1" ]]; then
+        echo "[launch] dry-run: not invoking polyhustle.cli"
+        echo "[launch] config at $TEMP_CONFIG:"
+        cat "$TEMP_CONFIG"
+        return 0
+    fi
+
+    # Activate conda only if not already active. Idempotent on the user's
+    # GX10 setup; harmless elsewhere as long as the env exists.
+    if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV" ]]; then
+        local conda_base
+        conda_base="$(/home/samsam/miniconda3/bin/conda info --base 2>/dev/null \
+            || echo /home/samsam/miniconda3)"
+        # shellcheck source=/dev/null
+        source "$conda_base/etc/profile.d/conda.sh"
+        conda activate "$CONDA_ENV"
+    fi
+
+    cd "$PROJECT_DIR"
+
+    local exec_mode
+    exec_mode=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('execution_mode',''))" "$TEMP_CONFIG")
+
+    if [[ "$exec_mode" == "live_real" ]]; then
+        echo "[launch] live_real → bringing up polybot netns (sudo required)"
+        sudo "$POLY_DIR/setup-polybot-ns.sh"
+        sudo -E ip netns exec "$NS" sudo -E -u samsam \
+            --preserve-env=HOME,PATH,CONDA_PREFIX,CONDA_DEFAULT_ENV,VIRTUAL_ENV,POLYHUSTLE_CONFIG \
+            env HOME=/home/samsam POLYHUSTLE_CONFIG="$TEMP_CONFIG" \
+            "$(which python3)" -m polyhustle.cli --config "$TEMP_CONFIG" &
+    else
+        python3 -m polyhustle.cli --config "$TEMP_CONFIG" &
+    fi
+    DAEMON_PID=$!
+    echo "[launch] daemon pid=$DAEMON_PID config=$TEMP_CONFIG"
+
+    # Forward to the daemon and wait. Trap handles SIGINT/SIGTERM cleanup.
+    wait "$DAEMON_PID" || true
+}
+
+_params_to_json() {
+    # Render CONFIG_PARAMS (assoc array) as a JSON object string.
+    # Use python because bash can't escape arbitrary strings into JSON
+    # safely (newlines, quotes, backslashes).
+    if [[ ${#CONFIG_PARAMS[@]} -eq 0 ]]; then
+        echo "{}"
+        return 0
+    fi
+    {
+        for k in "${!CONFIG_PARAMS[@]}"; do
+            printf '%s\t%s\n' "$k" "${CONFIG_PARAMS[$k]}"
+        done
+    } | python3 -c "
+import sys, json
+out = {}
+for line in sys.stdin:
+    line = line.rstrip('\n')
+    if not line:
+        continue
+    k, _, v = line.partition('\t')
+    out[k] = v
+print(json.dumps(out))
+"
+}
 
 write_config_json() {
     # Assemble the global CONFIG_* state into "$TEMP_CONFIG".
-    # Filled in C4 — body here is a placeholder until the menu is wired.
-    : > "$TEMP_CONFIG"
+    # Trims fields not relevant for the chosen mode so saved presets are
+    # readable (e.g. comparison-mode files don't carry a main_strategy).
+    local benches comparison
+    benches=$(IFS=','; echo "${CONFIG_BENCHMARKS[*]:-}")
+    comparison=$(IFS=','; echo "${CONFIG_COMPARISON_STRATEGIES[*]:-}")
+
+    CFG_MODE="$CONFIG_MODE" \
+    CFG_TUI_LAYOUT="$CONFIG_TUI_LAYOUT" \
+    CFG_MAIN_STRATEGY="${CONFIG_MAIN_STRATEGY:-}" \
+    CFG_EXECUTION_MODE="$CONFIG_EXECUTION_MODE" \
+    CFG_REPLAY_SESSION="${CONFIG_REPLAY_SESSION:-}" \
+    CFG_BENCHMARKS="$benches" \
+    CFG_COMPARISON="$comparison" \
+    CFG_PARAMS_JSON="$(_params_to_json)" \
+    python3 - "$TEMP_CONFIG" <<'PY'
+import json, os, sys
+
+def split(s):
+    return [x for x in (s or "").split(",") if x]
+
+cfg = {
+    "mode": os.environ["CFG_MODE"],
+    "tui_layout": os.environ["CFG_TUI_LAYOUT"],
+    "execution_mode": os.environ["CFG_EXECUTION_MODE"],
+    "params": json.loads(os.environ.get("CFG_PARAMS_JSON") or "{}"),
+}
+mode = cfg["mode"]
+if mode == "main":
+    cfg["main_strategy"] = os.environ.get("CFG_MAIN_STRATEGY") or None
+    cfg["benchmarks"] = split(os.environ.get("CFG_BENCHMARKS", ""))
+elif mode == "comparison":
+    cfg["comparison_strategies"] = split(os.environ.get("CFG_COMPARISON", ""))
+elif mode == "replay":
+    cfg["replay_session"] = os.environ.get("CFG_REPLAY_SESSION") or None
+    # Omit main_strategy/benchmarks when not explicitly chosen so the
+    # LaunchConfig defaults kick in (walked_vwap + refined/enhanced/base).
+    main = os.environ.get("CFG_MAIN_STRATEGY")
+    if main:
+        cfg["main_strategy"] = main
+    benches = split(os.environ.get("CFG_BENCHMARKS", ""))
+    if benches:
+        cfg["benchmarks"] = benches
+
+with open(sys.argv[1], "w") as f:
+    json.dump(cfg, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+}
+
+_render_summary() {
+    # Build a readable summary of the current CONFIG_* state for step 7.
+    local lines=()
+    lines+=("Mode:         $CONFIG_MODE")
+    lines+=("TUI:          $CONFIG_TUI_LAYOUT")
+    lines+=("Execution:    $CONFIG_EXECUTION_MODE")
+    case "$CONFIG_MODE" in
+        main)
+            lines+=("Trader:       $CONFIG_MAIN_STRATEGY")
+            if [[ ${#CONFIG_BENCHMARKS[@]} -eq 0 ]]; then
+                lines+=("Benchmarks:   (none)")
+            else
+                lines+=("Benchmarks:   ${CONFIG_BENCHMARKS[*]}")
+            fi
+            ;;
+        comparison)
+            lines+=("Strategies:   ${CONFIG_COMPARISON_STRATEGIES[*]}")
+            ;;
+        replay)
+            lines+=("Session:      $CONFIG_REPLAY_SESSION")
+            lines+=("Trader:       $CONFIG_MAIN_STRATEGY")
+            ;;
+    esac
+    if [[ ${#CONFIG_PARAMS[@]} -eq 0 ]]; then
+        lines+=("Params:       (defaults)")
+    else
+        lines+=("Params:")
+        for k in "${!CONFIG_PARAMS[@]}"; do
+            lines+=("  $k = ${CONFIG_PARAMS[$k]}")
+        done
+    fi
+    printf '%s\n' "${lines[@]}"
 }
 
 # ── Step driver — Esc walks back, Cancel exits ───────────────────────────
