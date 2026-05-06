@@ -12,19 +12,37 @@ Contracts:
 
 from __future__ import annotations
 
+import warnings
+
+import pytest
+
 from active_bots.execution.executor import MarketCtx
 from polyhustle.execution.dryrun_trader import DryrunTrader
 from polyhustle.execution.trader import ACTION_ENTER, Decision, Trader
 
 
-def test_dryrun_trader_implements_abc():
-    t = DryrunTrader()
+@pytest.fixture
+def silent_dryrun_trader():
+    """DryrunTrader instance with the instantiation RuntimeWarning suppressed.
+
+    The warning is intentional (Follow-up 2) — it tells operators that
+    DryrunTrader does not actually sign. Tests that don't care about
+    that signal use this fixture; the dedicated warning test asserts
+    it explicitly.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        yield DryrunTrader()
+
+
+def test_dryrun_trader_implements_abc(silent_dryrun_trader):
+    t = silent_dryrun_trader
     assert isinstance(t, Trader)
     assert t.mode == "live"
 
 
-def test_dryrun_trader_stamps_synthetic_order_id():
-    t = DryrunTrader()
+def test_dryrun_trader_stamps_synthetic_order_id(silent_dryrun_trader):
+    t = silent_dryrun_trader
     ctx = MarketCtx(
         slug="btc-updown-5m-1",
         t_zero=1,
@@ -47,3 +65,15 @@ def test_dryrun_trader_stamps_synthetic_order_id():
     assert res.entry.order_id.startswith("dry-run-")
     # token_id resolved from MarketCtx for the side
     assert res.entry.token_id == "yes-token-abc"
+
+
+def test_dryrun_trader_init_emits_runtime_warning():
+    """Operator-visible signal that signing is not exercised."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        DryrunTrader()
+    runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert len(runtime_warnings) == 1
+    msg = str(runtime_warnings[0].message)
+    assert "live-shape fills without signing" in msg
+    assert "feat/dryrun-true-sign" in msg

@@ -31,12 +31,26 @@ extensible to "actually signs" once the LiveExecutor refactor lands.
 
 from __future__ import annotations
 
+import warnings
+
 from active_bots.execution.dry_run_executor import DryRunExecutor
 from polyhustle.execution._executor_trader import _ExecutorTrader
+
+
+_INSTANTIATION_WARNING = (
+    "DryrunTrader produces live-shape fills without signing. "
+    "To sign-without-post, an unsigned-sign path must be added to "
+    "live_executor.py (protected) — see follow-up branch "
+    "feat/dryrun-true-sign."
+)
 
 
 class DryrunTrader(_ExecutorTrader):
     """Live-shaped fills + synthetic order_id; no real CLOB POST."""
 
     def __init__(self) -> None:
+        # stacklevel=2 surfaces the caller (the CLI / test) instead of
+        # this __init__. Visible-but-non-fatal: we don't auto-disable
+        # because the live-shape paper path is still useful end-to-end.
+        warnings.warn(_INSTANTIATION_WARNING, RuntimeWarning, stacklevel=2)
         super().__init__(DryRunExecutor())
