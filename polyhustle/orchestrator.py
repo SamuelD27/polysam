@@ -177,6 +177,11 @@ class Orchestrator:
         self._ctx_factory = ctx_factory
         self._stopping = asyncio.Event()
         self._last_t_zero: float | None = None
+        # Dedup cache for the on_tick signature-fallback warning. Keyed by
+        # (strategy_class, fallback_signature_label) so each
+        # divergent class produces exactly one WARNING per Orchestrator
+        # instance, not one per tick.
+        self._signature_fallback_warned: set[tuple[type, str]] = set()
 
     @property
     def assignments(self) -> list[StrategyAssignment]:
@@ -221,6 +226,32 @@ class Orchestrator:
         for assignment in self._assignments:
             self._run_assignment(assignment, tick, ctx)
 
+    def _warn_signature_fallback(
+        self,
+        assignment: StrategyAssignment,
+        *,
+        fallback_label: str,
+    ) -> None:
+        """Emit one WARNING the first time a strategy class needs the fallback.
+
+        Dedup keyed by ``(class, fallback_label)`` so a long-running
+        Orchestrator does not spam the log on every tick. The cache lives
+        on the instance, not the class, so test isolation is preserved.
+        """
+        key = (type(assignment.strategy), fallback_label)
+        if key in self._signature_fallback_warned:
+            return
+        self._signature_fallback_warned.add(key)
+        logger.warning(
+            "Strategy %s.on_tick rejected the canonical signature "
+            "(market_price_ts, *, books); falling back to the %s form. "
+            "See polyhustle/strategies/strategy_abc.py for the divergence "
+            "matrix. This warning fires once per (class, fallback) per "
+            "Orchestrator instance.",
+            type(assignment.strategy).__name__,
+            fallback_label,
+        )
+
     def _run_assignment(
         self,
         assignment: StrategyAssignment,
@@ -239,8 +270,16 @@ class Orchestrator:
             )
         except TypeError:
             # Compatibility branch: BaseStrategy doesn't accept
-            # market_price_ts / books. Documented divergence — fall back
-            # to the narrowest 4-positional form.
+            # market_price_ts / books. Documented divergence (see
+            # polyhustle/strategies/strategy_abc.py module docstring) —
+            # fall back to the narrowest 4-positional form.
+            #
+            # Warn once per (class, fallback_label) so the operator
+            # discovers a strategy is being called with the narrow form,
+            # without spamming the log on every tick.
+            self._warn_signature_fallback(
+                assignment, fallback_label="4-arg",
+            )
             action = assignment.strategy.on_tick(
                 tick.btc_price,
                 tick.market_price_up if tick.market_price_up is not None else 0.5,
