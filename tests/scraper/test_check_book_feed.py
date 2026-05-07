@@ -19,7 +19,6 @@ from pathlib import Path
 
 from scripts import check_book_feed
 
-
 # ── predicate cases ─────────────────────────────────────────────────────────
 
 

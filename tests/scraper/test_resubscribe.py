@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -459,7 +459,7 @@ async def test_dispatched_book_event_passes_corrected_predicate(
         await server.wait_closed()
         writer.close_all()
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     f = tmp_path / today / "btc-updown-5m-1700000000.jsonl.gz"
     assert f.exists(), f"expected gzipped file at {f}"
 
