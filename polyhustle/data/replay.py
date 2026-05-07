@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from active_bots.execution.live_book_state import LiveBookState, MarketBooks
+from active_bots.pricing.variance import EWMAVariance
 from polyhustle.data.provider import DataProvider, MarketTick
 
 logger = logging.getLogger("polyhustle.data.replay")
@@ -99,6 +100,13 @@ class ReplayDataProvider(DataProvider):
         self._market_t_zeros: list[float] = []
         self._rtds_ts_cache: dict[str, list[float]] = {}
         self._books_ts_cache: dict[str, list[int]] = {}
+        # Per-tick precomputed sigma — parallel to btc_ticks. Built by
+        # _compute_sigma_tape after the BTC tape loads. NaN before EWMA
+        # warmup is reached; downstream lookup falls back to 0.0 in the
+        # pre-warmup window so behaviour is identical to the previous
+        # "sigma always 0.0" placeholder until enough BTC ticks have
+        # arrived for a sound estimate.
+        self._sigma_tape: list[float] = []
         self._loaded = False
         self._stop = asyncio.Event()
 
@@ -112,6 +120,7 @@ class ReplayDataProvider(DataProvider):
         self._load_book_feed()
         self._load_events()
         self._load_btc_tape()
+        self._compute_sigma_tape()
         self._index_markets_and_rtds()
         self._loaded = True
 
@@ -323,6 +332,46 @@ class ReplayDataProvider(DataProvider):
         # without rebuilding the list every tick.
         self._btc_ts_list = [b.ts for b in self.btc_ticks]
 
+    def _compute_sigma_tape(self) -> None:
+        """Precompute annualised sigma per BTC tick via EWMA.
+
+        Mirrors the daemon's online estimator (``EWMAVariance`` with
+        ``λ=0.94``) so replayed strategies see the same sigma the live
+        daemon would have emitted at that moment. Pre-warmup ticks
+        receive ``0.0`` so the strategy's existing sigma-zero handling
+        (deterministic fair_price collapse to 1.0/0.0/0.5 around the
+        strike) is preserved. Once warmup is reached the EWMA estimate
+        is read from ``current_sigma()`` after each accepted update.
+
+        Cost: O(n) over the BTC tape, single pass. R2.2 has 5,547 ticks;
+        builds in <50 ms.
+        """
+        n = len(self.btc_ticks)
+        self._sigma_tape = [0.0] * n
+        if n == 0:
+            return
+        ewma = EWMAVariance()
+        for i, tick in enumerate(self.btc_ticks):
+            ewma.update(tick.btc_price, tick.ts)
+            sig = ewma.current_sigma()
+            if sig is not None:
+                self._sigma_tape[i] = sig
+
+    def _sigma_at(self, now: float) -> float:
+        """Return the precomputed sigma for the BTC sample <= ``now``.
+
+        Mirrors ``_btc_at`` so sigma and BTC always come from the same
+        sample index. Returns 0.0 before any BTC tick is available — the
+        strategy's existing sigma-zero handling kicks in (fair_price
+        collapses to deterministic 1.0/0.0/0.5 around the strike).
+        """
+        if not self.btc_ticks:
+            return 0.0
+        i = bisect.bisect_right(self._btc_ts_list, now) - 1
+        if i < 0:
+            return 0.0
+        return self._sigma_tape[i]
+
     def _index_markets_and_rtds(self) -> None:
         """Build the (t_zero, t_end, slug, strike) sequence + per-slug RTDS."""
         for ev in self.events:
@@ -364,16 +413,15 @@ class ReplayDataProvider(DataProvider):
         t_lo = self.launch_ts_ns / 1e9
         t_hi = self.stop_ts_ns / 1e9
         t = t_lo
-        sigma = 0.0
         while t <= t_hi:
             if self._stop.is_set():
                 return
-            tick = self._build_tick(t, sigma)
+            tick = self._build_tick(t)
             if tick is not None:
                 yield tick
             t += self._tick_interval_s
 
-    def _build_tick(self, now: float, sigma: float) -> MarketTick | None:
+    def _build_tick(self, now: float) -> MarketTick | None:
         slug, t_zero, strike = self._active_market(now)
         if slug is None:
             return None
@@ -386,7 +434,7 @@ class ReplayDataProvider(DataProvider):
             timestamp=now,
             btc_price=btc,
             market_price_up=m_up,
-            sigma=sigma,
+            sigma=self._sigma_at(now),
             t_zero=t_zero,
             strike=strike,
             slug=slug,
