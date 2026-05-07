@@ -611,6 +611,25 @@ after each (re)subscribe so future discovery cycles fire fresh.
 Per-slug file format is unchanged — `polyhustle/data/replay.py`'s
 loader continues to work without modification.
 
+**Resolved-market periodic-snapshot accumulation (correct, not a bug).**
+*Plain-language summary.* Once a 5-min market resolves, its order book
+is wiped by a cascade of cancellation `price_change` events from the
+CLAUDE. The scraper writes those cancellations faithfully; subsequent
+periodic snapshots for that token correctly serialise empty bids and
+empty asks until the daemon stops. The slug's `.jsonl.gz` file
+therefore keeps growing post-resolution, dominated by empty periodic
+snapshots interspersed with whatever residual ticks the CLOB sends.
+*Technical context.* `_discovery_loop` never deletes resolved entries
+from `token_states` (deletion happens on process restart, by design).
+The scraper has no concept of "this market is done" — that knowledge
+lives in the daemon, which uses `t_zero + MARKET_DURATION_S` to gate
+strategy logic. Per-slug post-resolution emptiness is correct
+behaviour; the new `scripts/check_book_feed.py` handles it correctly
+because the active-period dense `book` and `price_change` streams
+dominate the per-slug record count, so even a multi-market session
+with many resolved-but-still-tracked tokens still clears the 80%
+median bar (R3 measured: 95.6% median across 10 slugs).
+
 **Loud-failure complement.** `_prime_from_rest` now distinguishes
 ACTIVE-window from NEXT-window tokens via the slug's `t_zero` suffix.
 An empty REST `/book` for an ACTIVE token logs WARNING with enough

@@ -160,7 +160,47 @@ launch.
 
 ---
 
-## 5. Non-goals
+## 5. Deferred — known issues with a trigger condition
+
+These are real issues identified during diagnostic work but consciously
+deferred. Each entry documents the trigger condition that should cause
+us to un-defer it.
+
+### 5.1 F1 — periodic snapshotter starves under sustained book traffic
+
+**Where:** `scripts/scrape_book.py:_handle_book` sets
+`st.last_snapshot_ts = time.time()` after applying every WS book event
+(`scrape_book.py:603`). The periodic snapshotter at
+`scrape_book.py:462` skips any token whose `now - last_snapshot_ts <
+SNAPSHOT_CADENCE_S`. When book events arrive faster than every 5 s
+(the active period of any liquid market — observed at 16/sec inside
+the polybot netns during R3), the snapshotter NEVER writes a periodic
+snapshot for that token.
+
+**Why deferred:** the only consumer that needs reconstructable state
+is `polyhustle/data/replay.py`, and replay reads `book` events and
+`price_change` deltas directly (`replay.py:228-247`). Replay is
+unaffected; ad-hoc analysis tools that read snapshots-only would
+starve, but the only such tool was the (now retired) ad-hoc bash
+spot-check predicate, replaced by `scripts/check_book_feed.py` —
+which counts all event classes and doesn't depend on periodic
+snapshots either.
+
+**Trigger to un-defer:** any new tool needs snapshot density > 0.2 Hz
+per token under sustained book traffic. (Equivalently: any operator
+workflow that grep / replay-walks ONLY `type=="snapshot"` records
+and expects a record every ~5 s during active windows.)
+
+**Fix shape (when un-deferred):** either stop updating
+`st.last_snapshot_ts` from `_handle_book`, or change the snapshotter
+gate to `≥ N seconds since last *periodic* snapshot, regardless of
+book events`. Track periodic-only timestamp in a separate field. Ship
+default-off behind a feature flag per CLAUDE.md §7. Diagnostic
+context: `reports/r3_failure_diagnostic.md` §6 / Finding F1.
+
+---
+
+## 6. Non-goals
 
 These were on the legacy launch_daemon.sh path but are deliberately NOT
 on this roadmap:
