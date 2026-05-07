@@ -382,16 +382,60 @@ def _raw_event_record(
     }
 
 
+def _slug_t_zero(slug: str) -> int | None:
+    """Parse t_zero epoch seconds out of a slug like ``btc-updown-5m-1777986000``.
+
+    Returns None if the slug doesn't carry the expected SLUG_PREFIX or
+    the suffix isn't an integer. Used by _prime_from_rest to decide
+    whether an empty REST /book is "active token, alarm" vs "next-window
+    token, expected".
+    """
+    if not slug.startswith(SLUG_PREFIX):
+        return None
+    suffix = slug[len(SLUG_PREFIX):]
+    try:
+        return int(suffix)
+    except ValueError:
+        return None
+
+
 async def _prime_from_rest(
     session: requests.Session,
     token_states: dict[str, TokenState],
     writer: FeedWriter,
 ) -> None:
     """Fetch REST /book for each token and seed local state. Emits an initial
-    snapshot record to the feed per token."""
+    snapshot record to the feed per token.
+
+    Empty REST /book is the early-warning signal we missed in the R2.2
+    capture. If the token is for an ACTIVE market (now is between
+    t_zero and t_zero+MARKET_DURATION_S), an empty REST /book means
+    daemon_base_v1.clob_book_feed is likely seeing populated state at
+    the same moment — i.e. a CDN / regional cache disagreement worth
+    surfacing. We log WARNING with enough context to grep daemon.log
+    for the cross-check. Next-window tokens with empty REST is
+    expected (the market hasn't opened yet) and stays at DEBUG.
+    """
+    now = time.time()
     for asset_id, st in token_states.items():
         book = await asyncio.to_thread(fetch_rest_book, session, asset_id)
         if not book:
+            t_zero = _slug_t_zero(st.slug)
+            if t_zero is not None and t_zero <= now < t_zero + MARKET_DURATION_S:
+                logger.warning(
+                    "prime_from_rest: empty REST /book for ACTIVE token "
+                    "asset_id=%s slug=%s side=%s — daemon clob_book_feed "
+                    "should have data; possible CDN / regional cache issue. "
+                    "Periodic snapshots will write empty until the WS sends "
+                    "a book event for this token.",
+                    asset_id[:16] + "...", st.slug, st.side,
+                )
+            else:
+                logger.debug(
+                    "prime_from_rest: empty REST /book for next-window token "
+                    "asset_id=%s slug=%s (expected before market opens)",
+                    asset_id[:16] + "...", st.slug,
+                )
             continue
         _apply_book_snapshot(st, book)
         st.last_snapshot_ts = time.time()
