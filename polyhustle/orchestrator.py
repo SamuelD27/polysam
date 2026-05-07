@@ -58,7 +58,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from polyhustle.data.provider import MarketTick
-from polyhustle.execution.trader import ACTION_REJECT, Decision
+from polyhustle.execution.trader import ACTION_ENTER, ACTION_REJECT, Decision
 
 if TYPE_CHECKING:
     from active_bots.execution.event_logger import EventLogger
@@ -278,7 +278,34 @@ class Orchestrator:
                 ev["entry_rejected"],
                 strategy=assignment.name,
                 slug=tick.slug,
+                reject_source="strategy",
                 **{k: v for k, v in decision.meta.items()},
+            )
+            return
+
+        # Trader-side rejection of an ENTER. Without surfacing this, the
+        # strategy's internal _open_position (set inside on_tick before
+        # the orchestrator dispatched) silently diverges from
+        # assignment.position (still None because no entry filled). The
+        # strategy then emits EXITs the orchestrator silently bounces
+        # with no_open_position. Visibility is the floor; the deeper
+        # fix (strategy.confirm_execution) is filed against
+        # docs/POLYHUSTLE_CLI_ROADMAP.md as a follow-up. NOTE: do NOT
+        # update assignment.position here — letting it stay None is
+        # how the orchestrator records "no position opened."
+        if decision.action == ACTION_ENTER and result.rejected:
+            self._events.log(
+                ev["entry_rejected"],
+                strategy=assignment.name,
+                slug=tick.slug,
+                reject_source="trader",
+                reject_reason=result.reject_reason or "trader_rejected",
+                # Surface the action's intended fields so postmortem
+                # analysis can see what the strategy meant to enter.
+                intended_side=decision.side,
+                intended_size_shares=decision.size_shares,
+                intended_size_usdc=decision.size_usdc,
+                intended_entry_price=decision.entry_price,
             )
             return
 

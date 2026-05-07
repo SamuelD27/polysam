@@ -154,6 +154,249 @@ async def test_orchestrator_replay_mode_default_false():
     assert o.tick_count == 0
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_emits_entry_rejected_on_trader_side_reject():
+    """When PaperTrader rejects an ACTION_ENTER (e.g. paper_no_fill on
+    a thin book), the orchestrator must emit an ``entry_rejected``
+    event with ``reject_source="trader"``. Without this, every
+    rejected entry is silent loss; the strategy thinks it has a
+    position, the orchestrator stays at position=None, and every
+    subsequent EXIT bounces with ``no_open_position`` invisibly.
+
+    Regression-proof for the secondary gap surfaced during R2.2 H4
+    validation — see reports/r4_replay_wiring_diag.md and the H1
+    branch's commit body.
+    """
+    import time
+    from collections.abc import AsyncIterator
+    from dataclasses import dataclass, field
+    from typing import Any
+
+    from active_bots.execution.executor import MarketCtx
+    from polyhustle.data.provider import DataProvider, MarketTick
+    from polyhustle.execution.trader import (
+        ACTION_ENTER,
+        Decision,
+        ExecutionResult,
+        Trader,
+    )
+    from polyhustle.orchestrator import Orchestrator, StrategyAssignment
+    from polyhustle.strategies.strategy_abc import Strategy
+
+    # Strategy that always emits one ENTER on each tick.
+    @dataclass
+    class _AlwaysEnterStrategy(Strategy):
+        on_tick_calls: int = 0
+        _open: bool = False
+
+        def on_tick(self, btc_price, market_price_up, sigma, t_zero,
+                    market_price_ts=None, *, books=None, now=None, **kwargs):
+            self.on_tick_calls += 1
+            return {
+                "action": ACTION_ENTER,
+                "side": "Up",
+                "entry_price": 0.5,
+                "size_shares": 4.0,
+                "size_usdc": 2.0,
+                "edge": 0.5,
+            }
+
+        def reset(self, t_zero=None, strike=None):
+            self._open = False
+
+        @property
+        def has_position(self) -> bool:
+            return self._open
+
+    # Trader that always rejects with paper_no_fill.
+    @dataclass
+    class _RejectingTrader(Trader):
+        mode: str = "paper"
+        calls: int = 0
+
+        def execute(self, decision, ctx, **kw):
+            self.calls += 1
+            return ExecutionResult(
+                action=decision.action,
+                rejected=True,
+                reject_reason="paper_no_fill",
+            )
+
+        def reconcile(self, now):
+            return None
+
+    @dataclass
+    class _Provider(DataProvider):
+        n_ticks: int = 1
+
+        async def stream(self) -> AsyncIterator[MarketTick]:
+            for _ in range(self.n_ticks):
+                yield MarketTick(
+                    timestamp=time.time(),
+                    btc_price=100_000.0,
+                    market_price_up=0.5,
+                    sigma=0.5,
+                    t_zero=10_000_000.0,
+                    strike=100_000.0,
+                    slug="btc-updown-5m-10000000",
+                    books=None,
+                    market_price_ts=time.time(),
+                )
+
+        async def shutdown(self):
+            return None
+
+    @dataclass
+    class _CapturingLogger:
+        events: list[tuple[str, dict]] = field(default_factory=list)
+
+        def log(self, event_type, **fields):
+            self.events.append((event_type, fields))
+
+        def close(self):
+            return None
+
+    class _NoOpRisk:
+        def record_trade(self, *a, **k):
+            return None
+
+    strategy = _AlwaysEnterStrategy()
+    trader = _RejectingTrader()
+    assignment = StrategyAssignment(
+        name="walked_vwap", strategy=strategy, trader=trader, role="trader",
+    )
+    log = _CapturingLogger()
+
+    o = Orchestrator(
+        data_provider=_Provider(n_ticks=1),
+        assignments=[assignment],
+        risk=_NoOpRisk(),
+        events=log,
+    )
+    await o.run()
+
+    rejected = [e for e in log.events if e[0] == "entry_rejected"]
+    assert len(rejected) == 1, (
+        f"expected exactly one entry_rejected event, got {log.events}"
+    )
+    name, fields = rejected[0]
+    assert fields["strategy"] == "walked_vwap"
+    assert fields["reject_source"] == "trader"
+    assert fields["reject_reason"] == "paper_no_fill"
+    assert fields["intended_side"] == "Up"
+    assert fields["intended_size_shares"] == 4.0
+    # Position must remain None — strategy/orchestrator divergence
+    # must not leak through this path.
+    assert assignment.position is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_strategy_side_reject_carries_strategy_source():
+    """ACTION_REJECT (the WALKED_VWAP_REJECT path) must tag the event
+    with reject_source="strategy" so postmortem can distinguish
+    strategy gate rejects from trader rejects.
+    """
+    import time
+    from collections.abc import AsyncIterator
+    from dataclasses import dataclass, field
+    from typing import Any
+
+    from polyhustle.data.provider import DataProvider, MarketTick
+    from polyhustle.execution.trader import (
+        ACTION_REJECT,
+        ExecutionResult,
+        Trader,
+    )
+    from polyhustle.orchestrator import Orchestrator, StrategyAssignment
+    from polyhustle.strategies.strategy_abc import Strategy
+
+    @dataclass
+    class _RejectingStrategy(Strategy):
+        _open: bool = False
+
+        def on_tick(self, btc_price, market_price_up, sigma, t_zero,
+                    market_price_ts=None, *, books=None, now=None, **kwargs):
+            return {
+                "action": ACTION_REJECT,
+                "side": "Down",
+                "reject_reason": "empty_book",
+            }
+
+        def reset(self, t_zero=None, strike=None):
+            self._open = False
+
+        @property
+        def has_position(self) -> bool:
+            return self._open
+
+    @dataclass
+    class _PassthroughTrader(Trader):
+        mode: str = "paper"
+
+        def execute(self, decision, ctx, **kw):
+            return ExecutionResult(
+                action=decision.action,
+                rejected=True,
+                reject_reason=decision.meta.get("reject_reason", "walked_vwap_reject"),
+            )
+
+        def reconcile(self, now):
+            return None
+
+    @dataclass
+    class _Provider(DataProvider):
+        async def stream(self) -> AsyncIterator[MarketTick]:
+            yield MarketTick(
+                timestamp=time.time(),
+                btc_price=100_000.0,
+                market_price_up=0.5,
+                sigma=0.5,
+                t_zero=10_000_000.0,
+                strike=100_000.0,
+                slug="btc-updown-5m-10000000",
+                books=None,
+                market_price_ts=time.time(),
+            )
+
+        async def shutdown(self):
+            return None
+
+    @dataclass
+    class _CapturingLogger:
+        events: list[tuple[str, dict]] = field(default_factory=list)
+
+        def log(self, event_type, **fields):
+            self.events.append((event_type, fields))
+
+        def close(self):
+            return None
+
+    class _NoOpRisk:
+        def record_trade(self, *a, **k):
+            return None
+
+    strategy = _RejectingStrategy()
+    trader = _PassthroughTrader()
+    assignment = StrategyAssignment(
+        name="walked_vwap", strategy=strategy, trader=trader, role="trader",
+    )
+    log = _CapturingLogger()
+
+    o = Orchestrator(
+        data_provider=_Provider(),
+        assignments=[assignment],
+        risk=_NoOpRisk(),
+        events=log,
+    )
+    await o.run()
+
+    rejected = [e for e in log.events if e[0] == "entry_rejected"]
+    assert len(rejected) == 1
+    _, fields = rejected[0]
+    assert fields["reject_source"] == "strategy"
+    assert fields["reject_reason"] == "empty_book"
+
+
 @pytest.mark.slow
 def test_replay_r22_wall_clock_under_target(tmp_path):
     """R2.2 capture replays in under the achieved-target wall clock.
