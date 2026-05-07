@@ -239,7 +239,14 @@ class Orchestrator:
         tick: MarketTick,
         ctx: MarketCtx,
     ) -> None:
-        """Drive one Strategy → Trader pipeline for the current tick."""
+        """Drive one Strategy → Trader pipeline for the current tick.
+
+        Always passes ``now=tick.timestamp`` so the strategy's internal
+        time accounting matches the tick. In live mode ``tick.timestamp``
+        IS wall-clock (modulo data-provider construction microseconds);
+        in replay mode it is the historical tick's epoch — which is the
+        whole point of this seam (see reports/r4_replay_wiring_diag.md).
+        """
         action = assignment.strategy.on_tick(
             tick.btc_price,
             tick.market_price_up if tick.market_price_up is not None else 0.5,
@@ -247,6 +254,7 @@ class Orchestrator:
             tick.t_zero,
             tick.market_price_ts,
             books=tick.books,
+            now=tick.timestamp,
         )
 
         if action is None:
