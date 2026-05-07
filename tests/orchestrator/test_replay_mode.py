@@ -170,13 +170,10 @@ async def test_orchestrator_emits_entry_rejected_on_trader_side_reject():
     import time
     from collections.abc import AsyncIterator
     from dataclasses import dataclass, field
-    from typing import Any
 
-    from active_bots.execution.executor import MarketCtx
     from polyhustle.data.provider import DataProvider, MarketTick
     from polyhustle.execution.trader import (
         ACTION_ENTER,
-        Decision,
         ExecutionResult,
         Trader,
     )
@@ -299,7 +296,6 @@ async def test_orchestrator_strategy_side_reject_carries_strategy_source():
     import time
     from collections.abc import AsyncIterator
     from dataclasses import dataclass, field
-    from typing import Any
 
     from polyhustle.data.provider import DataProvider, MarketTick
     from polyhustle.execution.trader import (
