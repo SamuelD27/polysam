@@ -417,7 +417,13 @@ async def _prime_from_rest(
     expected (the market hasn't opened yet) and stays at DEBUG.
     """
     now = time.time()
-    for asset_id, st in token_states.items():
+    # Snapshot the dict at iteration start. _discovery_loop runs
+    # concurrently and can mutate token_states at any moment;
+    # iterating over the live .items() races (Python raises
+    # RuntimeError: dictionary changed size during iteration). New
+    # tokens added mid-prime get caught by the next resubscribe
+    # cycle — initial prime is best-effort by design.
+    for asset_id, st in list(token_states.items()):
         book = await asyncio.to_thread(fetch_rest_book, session, asset_id)
         if not book:
             t_zero = _slug_t_zero(st.slug)
@@ -540,6 +546,21 @@ async def _subscribe_and_stream(
                     "side": st.side,
                     "reason": str(e)[:200],
                 })
+            await asyncio.sleep(3.0)
+        except RuntimeError:
+            # Belt-and-braces. An uncaught RuntimeError on this hot
+            # loop (the canonical example: a dict-mutation race against
+            # _discovery_loop) used to silently kill this task and
+            # produce empty captures — exactly the failure mode the
+            # branch's main fix addresses. Catch + log at ERROR with
+            # full traceback so any future race becomes visible in
+            # operator review of daemon.log; reconnect via the same
+            # 3-s backoff path used for genuine network drops. Don't
+            # crash the scraper process — reconnect is the correct
+            # response to a dead WS task.
+            logger.exception(
+                "ws task RuntimeError on hot loop; reconnecting in 3s",
+            )
             await asyncio.sleep(3.0)
 
 
