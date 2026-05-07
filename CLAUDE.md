@@ -715,7 +715,8 @@ Claude) doesn't repeat that mistake.
    answer; the full window gives the rigorous answer.
 
    ```bash
-   python scripts/check_book_feed.py daemon_state/book_feed/<DATE>/
+   python scripts/check_book_feed.py daemon_state/book_feed/<DATE>/ \
+     --btc-tape daemon_state/scrapes/<session_id>/btc_ticks.jsonl
    ```
 
    Decision matrix:
@@ -729,7 +730,20 @@ Claude) doesn't repeat that mistake.
    The script's exit codes mirror this matrix: `0` healthy, `2`
    borderline, `1` alarm. `3` if no `.jsonl.gz` files / unreadable.
 
-5. **What to do when the gate fails.** Do NOT assume "the scraper is
+5. **BTC tape (H1).** Every post-H1 capture writes one JSON line per
+   Binance trade tick to
+   `daemon_state/scrapes/<session_id>/btc_ticks.jsonl`. `ReplayDataProvider`
+   reads this file in preference to the legacy
+   `dashboard_history.jsonl` (which is no longer written by anything
+   in production — it was a side effect of the retired
+   `scripts/live_dashboard.py`). A capture without a BTC tape is
+   unreplayable: every replay tick yields `btc_price=None` and
+   `_build_tick` returns None for the entire session. The `--btc-tape`
+   flag above checks the file exists and has ≥ 1 line; the verdict
+   downgrades to `BOOK_HEALTHY but BTC_TAPE_<status>` if the book is
+   fine but the tape is missing.
+
+6. **What to do when the gate fails.** Do NOT assume "the scraper is
    broken." Run the diagnostic flow in
    `reports/r3_failure_diagnostic.md` §1-§4 first — process state,
    scraper.log resubscribe count, daemon-side cross-check via
@@ -737,4 +751,20 @@ Claude) doesn't repeat that mistake.
    populated" can be a measurement artefact even when the predicate
    is corrected (e.g., if the capture window contained no active
    markets). Process before code.
+
+### `entry_rejected` — `reject_source` field (post-H4)
+
+Every `entry_rejected` event in `events.jsonl` carries a
+`reject_source` field distinguishing the rejection class:
+
+| `reject_source` | Meaning |
+|---|---|
+| `"strategy"` | Strategy-side gate fired (e.g., `WALKED_VWAP_REJECT` for `empty_book` / `insufficient_walked_edge`). The action's `reject_reason` carries the gate-vocabulary code. |
+| `"trader"`   | Trader rejected an `ACTION_ENTER` after the strategy had already committed (e.g., `paper_no_fill` when the realistic-paper book walk found insufficient liquidity). Strategy-side `_open_position` and orchestrator `position` may diverge — see the H1 commit body for the structural follow-up filed in `docs/POLYHUSTLE_CLI_ROADMAP.md`. |
+
+R4 replay reports will surface `reject_source=trader` entries that
+pre-H4 reports never had. A non-zero count is informative, not an
+alarm — it tells you which entries the gate accepted but the realistic
+fill simulator rejected. Persistent zero `reject_source=trader` on a
+capture with thin books would be surprising and worth investigating.
 

@@ -110,6 +110,17 @@ def main() -> int:
         action="store_true",
         help="print every slug's ratio (default: only outliers)",
     )
+    parser.add_argument(
+        "--btc-tape",
+        type=Path,
+        default=None,
+        help=(
+            "optional path to btc_ticks.jsonl (the H1 per-session BTC tape). "
+            "If provided, the script also asserts the file exists, has at "
+            "least 1 line, and parses cleanly. A capture missing its BTC "
+            "tape is unreplayable — see CLAUDE.md §19."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.directory.is_dir():
@@ -157,7 +168,45 @@ def main() -> int:
     print(f"files:  {len(rows)}")
     print(f"median: {median:.1%}   p25: {p25:.1%}   p75: {p75:.1%}")
 
+    # Optional BTC-tape check (H1). A capture without a BTC tape is
+    # unreplayable — replay's _build_tick returns None for every tick
+    # when btc is None. Healthier to surface this BEFORE the operator
+    # leaves a 12-hour capture running.
+    btc_tape_status = None
+    if args.btc_tape is not None:
+        if not args.btc_tape.is_file():
+            print(
+                f"BTC tape: MISSING {args.btc_tape} — replay will produce "
+                "zero ticks. Confirm the daemon is writing btc_ticks.jsonl "
+                "(POLYMARKET_SCRAPE_SESSION_DIR set, H1 daemon)."
+            )
+            btc_tape_status = "missing"
+        else:
+            line_count = 0
+            try:
+                with args.btc_tape.open() as f:
+                    for line in f:
+                        if line.strip():
+                            line_count += 1
+            except OSError as e:
+                print(f"BTC tape: UNREADABLE {args.btc_tape} — {e}")
+                btc_tape_status = "unreadable"
+            else:
+                print(f"BTC tape: OK {args.btc_tape} ({line_count} lines)")
+                btc_tape_status = "ok" if line_count > 0 else "empty"
+                if line_count == 0:
+                    print(
+                        "BTC tape: EMPTY — file exists but no lines. "
+                        "Replay will produce zero ticks."
+                    )
+
     if median >= HEALTHY_THRESHOLD:
+        if btc_tape_status not in (None, "ok"):
+            print(
+                f"verdict: BOOK_HEALTHY but BTC_TAPE_{btc_tape_status.upper()} — "
+                "capture is partially unreplayable"
+            )
+            return 2
         print(f"verdict: HEALTHY (median >= {HEALTHY_THRESHOLD:.0%})")
         return 0
     if median < ALARM_THRESHOLD:
