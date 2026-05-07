@@ -660,3 +660,81 @@ was the diagnostic-time hypothesis). NEXT-window empty stays at DEBUG
   active. Also grep for `prime_from_rest: empty REST /book for ACTIVE
   token` — should be zero or rare; persistent volume here means the
   REST path is failing in some way the WS path isn't.
+
+---
+
+## 19. Capture verification — the only sanctioned procedure
+
+### Plain-language summary
+
+How to know whether a captured trading session produced real, usable
+book data. There is exactly one supported way to answer this question.
+Anything else is unreliable. The May 2026 dcfe272 incident shipped a
+working scraper fix but flagged a healthy follow-on capture as failed
+because the gate used an ad-hoc bash one-liner that didn't account for
+all three event classes the scraper writes — see
+`reports/r3_failure_diagnostic.md` for the full incident write-up.
+This procedure exists so the next operator (and the next session of
+Claude) doesn't repeat that mistake.
+
+### Technical body
+
+1. **Use `scripts/check_book_feed.py` — never ad-hoc bash one-liners.**
+   The script applies the corrected populated-frame predicate and
+   exits with a meaningful return code. Bash one-liners that grep on
+   top-level `bids|asks` will systematically under-report population
+   on any capture where `book` events or `price_change` deltas
+   dominate the file (i.e., any capture during liquid-market
+   periods). Other one-line checks have similar blind spots.
+
+2. **The predicate counts a record as populated iff one of:**
+   - `type == "snapshot"` AND (top-level `bids` non-empty OR top-level
+     `asks` non-empty)
+   - `type == "book"` AND (`raw.bids` non-empty OR `raw.asks`
+     non-empty)
+   - `type == "price_change"` AND any `deltas[*].size != "0"`
+
+   Empty periodic snapshots from resolved markets are correct
+   behaviour and don't count toward "populated" — that is intended.
+   The active-period dense streams of `book` and `price_change`
+   events dominate per-slug record counts even on multi-market
+   sessions, so a healthy capture still clears the 80 % bar.
+
+3. **Inside-netns smoke is required for any scraper change.**
+   `tests/scraper/` runs in the user's default netns, NOT inside the
+   `polybot` WireGuard netns the production capture uses. The test
+   suite passing is necessary but not sufficient. Any branch
+   touching `scripts/scrape_book.py`, the daemon's `clob_book_feed`,
+   or the WS subscription path must additionally produce a 30-min
+   inside-netns smoke (run via `./launch_daemon.sh paper`) and the
+   spot-check script must report median ratio ≥ 80 %.
+
+4. **Pre-flight check during a live capture.** Thirty minutes into
+   any session you intend to keep, run the script against the most
+   recently fully-rolled slugs. The 3 most recent give a fast
+   answer; the full window gives the rigorous answer.
+
+   ```bash
+   python scripts/check_book_feed.py daemon_state/book_feed/<DATE>/
+   ```
+
+   Decision matrix:
+
+   | Median ratio | Action |
+   |---|---|
+   | ≥ 80 %       | Healthy. Continue capture. |
+   | 50 - 80 %    | Borderline. Surface and discuss before continuing. |
+   | < 50 %       | Alarm. Kill the capture; diagnose. |
+
+   The script's exit codes mirror this matrix: `0` healthy, `2`
+   borderline, `1` alarm. `3` if no `.jsonl.gz` files / unreadable.
+
+5. **What to do when the gate fails.** Do NOT assume "the scraper is
+   broken." Run the diagnostic flow in
+   `reports/r3_failure_diagnostic.md` §1-§4 first — process state,
+   scraper.log resubscribe count, daemon-side cross-check via
+   `daemon_state/events.jsonl`. The R3 incident showed that "0 %
+   populated" can be a measurement artefact even when the predicate
+   is corrected (e.g., if the capture window contained no active
+   markets). Process before code.
+

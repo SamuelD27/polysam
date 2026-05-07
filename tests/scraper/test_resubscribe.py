@@ -9,18 +9,41 @@ A local ``websockets.serve`` mock acts as the CLOB WS endpoint.
 ``WS_CLOB`` is monkey-patched at the module level so the scraper
 connects to it. ``_prime_from_rest`` is monkey-patched to a no-op so
 the test doesn't need to mock REST. ``_dispatch`` is also patched out
-since this test is about subscription bookkeeping, not message handling.
+in the bookkeeping tests since they're about subscription paths, not
+message handling. The end-to-end test at the bottom of this file does
+NOT patch dispatch — it exercises the full WS → dispatcher → gzip
+file path and validates output via ``scripts/check_book_feed``.
+
+**Scope limits — read before treating these tests as a merge gate.**
+
+This file's tests run in the user's default network namespace, NOT
+inside the ``polybot`` WireGuard netns the production capture uses.
+WireGuard MTU, DNS, and tunnel-routing differences can in principle
+mask CLOB WS subscription failures that pass these tests cleanly.
+The dcfe272 merge gate ran this file outside-netns and passed; the
+ensuing "failed" R3 capture was a measurement artefact, not a real
+failure (see ``reports/r3_failure_diagnostic.md`` and CLAUDE.md §19),
+but the precedent stands: outside-netns is necessary, not sufficient.
+
+**Required gate for any scraper-touching merge:**
+  1. ``pytest tests/scraper/`` — all green (this file).
+  2. A 30-minute inside-netns smoke run via
+     ``./launch_daemon.sh paper`` followed by
+     ``python scripts/check_book_feed.py daemon_state/book_feed/<DATE>/``
+     reporting median ratio ≥ 80 % across slugs (see CLAUDE.md §19).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 import websockets
 
-from scripts import scrape_book
+from scripts import check_book_feed, scrape_book
 
 
 @pytest.mark.asyncio
@@ -343,3 +366,108 @@ async def test_subscribe_and_stream_catches_runtime_error_and_reconnects(
             pass
         server.close()
         await server.wait_closed()
+
+# ── end-to-end gate: WS → dispatcher → gzip → corrected predicate ───────────
+
+
+@pytest.mark.asyncio
+async def test_dispatched_book_event_passes_corrected_predicate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """End-to-end: a populated WS ``book`` event must reach the on-disk
+    gzipped JSONL and pass ``check_book_feed.is_populated``.
+
+    This is the test that, had it existed, would have caught the dcfe272
+    merge gate's blind spot: the old ad-hoc bash predicate counted the
+    written ``book`` record as un-populated because it only checked
+    top-level ``bids|asks``, missing the ``raw.bids|raw.asks`` nesting.
+    The `check_book_feed.is_populated` predicate from commit (1) handles
+    this correctly. Asserts:
+
+      1. A subscribe was observed.
+      2. After the WS sends a populated book event, at least one
+         record reaches the per-slug ``.jsonl.gz`` file.
+      3. ``check_book_feed.scan_file`` reports populated >= 1 for that
+         file.
+
+    Does NOT patch ``_dispatch`` — that is the whole point. The full
+    real path from WS message to predicate must be exercised.
+    """
+    book_sent = asyncio.Event()
+
+    async def mock_handler(websocket: websockets.ServerConnection) -> None:
+        # Stay in async-for so the connection lives for the scraper to
+        # process the book event we send. The test cancels the scraper
+        # task when ready, which closes the WS and exits this loop.
+        async for msg in websocket:
+            try:
+                payload = json.loads(msg)
+            except (TypeError, ValueError):
+                continue
+            if payload.get("type") == "market" and "assets_ids" in payload:
+                aid = payload["assets_ids"][0]
+                book_event = {
+                    "event_type": "book",
+                    "asset_id": aid,
+                    "market": "0xtest",
+                    "timestamp": "1700000000000",
+                    "hash": "abc123",
+                    "bids": [{"price": "0.5", "size": "100"}],
+                    "asks": [{"price": "0.51", "size": "200"}],
+                }
+                await websocket.send(json.dumps(book_event))
+                book_sent.set()
+
+    server = await websockets.serve(mock_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(scrape_book, "WS_CLOB", f"ws://127.0.0.1:{port}")
+
+    async def _noop_prime(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scrape_book, "_prime_from_rest", _noop_prime)
+
+    token_states: dict[str, scrape_book.TokenState] = {
+        "asset-1-yes": scrape_book.TokenState(
+            asset_id="asset-1-yes",
+            slug="btc-updown-5m-1700000000",
+            side="yes",
+            condition_id="0xtest",
+            canonical_tick="0.01",
+        ),
+    }
+    writer = scrape_book.FeedWriter(tmp_path)
+    discovery_event = asyncio.Event()
+
+    task = asyncio.create_task(
+        scrape_book._subscribe_and_stream(
+            token_states, writer, session=None,
+            discovery_event=discovery_event,
+        )
+    )
+    try:
+        await asyncio.wait_for(book_sent.wait(), timeout=5.0)
+        # Brief settle so the dispatcher has time to write + flush.
+        await asyncio.sleep(0.3)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        server.close()
+        await server.wait_closed()
+        writer.close_all()
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    f = tmp_path / today / "btc-updown-5m-1700000000.jsonl.gz"
+    assert f.exists(), f"expected gzipped file at {f}"
+
+    total, populated = check_book_feed.scan_file(f)
+    assert total >= 1, f"no records written; total={total}"
+    assert populated >= 1, (
+        f"WS book event arrived but check_book_feed counted zero "
+        f"populated frames. The predicate or the dispatcher schema is "
+        f"broken. total={total} populated={populated}"
+    )
+
