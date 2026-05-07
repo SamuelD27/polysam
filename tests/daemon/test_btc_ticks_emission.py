@@ -218,9 +218,15 @@ def test_replay_warns_when_no_btc_tape_source_exists(tmp_path, caplog):
 def test_writer_round_trip_at_realistic_tick_volume(tmp_path, monkeypatch, n_ticks):
     """Writer + reader handle realistic line counts. 100 ticks ≈ 100 s
     of daemon runtime; 12 h session = ~43k lines and the writer is
-    line-buffered (buffering=1) so this scales."""
-    import time
+    line-buffered (buffering=1) so this scales.
 
+    Uses an integer t0 to avoid the ``.6f``-formatting + float-precision
+    corner case that surfaces only in synthetic tests where
+    ``launch_ts_ns`` and the first tick's ``ts`` are derived from the
+    same wall-clock instant. In real captures the launcher's
+    ``launch_ts_ns`` is set milliseconds BEFORE any BTC tick, so
+    ``t_lo < first_tick_ts`` always — even with ``.6f`` truncation.
+    """
     import daemon_base_v1
     from polyhustle.data.replay import ReplayDataProvider
 
@@ -228,10 +234,11 @@ def test_writer_round_trip_at_realistic_tick_volume(tmp_path, monkeypatch, n_tic
     session_dir.mkdir()
     monkeypatch.setenv("POLYMARKET_SCRAPE_SESSION_DIR", str(session_dir))
 
+    # Integer t0 → .6f format preserves it exactly → no precision drift.
+    t0 = 1_700_000_000
     fh = daemon_base_v1._open_btc_tick_writer()
     assert fh is not None
     try:
-        t0 = time.time()
         for i in range(n_ticks):
             ts = t0 + i * 1.0
             price = 100_000.0 + i
