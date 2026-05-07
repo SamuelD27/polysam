@@ -214,6 +214,10 @@ echo "[launch_daemon] session_id=$SESSION_ID"
 
 # ── Daemon launch ────────────────────────────────────────────────────────
 export POLYMARKET_MODE="$MODE"
+# H1: tell the daemon where to write per-session btc_ticks.jsonl. The daemon
+# falls back gracefully if this is unset (legacy invocations / polyhustle.cli
+# direct call). See CLAUDE.md §19 for the consumer side (replay BTC tape).
+export POLYMARKET_SCRAPE_SESSION_DIR="$SCRAPE_SESSION_DIR"
 if [[ "$DRYRUN" == "dryrun" || "$DRYRUN" == "dry_run" ]]; then
     export POLYMARKET_DRY_RUN=1
     echo "[launch_daemon] DRY_RUN=1 — orders will be logged, NOT posted"

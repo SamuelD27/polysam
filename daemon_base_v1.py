@@ -661,32 +661,85 @@ class DaemonState:
 
 # ── Websocket feeds ──────────────────────────────────────────────────────
 
+def _open_btc_tick_writer():
+    """Open the per-session btc_ticks.jsonl writer, or return None.
+
+    H1 (replay BTC tape source). When the daemon launches via
+    ``launch_daemon.sh``, ``POLYMARKET_SCRAPE_SESSION_DIR`` is exported
+    pointing at ``daemon_state/scrapes/<session_id>/`` and the writer
+    appends one JSON line per Binance trade tick to
+    ``<dir>/btc_ticks.jsonl``. ``ReplayDataProvider`` reads this file
+    in preference to the legacy ``dashboard_history.jsonl``.
+
+    Returns a line-buffered file handle opened in append mode, or
+    None when the env var is unset (direct ``polyhustle.cli`` /
+    legacy invocation paths) — the per-tick write becomes a no-op
+    so behaviour is unchanged.
+    """
+    session_dir = os.environ.get("POLYMARKET_SCRAPE_SESSION_DIR", "").strip()
+    if not session_dir:
+        return None
+    sd = Path(session_dir)
+    try:
+        sd.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("btc_ticks: cannot mkdir %s — %s; tape disabled", sd, e)
+        return None
+    path = sd / "btc_ticks.jsonl"
+    try:
+        # Append + line-buffered — Ctrl-C between fsync intervals loses
+        # at most the buffered line. Resume scenarios append cleanly.
+        fh = path.open("a", buffering=1)
+    except OSError as e:
+        logger.warning("btc_ticks: cannot open %s — %s; tape disabled", path, e)
+        return None
+    logger.info("btc_ticks: writing to %s", path)
+    return fh
+
+
 async def binance_feed(state: DaemonState, ewma: EWMA):
     """Connect to Binance and update BTC price + EWMA sigma."""
-    while True:
-        try:
-            async with websockets.connect(WS_BINANCE, ping_interval=20) as ws:
-                state.connections["binance"] = True
-                logger.info("Binance connected")
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    if msg.get("e") != "trade":
-                        continue
-                    price = float(msg["p"])
-                    ts = float(msg["T"]) / 1000.0
-                    state.btc_price = price
-                    state.btc_ts = ts
-                    if state.strike and state.t_zero:
-                        sig = ewma.update(price, ts)
-                        if sig is not None and sig > 0:
-                            state.sigma = sig
-                        state.recompute_fair()
-        except (websockets.ConnectionClosed, OSError, KeyError, ValueError) as e:
-            state.connections["binance"] = False
-            logger.warning("Binance disconnected: %s, reconnecting in 1s", e)
-            await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            return
+    btc_tick_fh = _open_btc_tick_writer()
+    try:
+        while True:
+            try:
+                async with websockets.connect(WS_BINANCE, ping_interval=20) as ws:
+                    state.connections["binance"] = True
+                    logger.info("Binance connected")
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        if msg.get("e") != "trade":
+                            continue
+                        price = float(msg["p"])
+                        ts = float(msg["T"]) / 1000.0
+                        state.btc_price = price
+                        state.btc_ts = ts
+                        if btc_tick_fh is not None:
+                            # ts_ns derived from the trade timestamp (Binance ms),
+                            # not local time, so replay's bisect aligns with the
+                            # capture's market_rollover events keyed off the same
+                            # epoch family.
+                            btc_tick_fh.write(
+                                f'{{"ts_ns":{int(ts * 1e9)},'
+                                f'"ts":{ts:.6f},"btc_price":{price}}}\n'
+                            )
+                        if state.strike and state.t_zero:
+                            sig = ewma.update(price, ts)
+                            if sig is not None and sig > 0:
+                                state.sigma = sig
+                            state.recompute_fair()
+            except (websockets.ConnectionClosed, OSError, KeyError, ValueError) as e:
+                state.connections["binance"] = False
+                logger.warning("Binance disconnected: %s, reconnecting in 1s", e)
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                return
+    finally:
+        if btc_tick_fh is not None:
+            try:
+                btc_tick_fh.close()
+            except OSError:
+                pass
 
 
 def _gamma_fetch_yes_price(slug: str, timeout: float = 3.0) -> float | None:
