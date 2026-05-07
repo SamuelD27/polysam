@@ -299,38 +299,87 @@ class ReplayDataProvider(DataProvider):
                 self.events.append(row)
 
     def _load_btc_tape(self) -> None:
-        """Read dashboard_history.jsonl from the manifest's daemon_log
-        sibling, falling back to daemon_state/dashboard_history.jsonl
-        relative to cwd.
+        """Load the BTC tape from the most authoritative source available.
+
+        Priority:
+            1. ``<session_dir>/btc_ticks.jsonl`` — H1 per-session tape
+               written by the daemon's Binance WS handler. This is the
+               canonical source for any capture taken after H1 lands.
+            2. ``daemon_state/dashboard_history.jsonl`` (sibling of the
+               daemon log, falling back to cwd/``daemon_state/``) — the
+               legacy source. Pre-H1 captures (R2.2 era) populated this
+               via the now-retired ``scripts/live_dashboard.py``.
+
+        Each row is filtered to ``[launch_ts_ns, stop_ts_ns]``. If
+        neither source yields any ticks, ``self.btc_ticks`` is left
+        empty and ``_build_tick`` will return None for every replay
+        tick (existing behaviour) — but a clear ``logger.warning`` is
+        emitted to surface the gap; downstream callers can decide
+        whether to abort.
         """
-        candidates = []
+        candidates: list[tuple[Path, str]] = []
+        # 1. Per-session btc_ticks.jsonl — H1 source.
+        candidates.append(
+            (self.session_path / "btc_ticks.jsonl", "session_btc_ticks"),
+        )
+        # 2. Legacy dashboard_history.jsonl.
         log_path = self.manifest.get("daemon_log_path")
         if log_path:
-            candidates.append(Path(log_path).parent / "dashboard_history.jsonl")
-        candidates.append(Path("daemon_state") / "dashboard_history.jsonl")
+            candidates.append(
+                (Path(log_path).parent / "dashboard_history.jsonl",
+                 "dashboard_history_log_sibling"),
+            )
+        candidates.append(
+            (Path("daemon_state") / "dashboard_history.jsonl",
+             "dashboard_history_cwd"),
+        )
+
         t_lo = self.launch_ts_ns / 1e9
         t_hi = self.stop_ts_ns / 1e9
-        for path in candidates:
-            if path.is_file():
-                with path.open() as f:
-                    for line in f:
-                        try:
-                            row = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        ts = row.get("ts")
-                        btc = row.get("btc_price")
-                        if ts is None or btc is None:
-                            continue
-                        if not (t_lo <= ts <= t_hi):
-                            continue
-                        self.btc_ticks.append(_BTCTick(ts=ts, btc_price=btc))
-                if self.btc_ticks:
-                    break
+        chosen_source: str | None = None
+        for path, label in candidates:
+            if not path.is_file():
+                continue
+            loaded_from_this = 0
+            with path.open() as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = row.get("ts")
+                    btc = row.get("btc_price")
+                    if ts is None or btc is None:
+                        continue
+                    if not (t_lo <= ts <= t_hi):
+                        continue
+                    self.btc_ticks.append(_BTCTick(ts=ts, btc_price=btc))
+                    loaded_from_this += 1
+            if loaded_from_this > 0:
+                chosen_source = label
+                logger.info(
+                    "btc tape: loaded %d ticks from %s (%s)",
+                    loaded_from_this, path, label,
+                )
+                break
+
+        if not self.btc_ticks:
+            logger.warning(
+                "btc tape: no ticks loaded for session %s — every "
+                "MarketTick will yield btc_price=None and replay will "
+                "produce zero ticks downstream. Confirm the capture "
+                "was taken with a daemon that writes btc_ticks.jsonl "
+                "(H1) or has a dashboard_history.jsonl covering the "
+                "session window.",
+                self.session_id,
+            )
+
         self.btc_ticks.sort(key=lambda x: x.ts)
         # Pre-build the bisect ts list so _btc_at is O(log n) per call
         # without rebuilding the list every tick.
         self._btc_ts_list = [b.ts for b in self.btc_ticks]
+        # Stash the chosen source so tests / diagnostics can inspect it.
+        self.btc_tape_source: str | None = chosen_source
 
     def _compute_sigma_tape(self) -> None:
         """Precompute annualised sigma per BTC tick via EWMA.
