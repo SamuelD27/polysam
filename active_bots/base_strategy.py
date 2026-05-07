@@ -223,6 +223,11 @@ class BaseStrategy(Strategy):
         market_price_up: float,
         sigma: float,
         t_zero: float,
+        market_price_ts: float | None = None,
+        *,
+        books: Any = None,
+        now: float | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any] | None:
         """Process a price tick. Returns an action dict or None.
 
@@ -231,6 +236,11 @@ class BaseStrategy(Strategy):
             market_price_up: current market price for the Up token (0..1)
             sigma: current annualized volatility estimate
             t_zero: market start timestamp (epoch seconds)
+            market_price_ts: ignored by the base; accepted for canonical signature
+            books: ignored by the base; accepted for canonical signature
+            now: tick-time epoch seconds. ``None`` (live mode) → ``time.time()``;
+                replay mode passes the tick's historical timestamp so elapsed
+                is computed against the replayed time, not wall-clock.
 
         Returns:
             None if no action, or a dict:
@@ -238,7 +248,7 @@ class BaseStrategy(Strategy):
                "size_usdc": ..., "size_shares": ...}
             - {"action": "RESOLVE", "won": ..., "pnl": ..., ...}
         """
-        now = time.time()
+        now = now if now is not None else time.time()
 
         # Detect new market
         if self._t_zero != t_zero:

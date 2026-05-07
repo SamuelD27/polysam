@@ -62,7 +62,7 @@ class FakeStrategy(Strategy):
 
     def on_tick(
         self, btc_price, market_price_up, sigma, t_zero,
-        market_price_ts=0.0, *, books=None,
+        market_price_ts=None, *, books=None, now=None, **kwargs,
     ):
         self.on_tick_calls.append(
             (btc_price, market_price_up, sigma, t_zero, market_price_ts, books)
@@ -311,80 +311,6 @@ async def test_provider_shutdown_called_on_run_completion():
     )
     await o.run()
     assert p.shutdown_called is True
-
-
-class NarrowFourArgStrategy(Strategy):
-    """Subclass with only the 4-arg on_tick form (mirrors BaseStrategy's surface)."""
-
-    def __init__(self):
-        self._open = False
-        self.calls: list[tuple] = []
-
-    def on_tick(self, btc_price, market_price_up, sigma, t_zero):  # type: ignore[override]
-        self.calls.append((btc_price, market_price_up, sigma, t_zero))
-        return None
-
-    def reset(self, t_zero=None, strike=None):
-        self._open = False
-
-    @property
-    def has_position(self) -> bool:
-        return self._open
-
-
-@pytest.mark.asyncio
-async def test_signature_fallback_warns_exactly_once_across_n_ticks(caplog):
-    """A 4-arg-only Strategy triggers the fallback; warning fires once across N ticks."""
-    s = NarrowFourArgStrategy()
-    t = FakeTrader()
-    a = StrategyAssignment(name="narrow", strategy=s, trader=t, role="observer")
-
-    n_ticks = 5
-    o = Orchestrator(
-        data_provider=FakeDataProvider([_tick() for _ in range(n_ticks)]),
-        assignments=[a],
-        risk=FakeRisk(),
-        events=FakeEventLogger(),
-    )
-    with caplog.at_level("WARNING", logger="polyhustle.orchestrator"):
-        await o.run()
-
-    # Strategy received every tick via the narrow form (verifies fallback fired).
-    assert len(s.calls) == n_ticks
-    # Warning fired exactly once across all N ticks.
-    fallback_records = [
-        r for r in caplog.records
-        if "rejected the canonical signature" in r.getMessage()
-    ]
-    assert len(fallback_records) == 1
-    msg = fallback_records[0].getMessage()
-    assert "NarrowFourArgStrategy" in msg
-    assert "4-arg" in msg
-
-
-@pytest.mark.asyncio
-async def test_signature_fallback_dedup_per_class_not_per_instance(caplog):
-    """Two instances of the same narrow class share one warning slot."""
-    s1 = NarrowFourArgStrategy()
-    s2 = NarrowFourArgStrategy()
-    a1 = StrategyAssignment(name="narrow1", strategy=s1, trader=FakeTrader(), role="observer")
-    a2 = StrategyAssignment(name="narrow2", strategy=s2, trader=FakeTrader(), role="observer")
-
-    o = Orchestrator(
-        data_provider=FakeDataProvider([_tick(), _tick()]),
-        assignments=[a1, a2],
-        risk=FakeRisk(),
-        events=FakeEventLogger(),
-    )
-    with caplog.at_level("WARNING", logger="polyhustle.orchestrator"):
-        await o.run()
-
-    fallback_records = [
-        r for r in caplog.records
-        if "rejected the canonical signature" in r.getMessage()
-    ]
-    # Two assignments × two ticks = 4 fallback firings; dedup → 1 warning.
-    assert len(fallback_records) == 1
 
 
 @pytest.mark.asyncio

@@ -91,8 +91,18 @@ class TimeBasedStrategy:
         market_price_up: float,
         sigma: float,
         t_zero: float,
+        market_price_ts: float | None = None,
+        *,
+        books: Any = None,
+        now: float | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any] | None:
         """Process a price tick. Returns an action dict or None.
+
+        ``now`` defaults to wall-clock; replay callers pass the tick's
+        historical timestamp so the entry-zone gate fires against the
+        replayed time, not wall-clock — see
+        ``polyhustle/strategies/strategy_abc.py``.
 
         Returns:
             None or dict with keys:
@@ -100,7 +110,7 @@ class TimeBasedStrategy:
                "size_usdc", "size_shares", "time_zone", "fair", "market"}
             - {"action": "RESOLVE", ...}
         """
-        now = time.time()
+        now = now if now is not None else time.time()
 
         # Detect new market
         if self._t_zero != t_zero:
@@ -339,6 +349,8 @@ class ProfitGrabber:
         t_zero: float,
         market_price_up: float | None = None,
         market_price_ts: float = 0.0,
+        *,
+        now: float | None = None,
     ) -> dict[str, Any] | None:
         """Check whether to TP or SL an open position.
 
@@ -349,8 +361,12 @@ class ProfitGrabber:
         TP / SL thresholds scale with the entry edge: a high-conviction
         position holds longer for a bigger move; a low-conviction position
         cashes out at the first whiff of profit.
+
+        ``now`` defaults to wall-clock; the strategy on_tick passes its
+        own ``now`` through so replay-mode time accounting stays
+        consistent end-to-end.
         """
-        now = time.time()
+        now = now if now is not None else time.time()
         elapsed = now - t_zero
         time_remaining = MARKET_DURATION - elapsed
 
@@ -706,7 +722,11 @@ class EnhancedStrategy(Strategy):
         market_price_up: float,
         sigma: float,
         t_zero: float,
-        market_price_ts: float = 0.0,
+        market_price_ts: float | None = None,
+        *,
+        books: Any = None,
+        now: float | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any] | None:
         """Process tick. Returns action dict or None.
 
@@ -715,8 +735,14 @@ class EnhancedStrategy(Strategy):
         2. Check resolution on existing position
         3. Check squeeze entry (independent signal)
         4. Check time-based edge entry
+
+        ``now`` defaults to wall-clock; replay callers pass the tick's
+        historical timestamp. ``now`` is threaded into the composed
+        ``profit_grabber.check_exit`` and ``time_strategy.on_tick``
+        calls so the whole chain agrees on what time it is.
         """
-        now = time.time()
+        market_price_ts = market_price_ts if market_price_ts is not None else 0.0
+        now = now if now is not None else time.time()
 
         # Detect new market
         if self._t_zero != t_zero:
@@ -738,6 +764,7 @@ class EnhancedStrategy(Strategy):
                 self._t_zero,
                 market_price_up=market_price_up,
                 market_price_ts=market_price_ts,
+                now=now,
             )
             if exit_action is not None:
                 exit_action["position_source"] = self._position_source
@@ -781,7 +808,9 @@ class EnhancedStrategy(Strategy):
 
         # 4. Time-based edge entry
         if not self.has_position:
-            entry = self.time_strategy.on_tick(btc_price, market_price_up, sigma, t_zero)
+            entry = self.time_strategy.on_tick(
+                btc_price, market_price_up, sigma, t_zero, now=now,
+            )
             if entry is not None and entry.get("action") == "ENTER":
                 self._position_source = "edge"
                 self._open_position = {

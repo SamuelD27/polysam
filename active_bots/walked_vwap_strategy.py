@@ -96,12 +96,18 @@ class WalkedExitProfitGrabber(ProfitGrabber):
         t_zero: float,
         market_price_up: float | None = None,
         market_price_ts: float = 0.0,
+        *,
+        now: float | None = None,
     ) -> dict[str, Any] | None:
         """Re-price exit on walked-bid VWAP (post-fee), then defer to parent.
 
         See STRATEGY.md §4 for the full mechanics. With ``EXIT_ENABLE=False``
         this is a transparent passthrough to ``ProfitGrabber.check_exit``.
+
+        ``now`` threads tick-time through to the staleness gate and the
+        force-window calculation; live callers leave it ``None``.
         """
+        wall_now = now if now is not None else _time.time()
         # Default-off: short-circuit so behaviour is identical to vanilla
         # ProfitGrabber.check_exit when EXIT_ENABLE is False (preserves mid
         # quoting bit-for-bit, no logging side effects).
@@ -113,12 +119,13 @@ class WalkedExitProfitGrabber(ProfitGrabber):
                 t_zero,
                 market_price_up=market_price_up,
                 market_price_ts=market_price_ts,
+                now=now,
             )
 
         # Force-window detection mirrors enhanced_strategy.py:282-284 so the
         # gate's bad-book fallback decision matches the parent's own
         # force-close semantics (never hold past resolution).
-        time_remaining = MARKET_DURATION - (_time.time() - t_zero)
+        time_remaining = MARKET_DURATION - (wall_now - t_zero)
         in_force_window = (
             self.force_exit_before_s > 0 and time_remaining <= self.force_exit_before_s
         )
@@ -127,6 +134,7 @@ class WalkedExitProfitGrabber(ProfitGrabber):
             position,
             market_price_up,
             in_force_window,
+            now=wall_now,
         )
         if translated is None:
             # FALLBACK_MID=0 + non-force-window + bad book → hold position;
@@ -140,6 +148,7 @@ class WalkedExitProfitGrabber(ProfitGrabber):
             t_zero,
             market_price_up=translated,
             market_price_ts=market_price_ts,
+            now=now,
         )
 
     def _compute_translated_market_price_up(
@@ -147,6 +156,8 @@ class WalkedExitProfitGrabber(ProfitGrabber):
         position: dict[str, Any],
         mid_market_price_up: float | None,
         in_force_window: bool,
+        *,
+        now: float,
     ) -> float | None:
         """Returns market_price_up to feed parent.check_exit, or None to hold.
 
@@ -169,7 +180,6 @@ class WalkedExitProfitGrabber(ProfitGrabber):
             return mid_market_price_up if (EXIT_FALLBACK_MID or in_force_window) else None
 
         # Staleness gate — book.ts_ms is milliseconds (per LiveBookState).
-        now = _time.time()
         if book.ts_ms and (now - book.ts_ms / 1000.0) > EXIT_STALENESS_S:
             self._log_liquidity_gap(reason="stale_book", side=side)
             return mid_market_price_up if (EXIT_FALLBACK_MID or in_force_window) else None
@@ -267,6 +277,8 @@ class WalkedVWAPStrategy(RefinedStrategy):
         sigma: float,
         t_zero: float,
         market_price_ts: float,
+        *,
+        now: float | None = None,
     ) -> dict[str, Any] | None:
         # Indirection so tests can monkeypatch this seam.
         return RefinedStrategy.on_tick(
@@ -276,6 +288,7 @@ class WalkedVWAPStrategy(RefinedStrategy):
             sigma=sigma,
             t_zero=t_zero,
             market_price_ts=market_price_ts,
+            now=now,
         )
 
     def on_tick(
@@ -284,16 +297,23 @@ class WalkedVWAPStrategy(RefinedStrategy):
         market_price_up: float,
         sigma: float,
         t_zero: float,
-        market_price_ts: float = 0.0,
+        market_price_ts: float | None = None,
         *,
         books: MarketBooks | None = None,
+        now: float | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any] | None:
         """Run the parent's on_tick and gate any ENTER through walked-VWAP.
 
         See STRATEGY.md §3 for the per-tick flow. Returns the parent's action
         unchanged for non-ENTER, the gate-augmented action on entry pass, or
         a ``WALKED_VWAP_REJECT`` action when an entry is rejected.
+
+        ``now`` threads tick-time through to the parent and the entry gate
+        so replay-mode time accounting stays consistent end-to-end.
         """
+        market_price_ts = market_price_ts if market_price_ts is not None else 0.0
+        wall_now = now if now is not None else _time.time()
         # Stash books onto the exit-aware ProfitGrabber every tick, even when
         # books is None — the subclass's own None branch handles fallback, so
         # keeping the stash unconditional avoids a stale book leaking from a
@@ -306,12 +326,15 @@ class WalkedVWAPStrategy(RefinedStrategy):
             sigma,
             t_zero,
             market_price_ts,
+            now=now,
         )
         if action is None:
             return None
         if action.get("action") != "ENTER":
             return action
-        return self._gate(action, market_price_ts=market_price_ts, books=books)
+        return self._gate(
+            action, market_price_ts=market_price_ts, books=books, now=wall_now,
+        )
 
     def _gate(
         self,
@@ -319,8 +342,8 @@ class WalkedVWAPStrategy(RefinedStrategy):
         *,
         market_price_ts: float,
         books: MarketBooks | None,
+        now: float,
     ) -> dict[str, Any]:
-        now = _time.time()
 
         # 1. Staleness
         if (

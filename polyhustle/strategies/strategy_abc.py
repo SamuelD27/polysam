@@ -2,41 +2,31 @@
 
 Why an ABC.
 -----------
-Today's strategy classes (``BaseStrategy``, ``EnhancedStrategy``,
-``RefinedStrategy``, ``WalkedVWAPStrategy``) already share a common
-shape — same ``on_tick`` / ``reset`` / ``has_position`` surface. The
-ABC formalises that contract so the Orchestrator can dispatch ticks
+Every strategy class (``BaseStrategy``, ``EnhancedStrategy``,
+``RefinedStrategy``, ``WalkedVWAPStrategy``) shares a common shape —
+same ``on_tick`` / ``reset`` / ``has_position`` surface. The ABC
+formalises that contract so the Orchestrator can dispatch ticks
 through a typed interface and so anyone adding a new strategy has a
 single declaration to follow.
 
-Findings — signature divergences (surfaced, not fixed).
--------------------------------------------------------
-Python's ``ABC`` only enforces method NAMES, not signatures. The
-classes inherit from ``Strategy`` cleanly today, but their
-``on_tick`` signatures are not identical:
+Canonical signature.
+--------------------
+All concrete strategies accept the canonical shape
+``(btc_price, market_price_up, sigma, t_zero,
+market_price_ts=None, *, books=None, now=None, **kwargs)``. The
+``**kwargs`` slot is forward-compat for future kwargs the
+Orchestrator might pass — strategies that don't use them ignore them.
 
-- ``BaseStrategy.on_tick(btc_price, market_price_up, sigma, t_zero)``
-  — no ``market_price_ts``, no ``books``. The legacy daemon does NOT
-  call ``BaseStrategy.on_tick`` (it inlines the entry math at
-  ``daemon_base_v1.py:1695``); so this divergence is latent, not
-  active.
-- ``EnhancedStrategy.on_tick(btc_price, market_price_up, sigma,
-  t_zero, market_price_ts=0.0)`` — adds ``market_price_ts`` as a
-  positional arg with default. No ``books``.
-- ``WalkedVWAPStrategy.on_tick(btc_price, market_price_up, sigma,
-  t_zero, market_price_ts=0.0, *, books=None)`` — superset of all the
-  above.
-
-The ABC's ``on_tick`` documents the canonical signature
-(``market_price_ts`` as a positional default + ``books`` as a kwarg
-default) — i.e. the ``WalkedVWAPStrategy`` shape, which is the only
-fully-walked production caller. Strategies that don't use
-``market_price_ts`` or ``books`` simply ignore them; the daemon
-already passes both to walked-vwap and only ``market_price_ts`` to
-enhanced/refined.
-
-The Orchestrator (Commit 7) passes both to every strategy uniformly.
-The legacy ``daemon_base_v1.strategy_loop`` is unchanged.
+The ``now`` kwarg threads the tick's own timestamp into the
+strategy. Live-mode callers omit ``now`` (it defaults to ``None``)
+and strategies fall back to ``time.time()`` for elapsed-time math.
+Replay-mode callers pass ``now=tick.timestamp`` so elapsed is
+computed against the tick's historical time, not wall-clock — the
+fix for the replay-mode dead loop diagnosed in
+``reports/r4_replay_wiring_diag.md``. The Orchestrator passes
+``now=tick.timestamp`` unconditionally; in live mode the tick's
+timestamp IS wall-clock (modulo data-provider construction
+microseconds) so behaviour is preserved.
 
 Contract.
 ---------
@@ -72,9 +62,11 @@ class Strategy(ABC):
         market_price_up: float,
         sigma: float,
         t_zero: float,
-        market_price_ts: float = 0.0,
+        market_price_ts: float | None = None,
         *,
         books: MarketBooks | None = None,
+        now: float | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any] | None:
         """Process one MarketTick and return an action dict (or None).
 
