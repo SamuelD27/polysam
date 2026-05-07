@@ -625,11 +625,17 @@ was the diagnostic-time hypothesis). NEXT-window empty stays at DEBUG
   `pytest tests/scraper/test_resubscribe.py -v` — five tests, all
   green. Mocks the CLOB WS on a free localhost port and asserts the
   resubscribe-on-discovery contract.
-- After the next live capture, spot-check the first 30 minutes of
-  `daemon_state/book_feed/<DATE>/*.jsonl.gz`: at least 50 % of frames
-  per slug should have non-empty bids OR non-empty asks. Markets do go
-  quiet briefly so 100 % is not the bar; 50 % distinguishes a working
-  scraper from the all-empty pattern that the R2.2 capture exhibited.
+- After the next live capture, run
+  `python scripts/check_book_feed.py daemon_state/book_feed/<DATE>/`.
+  This is the only sanctioned way to check capture health — it
+  applies the corrected populated-frame predicate (counts `book`
+  events with `raw.bids|raw.asks`, `price_change` events with
+  size-non-zero deltas, and `snapshot` events with top-level
+  `bids|asks`). Median ratio ≥ 80 % across slugs = healthy; ad-hoc
+  bash one-liners that grep top-level `bids` only are unreliable
+  because they miss the two event classes that carry book data
+  inside nested fields (this exact mistake misled the dcfe272
+  merge gate; see `reports/r3_failure_diagnostic.md`).
 - Grep `daemon.log` for `ws resubscribe:` lines. One per discovery
   cycle that adds tokens — useful audit signal that the fix is
   active. Also grep for `prime_from_rest: empty REST /book for ACTIVE
