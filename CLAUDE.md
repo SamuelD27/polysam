@@ -572,3 +572,66 @@ web GUI, and its `status` / `attach` / `preflight` / `refresh_cache`
 subcommands now print a "no longer dispatched here" message. The
 replacement workflow for each is in
 `docs/LAUNCHER.md` §"Migrating from launch_daemon.sh".
+
+---
+
+## 18. Scraper — discovery resubscribe (May 2026)
+
+**Plain summary.** The scraper kept a single long-lived WebSocket but
+never told that connection about new markets it discovered after boot.
+So markets discovered later got zero book data — every periodic
+snapshot for those markets was written with empty bids and empty asks.
+The R2.2 capture made this obvious: only 2 of 144 captured slugs had
+populated YES books with both sides, and the realistic-paper replay
+infrastructure produced zero entries because the simulator had nothing
+to walk. The fix re-sends the full subscription list every time a new
+market is discovered.
+
+**Technical body.** The asymmetry was between
+`scripts/scrape_book.py:_subscribe_and_stream` and
+`daemon_base_v1.py:clob_book_feed`. Both connect to
+`wss://ws-subscriptions-clob.polymarket.com/ws/market` with the same
+subscription shape (`{"assets_ids": [...], "type": "market",
+"custom_feature_enabled": true}`). The daemon resubscribes on every
+market rollover (close + reopen with the new 4-token list — current
+YES/NO + next YES/NO). The scraper called `ws.send(sub)` once per
+WS connection and then accumulated tokens via `_discovery_loop`
+without ever telling the WS — accumulated to ~288 tokens over a
+12-hour R2.2 session, of which only the original handful received
+book events. `_periodic_snapshotter` then faithfully serialised the
+never-populated local state every 5 s for the lifetime of each token.
+
+**Fix shape.** Discovery cycles that add at least one new token set a
+shared `asyncio.Event`. The WS task uses `asyncio.wait_for(ws.recv(),
+timeout=1.0)` (mirroring the daemon's known-good pattern); on the next
+recv timeout it checks the event, logs a one-line WARNING with old/new
+token counts, and breaks — the outer reconnect loop immediately
+re-subscribes with `list(token_states.keys())`. The event is cleared
+after each (re)subscribe so future discovery cycles fire fresh.
+Per-slug file format is unchanged — `polyhustle/data/replay.py`'s
+loader continues to work without modification.
+
+**Loud-failure complement.** `_prime_from_rest` now distinguishes
+ACTIVE-window from NEXT-window tokens via the slug's `t_zero` suffix.
+An empty REST `/book` for an ACTIVE token logs WARNING with enough
+context to grep `daemon.log` and cross-check against the daemon's
+runtime book state at the same moment (CDN / regional cache mismatch
+was the diagnostic-time hypothesis). NEXT-window empty stays at DEBUG
+(the market hasn't opened yet — empty REST is expected).
+
+**How to verify.**
+
+- Run the integration test:
+  `pytest tests/scraper/test_resubscribe.py -v` — five tests, all
+  green. Mocks the CLOB WS on a free localhost port and asserts the
+  resubscribe-on-discovery contract.
+- After the next live capture, spot-check the first 30 minutes of
+  `daemon_state/book_feed/<DATE>/*.jsonl.gz`: at least 50 % of frames
+  per slug should have non-empty bids OR non-empty asks. Markets do go
+  quiet briefly so 100 % is not the bar; 50 % distinguishes a working
+  scraper from the all-empty pattern that the R2.2 capture exhibited.
+- Grep `daemon.log` for `ws resubscribe:` lines. One per discovery
+  cycle that adds tokens — useful audit signal that the fix is
+  active. Also grep for `prime_from_rest: empty REST /book for ACTIVE
+  token` — should be zero or rare; persistent volume here means the
+  REST path is failing in some way the WS path isn't.
