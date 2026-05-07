@@ -21,7 +21,7 @@ streams during the active window dominate the file.
 Usage:
     python scripts/check_book_feed.py <directory>
     python scripts/check_book_feed.py daemon_state/book_feed/2026-05-07/
-    python scripts/check_book_feed.py daemon_state/book_feed/2026-05-07_R3_FAILED/
+    python scripts/check_book_feed.py daemon_state/book_feed/2026-05-07_R3/
 
 Glob is recursive: pointing at ``daemon_state/book_feed/`` walks every
 date subdir. Pointing at a date subdir walks only that day.
