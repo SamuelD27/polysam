@@ -421,8 +421,19 @@ async def _subscribe_and_stream(
     token_states: dict[str, TokenState],
     writer: FeedWriter,
     session: requests.Session,
+    discovery_event: asyncio.Event,
 ) -> None:
-    """Single long-lived WS connection. Reconnects with REST reprime on drop."""
+    """Single long-lived WS connection. Reconnects with REST reprime on drop.
+
+    On every iteration, subscribes once with the current ``assets_ids``
+    snapshot. The CLOB WS does not support adding tokens to a live
+    subscription, so when ``_discovery_loop`` discovers new tokens it
+    sets ``discovery_event``; we detect this on the next 1 s recv
+    timeout, log a one-line WARNING, close the WS, and the outer loop
+    reconnects with the full ``list(token_states.keys())``. This
+    mirrors ``daemon_base_v1.clob_book_feed``'s known-good
+    rollover-resubscribe pattern.
+    """
     while not _shutdown:
         assets_ids = list(token_states.keys())
         if not assets_ids:
@@ -440,11 +451,39 @@ async def _subscribe_and_stream(
                     "custom_feature_enabled": True,
                 }
                 await ws.send(json.dumps(sub))
-                logger.info("subscribed assets=%d", len(assets_ids))
+                subscribed_set: set[str] = set(assets_ids)
+                logger.info("subscribed assets=%d", len(subscribed_set))
+                # Clear AFTER subscribe so any discovery events that
+                # arrived during the subscribe network round-trip are
+                # already covered by this connection.
+                discovery_event.clear()
                 await _prime_from_rest(session, token_states, writer)
-                async for raw in ws:
-                    if _shutdown:
-                        break
+                while not _shutdown:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except TimeoutError:
+                        # On idle: check whether _discovery_loop has
+                        # added tokens since this WS was subscribed.
+                        # Batched per discovery cycle (the event is set
+                        # at most once per cycle).
+                        if discovery_event.is_set():
+                            current = set(token_states.keys())
+                            new_only = current - subscribed_set
+                            if new_only:
+                                logger.warning(
+                                    "ws resubscribe: discovery added %d new "
+                                    "tokens (was %d, now %d); closing WS to "
+                                    "resubscribe with the full set",
+                                    len(new_only),
+                                    len(subscribed_set),
+                                    len(current),
+                                )
+                                break  # outer loop reconnects with full list
+                            # No genuinely new tokens this cycle (e.g.
+                            # discovery saw markets we already had).
+                            # Clear so a future real add still fires.
+                            discovery_event.clear()
+                        continue
                     _dispatch(raw, token_states, writer, session)
         except (websockets.ConnectionClosed, OSError) as e:
             logger.warning("ws disconnect: %s; reconnecting in 3s", e)
@@ -608,10 +647,16 @@ async def _discovery_loop(
     session: requests.Session,
     client: ClobClient,
     token_states: dict[str, TokenState],
+    discovery_event: asyncio.Event,
 ) -> None:
     """Periodically re-discover markets and add new (slug, token) pairs.
     Existing entries are never deleted from token_states during the session —
-    deletion happens on process restart."""
+    deletion happens on process restart.
+
+    On any cycle that adds at least one new token, sets ``discovery_event``
+    so ``_subscribe_and_stream`` can resubscribe with the full set. Setting
+    once per cycle (not once per token) is the natural batching boundary.
+    """
     while not _shutdown:
         try:
             markets = await asyncio.to_thread(discover_markets, session)
@@ -623,6 +668,7 @@ async def _discovery_loop(
                     new_pairs.append((aid, m["slug"], side, m["condition_id"]))
             if new_pairs:
                 resolved = await _bulk_resolve_ticks(client, new_pairs)
+                added = 0
                 for asset_id, slug, side, cid, tick in resolved:
                     if tick is None:
                         continue
@@ -633,10 +679,16 @@ async def _discovery_loop(
                         condition_id=cid,
                         canonical_tick=tick,
                     )
+                    added += 1
                     logger.info(
                         "new market %s %s tick=%s assets=%d",
                         slug, side, tick, len(token_states),
                     )
+                if added:
+                    # Single set per cycle; the WS task picks this up on
+                    # its next 1 s recv timeout and reconnects with the
+                    # full token_states set.
+                    discovery_event.set()
             await asyncio.sleep(MARKET_DISCOVERY_EVERY_S)
         except asyncio.CancelledError:
             return
@@ -669,10 +721,18 @@ async def main_async(args: argparse.Namespace) -> int:
     logger.info("initial subscription set: %d tokens (from %d markets)",
                 len(token_states), len(initial))
 
+    # Created inside the running loop so the asyncio.Event binds to the
+    # right loop (asyncio.Event() at module scope would bind to the
+    # default loop, which may not be the one running these tasks).
+    discovery_event = asyncio.Event()
     tasks = [
-        asyncio.create_task(_subscribe_and_stream(token_states, writer, session)),
+        asyncio.create_task(
+            _subscribe_and_stream(token_states, writer, session, discovery_event),
+        ),
         asyncio.create_task(_periodic_snapshotter(token_states, writer)),
-        asyncio.create_task(_discovery_loop(session, client, token_states)),
+        asyncio.create_task(
+            _discovery_loop(session, client, token_states, discovery_event),
+        ),
     ]
 
     try:
