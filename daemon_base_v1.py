@@ -697,6 +697,43 @@ def _open_btc_tick_writer():
     return fh
 
 
+def _open_market_price_writer():
+    """Open the per-session market_price.jsonl writer, or return None.
+
+    H2 (replay RTDS market_price source). When the daemon launches via
+    ``launch_daemon.sh``, ``POLYMARKET_SCRAPE_SESSION_DIR`` is exported
+    pointing at ``daemon_state/scrapes/<session_id>/`` and the writer
+    appends one JSON line per ACCEPTED RTDS frame (after the rollover-
+    grace + outcome filter) to ``<dir>/market_price.jsonl``.
+    ``ReplayDataProvider`` reads this file in preference to scanning
+    ``events.jsonl`` for ``rtds_market_price`` / ``market_price_update``
+    rows (which the daemon does not actually emit — that source has been
+    structurally empty for every post-H1 capture).
+
+    Returns a line-buffered file handle opened in append mode, or
+    None when the env var is unset (direct ``polyhustle.cli`` /
+    legacy invocation paths) — the per-tick write becomes a no-op
+    so behaviour is unchanged.
+    """
+    session_dir = os.environ.get("POLYMARKET_SCRAPE_SESSION_DIR", "").strip()
+    if not session_dir:
+        return None
+    sd = Path(session_dir)
+    try:
+        sd.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("market_price: cannot mkdir %s — %s; tape disabled", sd, e)
+        return None
+    path = sd / "market_price.jsonl"
+    try:
+        fh = path.open("a", buffering=1)
+    except OSError as e:
+        logger.warning("market_price: cannot open %s — %s; tape disabled", path, e)
+        return None
+    logger.info("market_price: writing to %s", path)
+    return fh
+
+
 async def binance_feed(state: DaemonState, ewma: EWMA):
     """Connect to Binance and update BTC price + EWMA sigma."""
     btc_tick_fh = _open_btc_tick_writer()
@@ -824,6 +861,89 @@ async def _rtds_stale_watchdog(state: DaemonState, ws) -> None:
             return
 
 
+def _process_rtds_message(state: "DaemonState", raw, *, market_price_fh=None):
+    """Filter an RTDS WS message, update state, optionally tape to disk.
+
+    Centralises the per-frame predicate so the live state update and the
+    H2 ``market_price.jsonl`` tape share one filter — byte-identical by
+    construction. Duplicating the rollover-grace / outcome predicate
+    between the live state update and the tape write would let live
+    and replay diverge again the moment one branch changed and the
+    other didn't. ``market_price_fh`` is the per-session writer from
+    ``_open_market_price_writer``; pass None to disable taping (legacy
+    / direct-cli paths unchanged).
+    """
+    if not isinstance(raw, str):
+        return
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+
+    payload = msg.get("payload")
+    if not payload:
+        return
+
+    slug = payload.get("slug", "") or payload.get("eventSlug", "")
+    if not slug.startswith(SLUG_PREFIX):
+        return
+
+    # Accept current cycle OR the cycle that ended in the last
+    # RTDS_ROLLOVER_GRACE_S so in-flight trades from the prior market
+    # aren't dropped silently during the transition.
+    try:
+        trade_slug_tz = int(slug.split("-")[-1])
+    except (ValueError, TypeError):
+        return
+    if trade_slug_tz != state.t_zero:
+        prev_tz = (
+            state.t_zero - MARKET_DURATION
+            if state.t_zero is not None
+            else None
+        )
+        if (
+            trade_slug_tz != prev_tz
+            or state.t_zero is None
+            or (time.time() - state.t_zero) > RTDS_ROLLOVER_GRACE_S
+            or state.market_price_up is not None
+        ):
+            return
+
+    outcome = payload.get("outcome", "")
+    price = payload.get("price")
+    if price is None:
+        return
+    try:
+        raw_price = float(price)
+    except (TypeError, ValueError):
+        return
+
+    if outcome in ("Up", "Yes"):
+        state.market_price_up = raw_price
+        normalised_outcome = "yes"
+    elif outcome in ("Down", "No"):
+        state.market_price_up = 1.0 - raw_price
+        normalised_outcome = "no"
+    else:
+        return
+
+    now = time.time()
+    state.market_price_ts = now
+
+    if market_price_fh is not None:
+        try:
+            market_price_fh.write(json.dumps({
+                "ts_ns": int(now * 1e9),
+                "ts": round(now, 6),
+                "slug": slug,
+                "outcome": normalised_outcome,
+                "raw_price": raw_price,
+                "market_price_up": state.market_price_up,
+            }, separators=(",", ":")) + "\n")
+        except OSError as e:
+            logger.warning("market_price: write failed — %s", e)
+
+
 async def rtds_feed(state: DaemonState):
     """Connect to Polymarket RTDS and update market price.
 
@@ -833,102 +953,59 @@ async def rtds_feed(state: DaemonState):
       Layer 3 — a short t_zero grace window absorbs in-flight trades from
                 the just-ended cycle during the rollover transition.
     """
-    while True:
-        try:
-            async with websockets.connect(
-                WS_RTDS,
-                ping_interval=RTDS_PING_INTERVAL_S,
-                ping_timeout=RTDS_PING_TIMEOUT_S,
-                close_timeout=5.0,
-            ) as ws:
-                state.connections["rtds"] = True
-                state.rtds_last_msg_ts = time.time()
-                logger.info("RTDS connected")
+    market_price_fh = _open_market_price_writer()
+    try:
+        while True:
+            try:
+                async with websockets.connect(
+                    WS_RTDS,
+                    ping_interval=RTDS_PING_INTERVAL_S,
+                    ping_timeout=RTDS_PING_TIMEOUT_S,
+                    close_timeout=5.0,
+                ) as ws:
+                    state.connections["rtds"] = True
+                    state.rtds_last_msg_ts = time.time()
+                    logger.info("RTDS connected")
 
-                sub = json.dumps({
-                    "action": "subscribe",
-                    "subscriptions": [{
-                        "topic": "activity",
-                        "type": "orders_matched",
-                    }],
-                }, separators=(",", ":"))
-                await ws.send(sub)
+                    sub = json.dumps({
+                        "action": "subscribe",
+                        "subscriptions": [{
+                            "topic": "activity",
+                            "type": "orders_matched",
+                        }],
+                    }, separators=(",", ":"))
+                    await ws.send(sub)
 
-                watchdog_task = asyncio.create_task(_rtds_stale_watchdog(state, ws))
-                try:
-                    async for raw in ws:
-                        # Record frame arrival BEFORE any filter: the
-                        # watchdog needs to know the socket is still
-                        # flowing, even if nothing matches our slug.
-                        state.rtds_last_msg_ts = time.time()
-
-                        if not isinstance(raw, str):
-                            continue
-                        try:
-                            msg = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-
-                        payload = msg.get("payload")
-                        if not payload:
-                            continue
-
-                        slug = payload.get("slug", "") or payload.get("eventSlug", "")
-                        if not slug.startswith(SLUG_PREFIX):
-                            continue
-
-                        # Accept current cycle OR the cycle that ended in
-                        # the last RTDS_ROLLOVER_GRACE_S so in-flight
-                        # trades from the prior market aren't dropped
-                        # silently during the transition.
-                        try:
-                            trade_slug_tz = int(slug.split("-")[-1])
-                        except (ValueError, TypeError):
-                            continue
-                        if trade_slug_tz != state.t_zero:
-                            prev_tz = (
-                                state.t_zero - MARKET_DURATION
-                                if state.t_zero is not None
-                                else None
-                            )
-                            if (
-                                trade_slug_tz != prev_tz
-                                or state.t_zero is None
-                                or (time.time() - state.t_zero) > RTDS_ROLLOVER_GRACE_S
-                                or state.market_price_up is not None
-                            ):
-                                continue
-
-                        outcome = payload.get("outcome", "")
-                        price = payload.get("price")
-                        if price is None:
-                            continue
-                        try:
-                            price = float(price)
-                        except (TypeError, ValueError):
-                            continue
-
-                        if outcome in ("Up", "Yes"):
-                            state.market_price_up = price
-                        elif outcome in ("Down", "No"):
-                            state.market_price_up = 1.0 - price
-                        else:
-                            continue
-
-                        state.market_price_ts = time.time()
-                finally:
-                    watchdog_task.cancel()
+                    watchdog_task = asyncio.create_task(_rtds_stale_watchdog(state, ws))
                     try:
-                        await asyncio.wait_for(watchdog_task, timeout=1.0)
-                    except (TimeoutError, asyncio.CancelledError, Exception):
-                        pass
+                        async for raw in ws:
+                            # Record frame arrival BEFORE any filter: the
+                            # watchdog needs to know the socket is still
+                            # flowing, even if nothing matches our slug.
+                            state.rtds_last_msg_ts = time.time()
+                            _process_rtds_message(
+                                state, raw,
+                                market_price_fh=market_price_fh,
+                            )
+                    finally:
+                        watchdog_task.cancel()
+                        try:
+                            await asyncio.wait_for(watchdog_task, timeout=1.0)
+                        except (TimeoutError, asyncio.CancelledError, Exception):
+                            pass
 
-        except (websockets.ConnectionClosed, OSError) as e:
-            state.connections["rtds"] = False
-            logger.warning("RTDS disconnected: %s, reconnecting in 1s", e)
-            await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            return
+            except (websockets.ConnectionClosed, OSError) as e:
+                state.connections["rtds"] = False
+                logger.warning("RTDS disconnected: %s, reconnecting in 1s", e)
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                return
+    finally:
+        if market_price_fh is not None:
+            try:
+                market_price_fh.close()
+            except OSError:
+                pass
 
 
 # ── CLOB book feed (walked-VWAP gate input) ────────────────────────────

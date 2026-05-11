@@ -127,7 +127,7 @@ verify_tunnel() {
 
 run_in_ns() {
     sudo -E ip netns exec "$NS" sudo -E -u samsam \
-        --preserve-env=HOME,PATH,CONDA_PREFIX,CONDA_DEFAULT_ENV,VIRTUAL_ENV,POLYMARKET_MODE,POLYMARKET_DRY_RUN,WALKED_VWAP_EXIT_ENABLE,WALKED_VWAP_EXIT_STALENESS_S,WALKED_VWAP_EXIT_PARTIAL_OK,WALKED_VWAP_EXIT_FALLBACK_MID \
+        --preserve-env=HOME,PATH,CONDA_PREFIX,CONDA_DEFAULT_ENV,VIRTUAL_ENV,POLYMARKET_MODE,POLYMARKET_DRY_RUN,POLYMARKET_SCRAPE_SESSION_DIR,WALKED_VWAP_EXIT_ENABLE,WALKED_VWAP_EXIT_STALENESS_S,WALKED_VWAP_EXIT_PARTIAL_OK,WALKED_VWAP_EXIT_FALLBACK_MID \
         env HOME=/home/samsam \
         "$@"
 }
@@ -214,9 +214,10 @@ echo "[launch_daemon] session_id=$SESSION_ID"
 
 # ── Daemon launch ────────────────────────────────────────────────────────
 export POLYMARKET_MODE="$MODE"
-# H1: tell the daemon where to write per-session btc_ticks.jsonl. The daemon
-# falls back gracefully if this is unset (legacy invocations / polyhustle.cli
-# direct call). See CLAUDE.md §19 for the consumer side (replay BTC tape).
+# H1/H2: tell the daemon where to write the per-session replay tapes
+# (btc_ticks.jsonl, market_price.jsonl). The daemon falls back gracefully
+# if this is unset (legacy invocations / polyhustle.cli direct call).
+# See CLAUDE.md §7 for the consumer side (capture verification + replay).
 export POLYMARKET_SCRAPE_SESSION_DIR="$SCRAPE_SESSION_DIR"
 if [[ "$DRYRUN" == "dryrun" || "$DRYRUN" == "dry_run" ]]; then
     export POLYMARKET_DRY_RUN=1
