@@ -70,6 +70,45 @@ def is_populated(rec: dict) -> bool:
     return False
 
 
+def _check_tape(
+    path: Path | None, *, label: str, missing_consequence: str,
+) -> str | None:
+    """Validate one per-session replay tape (btc_ticks.jsonl or
+    market_price.jsonl). Returns one of:
+        None         — flag not provided; not checked
+        "missing"    — flag provided but file does not exist
+        "unreadable" — file exists but I/O failed
+        "empty"      — file exists and is readable, zero lines
+        "ok"         — file exists, readable, ≥1 line
+
+    Shared shape between --btc-tape and --market-price so the script
+    treats both tapes with the same predicate; mismatched semantics
+    between the two would be a foot-gun.
+    """
+    if path is None:
+        return None
+    if not path.is_file():
+        print(f"{label}: MISSING {path} — {missing_consequence}")
+        return "missing"
+    line_count = 0
+    try:
+        with path.open() as f:
+            for line in f:
+                if line.strip():
+                    line_count += 1
+    except OSError as e:
+        print(f"{label}: UNREADABLE {path} — {e}")
+        return "unreadable"
+    print(f"{label}: OK {path} ({line_count} lines)")
+    if line_count == 0:
+        print(
+            f"{label}: EMPTY — file exists but no lines. "
+            f"{missing_consequence}"
+        )
+        return "empty"
+    return "ok"
+
+
 def scan_file(path: Path) -> tuple[int, int]:
     """Return (total_records, populated_records) for one .jsonl.gz file.
 
@@ -118,7 +157,19 @@ def main() -> int:
             "optional path to btc_ticks.jsonl (the H1 per-session BTC tape). "
             "If provided, the script also asserts the file exists, has at "
             "least 1 line, and parses cleanly. A capture missing its BTC "
-            "tape is unreplayable — see CLAUDE.md §19."
+            "tape is unreplayable — see CLAUDE.md §7."
+        ),
+    )
+    parser.add_argument(
+        "--market-price",
+        type=Path,
+        default=None,
+        help=(
+            "optional path to market_price.jsonl (the H2 per-session RTDS "
+            "tape). Same semantics as --btc-tape: asserts the file exists, "
+            "has at least 1 line, and parses cleanly. A capture missing "
+            "its market_price tape replays with market_price_up pinned to "
+            "the orchestrator's 0.5 constant (the R4 bug) — see CLAUDE.md §7."
         ),
     )
     args = parser.parse_args()
@@ -168,42 +219,44 @@ def main() -> int:
     print(f"files:  {len(rows)}")
     print(f"median: {median:.1%}   p25: {p25:.1%}   p75: {p75:.1%}")
 
-    # Optional BTC-tape check (H1). A capture without a BTC tape is
-    # unreplayable — replay's _build_tick returns None for every tick
-    # when btc is None. Healthier to surface this BEFORE the operator
-    # leaves a 12-hour capture running.
-    btc_tape_status = None
-    if args.btc_tape is not None:
-        if not args.btc_tape.is_file():
-            print(
-                f"BTC tape: MISSING {args.btc_tape} — replay will produce "
-                "zero ticks. Confirm the daemon is writing btc_ticks.jsonl "
-                "(POLYMARKET_SCRAPE_SESSION_DIR set, H1 daemon)."
-            )
-            btc_tape_status = "missing"
-        else:
-            line_count = 0
-            try:
-                with args.btc_tape.open() as f:
-                    for line in f:
-                        if line.strip():
-                            line_count += 1
-            except OSError as e:
-                print(f"BTC tape: UNREADABLE {args.btc_tape} — {e}")
-                btc_tape_status = "unreadable"
-            else:
-                print(f"BTC tape: OK {args.btc_tape} ({line_count} lines)")
-                btc_tape_status = "ok" if line_count > 0 else "empty"
-                if line_count == 0:
-                    print(
-                        "BTC tape: EMPTY — file exists but no lines. "
-                        "Replay will produce zero ticks."
-                    )
+    # Optional tape checks. Captures without these tapes are unreplayable
+    # in mechanically-distinct ways:
+    #   - missing BTC tape  → replay's _build_tick returns None for every
+    #                          tick (btc=None) and the strategy never runs.
+    #   - missing RTDS tape → replay's _market_price_at returns None and
+    #                          the orchestrator's `or 0.5` fallback pins
+    #                          market_price_up to a constant 0.5; the
+    #                          strategy runs but on bogus prices (R4 bug).
+    # Both surface here, BEFORE the operator commits to a 12-hour capture.
+    btc_tape_status = _check_tape(args.btc_tape, label="BTC tape", missing_consequence=(
+        "replay will produce zero ticks. Confirm the daemon is writing "
+        "btc_ticks.jsonl (POLYMARKET_SCRAPE_SESSION_DIR set, H1 daemon)."
+    ))
+    market_price_status = _check_tape(
+        args.market_price, label="market_price tape",
+        missing_consequence=(
+            "replay will pin market_price_up to the orchestrator's 0.5 "
+            "constant (the R4 bug). Confirm the daemon is writing "
+            "market_price.jsonl (POLYMARKET_SCRAPE_SESSION_DIR set, H2 daemon)."
+        ),
+    )
+
+    bad_tapes = [
+        (name, status)
+        for name, status in (
+            ("BTC_TAPE", btc_tape_status),
+            ("MARKET_PRICE_TAPE", market_price_status),
+        )
+        if status not in (None, "ok")
+    ]
 
     if median >= HEALTHY_THRESHOLD:
-        if btc_tape_status not in (None, "ok"):
+        if bad_tapes:
+            tape_desc = ", ".join(
+                f"{name}_{status.upper()}" for name, status in bad_tapes
+            )
             print(
-                f"verdict: BOOK_HEALTHY but BTC_TAPE_{btc_tape_status.upper()} — "
+                f"verdict: BOOK_HEALTHY but {tape_desc} — "
                 "capture is partially unreplayable"
             )
             return 2

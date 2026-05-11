@@ -29,7 +29,7 @@ Conda env: `polymarket-env` (Python 3.11.14).
 | Lint check                                  | `ruff check active_bots/ tests/ scripts/ daemon_base_v1.py`                                   |
 | Shell lint                                  | `shellcheck launch launch_daemon.sh`                                                          |
 | Replay against a capture                    | `python -m polyhustle.cli --config <replay_config.json>` (see `docs/REPLAY.md`)               |
-| Capture health check                        | `python scripts/check_book_feed.py daemon_state/book_feed/<DATE>/ --btc-tape daemon_state/scrapes/<session>/btc_ticks.jsonl` |
+| Capture health check                        | `python scripts/check_book_feed.py daemon_state/book_feed/<DATE>/ --btc-tape daemon_state/scrapes/<session>/btc_ticks.jsonl --market-price daemon_state/scrapes/<session>/market_price.jsonl` |
 | Kill switch (immediate stop of all entries) | `touch daemon_state/KILL`                                                                     |
 
 Daemon controls: `./daemon_base_v1 status / stop / log`. Presets:
@@ -202,7 +202,8 @@ How to confirm a captured session produced real, usable book data.
 
    ```bash
    python scripts/check_book_feed.py daemon_state/book_feed/<DATE>/ \
-     --btc-tape daemon_state/scrapes/<session_id>/btc_ticks.jsonl
+     --btc-tape daemon_state/scrapes/<session_id>/btc_ticks.jsonl \
+     --market-price daemon_state/scrapes/<session_id>/market_price.jsonl
    ```
 
    | Median ratio | Action                                                |
@@ -212,7 +213,9 @@ How to confirm a captured session produced real, usable book data.
    | < 50 %       | Alarm. Kill the capture; diagnose.                    |
 
    Exit codes mirror this: `0` healthy, `2` borderline, `1` alarm,
-   `3` no `.jsonl.gz` files / unreadable.
+   `3` no `.jsonl.gz` files / unreadable. The optional tape flags
+   (`--btc-tape`, `--market-price`) downgrade a healthy book verdict
+   to `2` (partial) if the corresponding tape is missing or empty.
 
 4. **BTC tape is required.** Every post-H1 capture writes
    `daemon_state/scrapes/<session_id>/btc_ticks.jsonl`. A capture
@@ -220,7 +223,27 @@ How to confirm a captured session produced real, usable book data.
    verdict to `BOOK_HEALTHY but BTC_TAPE_<status>` if the book is
    fine but the tape is missing.
 
-5. **Inside-netns smoke for scraper changes.** `tests/scraper/` runs
+5. **Market-price tape is required.** Every post-H2 capture writes
+   `daemon_state/scrapes/<session_id>/market_price.jsonl` — one JSON
+   line per RTDS frame the live handler accepted (post rollover-grace
+   + outcome filter). `ReplayDataProvider` reads this as the priority
+   source for `market_price_up`; without it replay falls back to
+   events.jsonl rtds_market_price / market_price_update rows (which
+   the daemon does not emit) and ultimately to the orchestrator's
+   `0.5` constant — the R4 bug. Schema:
+
+   ```
+   {ts_ns: int, ts: float, slug: str, outcome: "yes"|"no",
+    raw_price: float, market_price_up: float}
+   ```
+
+   The on-disk filter is shared with the live state update via
+   `daemon_base_v1._process_rtds_message` — one predicate updates
+   `state.market_price_up` AND writes the tape, so live and replay
+   cannot diverge on the rollover-grace + outcome rules. Any future
+   change to the filter must keep this single-source invariant.
+
+6. **Inside-netns smoke for scraper changes.** `tests/scraper/` runs
    in default netns; production capture is in polybot netns. Branches
    touching `scripts/scrape_book.py` or the book WS need a 30-min
    `./launch_daemon.sh paper` smoke meeting the 80 % bar.
