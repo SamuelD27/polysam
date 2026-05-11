@@ -19,7 +19,13 @@ Loading strategy (one-time, in __init__ via load()):
 Streaming strategy (in stream()):
   - For each second in the session window, build a MarketTick:
       btc_price       — nearest BTC sample <= now
-      market_price_up — last RTDS rtds_market_price for the active slug
+      market_price_up — last RTDS print for the active slug. Source
+                        priority: <session_dir>/market_price.jsonl
+                        (H2 per-session tape) > events.jsonl rows of
+                        type rtds_market_price / market_price_update
+                        (legacy fallback — empty in practice on every
+                        post-H1 capture, the daemon does not emit
+                        either type). Exposed as market_price_source.
       sigma           — 0.0 placeholder; perf-pass may rebuild EWMA later
       t_zero, slug    — active 5-minute market
       books           — MarketBooks at-or-before now (bisect)
@@ -100,6 +106,16 @@ class ReplayDataProvider(DataProvider):
         self._market_t_zeros: list[float] = []
         self._rtds_ts_cache: dict[str, list[float]] = {}
         self._books_ts_cache: dict[str, list[int]] = {}
+        # Which RTDS market_price source fired. Set during load(); one of:
+        #   "market_price.jsonl" — H2 per-session tape (priority 1)
+        #   "events_jsonl"       — rtds_market_price / market_price_update
+        #                          rows in events.jsonl (priority 2 fallback;
+        #                          empty in practice on every post-H1 capture
+        #                          but retained for legacy / forward-compat)
+        #   "none"               — neither source yielded data; downstream
+        #                          _market_price_at returns (None, None) and
+        #                          the orchestrator's 'or 0.5' fallback fires
+        self.market_price_source: str = "none"
         # Per-tick precomputed sigma — parallel to btc_ticks. Built by
         # _compute_sigma_tape after the BTC tape loads. NaN before EWMA
         # warmup is reached; downstream lookup falls back to 0.0 in the
@@ -121,6 +137,7 @@ class ReplayDataProvider(DataProvider):
         self._load_events()
         self._load_btc_tape()
         self._compute_sigma_tape()
+        self._load_market_price()
         self._index_markets_and_rtds()
         self._loaded = True
 
@@ -421,8 +438,63 @@ class ReplayDataProvider(DataProvider):
             return 0.0
         return self._sigma_tape[i]
 
+    def _load_market_price(self) -> None:
+        """Load the RTDS market_price tape — priority-1 source for replay.
+
+        Priority:
+            1. ``<session_dir>/market_price.jsonl`` — H2 per-session tape
+               written by the daemon's RTDS handler. Each line is one
+               accepted RTDS frame after the live rollover-grace +
+               outcome filter, so the replay-side index is byte-identical
+               to what the live daemon's ``state.market_price_up`` saw.
+            2. (fallback, in ``_index_markets_and_rtds``) ``events.jsonl``
+               rows of type ``rtds_market_price`` / ``market_price_update``.
+               Empty in practice on every post-H1 capture because the
+               daemon does not emit either type, but retained for legacy
+               / forward-compat. Sets ``market_price_source =
+               "events_jsonl"`` if a row is indexed.
+            3. None of the above → ``market_price_source = "none"`` (the
+               default); ``_market_price_at`` returns ``(None, None)``
+               for every lookup; the orchestrator's ``or 0.5`` fallback
+               fires (the bug H2 fixes).
+        """
+        path = self.session_path / "market_price.jsonl"
+        if not path.is_file():
+            return
+        t_lo = self.launch_ts_ns / 1e9
+        t_hi = self.stop_ts_ns / 1e9
+        loaded = 0
+        with path.open() as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = row.get("ts")
+                slug = row.get("slug")
+                m = row.get("market_price_up")
+                if ts is None or slug is None or m is None:
+                    continue
+                if not (t_lo <= ts <= t_hi):
+                    continue
+                try:
+                    self.rtds_by_slug.setdefault(str(slug), []).append(
+                        (float(ts), float(m))
+                    )
+                except (TypeError, ValueError):
+                    continue
+                loaded += 1
+        if loaded > 0:
+            self.market_price_source = "market_price.jsonl"
+            logger.info(
+                "market_price tape: loaded %d points from %s", loaded, path,
+            )
+
     def _index_markets_and_rtds(self) -> None:
-        """Build the (t_zero, t_end, slug, strike) sequence + per-slug RTDS."""
+        """Build the (t_zero, t_end, slug, strike) markets sequence and, if
+        the priority-1 market_price tape did NOT fire, fall back to
+        ``events.jsonl`` rows for the per-slug RTDS index."""
+        fallback_loaded = 0
         for ev in self.events:
             t = ev.get("type")
             if t == "market_rollover":
@@ -431,7 +503,10 @@ class ReplayDataProvider(DataProvider):
                 strike = float(ev.get("strike") or 0.0)
                 if slug and t_zero > 0:
                     self.markets.append((t_zero, t_zero + 300.0, slug, strike))
-            elif t in ("rtds_market_price", "market_price_update"):
+            elif (
+                self.market_price_source == "none"
+                and t in ("rtds_market_price", "market_price_update")
+            ):
                 slug = str(ev.get("slug") or "")
                 m = ev.get("market_price_up")
                 if not slug or m is None:
@@ -439,6 +514,14 @@ class ReplayDataProvider(DataProvider):
                 self.rtds_by_slug.setdefault(slug, []).append(
                     (float(ev.get("ts") or 0.0), float(m))
                 )
+                fallback_loaded += 1
+        if fallback_loaded > 0:
+            self.market_price_source = "events_jsonl"
+            logger.info(
+                "market_price tape: loaded %d points from events.jsonl "
+                "(rtds_market_price / market_price_update rows)",
+                fallback_loaded,
+            )
         self.markets.sort(key=lambda x: x[0])
         for slug in self.rtds_by_slug:
             self.rtds_by_slug[slug].sort(key=lambda x: x[0])
