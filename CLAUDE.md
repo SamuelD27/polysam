@@ -35,6 +35,66 @@ Conda env: `polymarket-env` (Python 3.11.14).
 Daemon controls: `./daemon_base_v1 status / stop / log`. Presets:
 `~/.polymarket-hustle/presets/`. Launcher reference: `docs/LAUNCHER.md`.
 
+## Subagent invocation rules
+
+These are workflow rules, not optional suggestions. Default
+invocations run automatically without asking; explicit-invocation
+agents run only when the operator names them or describes the task.
+
+### Default invocations (auto-delegate without asking)
+
+- **code-reviewer after any non-trivial code change.** "Non-trivial"
+  means more than a one-line fix, more than a comment edit, or any
+  change to logic, control flow, or data handling. Run code-reviewer
+  on the diff before considering the task done. "Task done" is defined
+  as: code-reviewer has run and either reported no blockers or all
+  blockers have been addressed. A change that has not been reviewed is
+  not complete.
+- **paper-session-analyst after any session.** After any paper or
+  live-dryrun session completes, or whenever the operator asks about
+  "the last session", "session results", "PnL", or anything similar,
+  run paper-session-analyst on the session directory.
+- **capture-verifier before any replay-derived conclusion.** Before
+  producing any analysis, conclusion, or recommendation that depends on
+  replay output, run capture-verifier on the session being replayed. If
+  capture-verifier reports failure, refuse to draw conclusions from
+  that replay; surface the failure instead.
+
+### Explicit-invocation only (run only when asked by name or task)
+
+- **dead-code-auditor.** Only when the operator asks to clean up,
+  audit, or look for unused code. Never run speculatively. Never run
+  against `active_bots/` even if asked, unless the operator explicitly
+  overrides that exclusion.
+- **architecture-advisor.** Only when planning a new feature and the
+  operator asks for design input, or asks "where should this go".
+  Never run against a change that is already in flight.
+- **replay-runner.** Only when the operator explicitly asks for a
+  sweep or comparison. Never run speculatively; it is expensive.
+
+### Sequencing
+
+- **Implementing a feature:** write the change → run code-reviewer →
+  address blockers → commit. Do not commit before code-reviewer has
+  run.
+- **Investigating a session:** run capture-verifier first → then
+  paper-session-analyst. Do not present session conclusions if
+  capture-verifier failed.
+- **Planning a new feature on request:** run architecture-advisor
+  first → present its plan → wait for the operator to confirm the seam
+  → implement → run code-reviewer at the end.
+
+### Out of scope
+
+- Never invoke a subagent to bypass the protect-files hook. If a hook
+  fires, surface it and stop; do not route the same edit through a
+  subagent.
+- Never invoke replay-runner or dead-code-auditor automatically
+  "while we're here". Explicit-invocation means explicit.
+- If a subagent's output disagrees with your own conclusion, the
+  subagent's output is the working assumption until the operator says
+  otherwise. Do not silently override it.
+
 ## 3. Repo layout
 
 ```
@@ -109,6 +169,8 @@ small change. Live trading bugs lose real USDC.
 - **No push to origin (`Wailydest`).** Local refs only; user pushes manually.
 - **No force-push anywhere**, including local branches.
 - **No running `MAX_TRADE_SIZE_USDC > 25`** without explicit go-ahead.
+- **Subagent invocation rules are in their own section above; follow
+  them as written, not as defaults you can skip.**
 
 **Operational knobs** (strategy-level knobs are in `STRATEGY.md` §5):
 
